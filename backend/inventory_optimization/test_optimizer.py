@@ -18,7 +18,7 @@ if __name__ == '__main__':
     optimizer = InventoryOptimizer(city_mapping_file, demand_data_file)
     optimizer.set_local_warehouses_from_dataframe(demand_data_file)
     optimizer.set_item_costs_from_dataframe(dev_cost_file)
-    optimizer.optimize_alpha(100,200)
+    optimizer.optimize_alpha(10,20)
     # alpha_dict = optimizer.generate_alpha_dict()
     # optimizer.set_alpha(alpha_dict)
     # optimizer.simulate(202701,202712)

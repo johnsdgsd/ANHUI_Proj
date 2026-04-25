@@ -167,6 +167,7 @@ class InventoryOptimizer:
         central_holding = 0
         for item in self.central_warehouse.items.values():
             central_holding += item.total_holding_cost
+        central_holding = round(central_holding,1)
         
         costs['central_warehouse'] = {
             'holding_cost': central_holding,
@@ -237,6 +238,7 @@ class InventoryOptimizer:
                 lb=lb, ub=ub, precision=1e-2,prob_mut=0.01)
         
         best_alpha_vector, min_cost = ga.run()
+        print(f'最佳参数组合为:{best_alpha_vector}')
         print(f'最低成本为{min_cost}')
         
         return best_alpha_vector, min_cost
