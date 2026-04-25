@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional
 import pandas as pd
+import numpy as np
 from backend.inventory_optimization.warehouse import CentralWarehouse, LocalWarehouse, Item
 from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
 
@@ -120,35 +121,123 @@ class InventoryOptimizer:
         
         self.central_warehouse.simulate(self.local_warehouses)
     
-    def calculate_order_quantity(self, item: Item, period: int) -> float:
-        """计算订货量"""
-        # 基于需求分布和满足率alpha计算订货量
-        month = (period - 1) % 12 + 1  # 假设period从1开始，映射到1-12月
-        try:
-            # 生成T+tn时间段内的需求作为订货量参考
-            return item.generate_demand_quantile(month)
-        except ValueError:
-            return 0.0
-    
-    def calculate_costs(self, results: Dict[str, Dict[str, List[float]]]) -> Dict[str, Dict[str, Dict[str, float]]]:
-        """计算成本"""
-        costs = {}
-        warehouse_map = {w.city_code: w for w in self.local_warehouses}
+    def calculate_weighted_alpha(self) -> float:
+        """计算加权满足率
         
-        for warehouse_id, warehouse_results in results.items():
-            warehouse_costs = {}
-            local_warehouse = warehouse_map.get(warehouse_id)
-            if not local_warehouse:
-                continue
-            for item_id, order_quantities in warehouse_results.items():
-                item = local_warehouse.get_item(item_id)
-                if item:
-                    holding_cost = 0
-                    shortage_cost = 0
-                    warehouse_costs[item_id] = {
-                        'holding_cost': holding_cost,
-                        'shortage_cost': shortage_cost,
-                        'total_cost': holding_cost + shortage_cost
-                    }
-            costs[warehouse_id] = warehouse_costs
+        Returns:
+            加权满足率
+        """
+        weighted_alpha_sum = 0
+        total_demand_sum = 0
+        
+        for local_warehouse in self.local_warehouses:
+            for item in local_warehouse.items.values():
+                item_demand_sum = sum(item.D_list)
+                weighted_alpha_sum += item.alpha * item_demand_sum
+                total_demand_sum += item_demand_sum
+        
+        return weighted_alpha_sum / total_demand_sum if total_demand_sum > 0 else 0
+    
+    def calculate_costs(self) -> Dict[str, float]:
+        """计算成本
+        
+        Returns:
+            成本字典，包含各仓库成本和总成本
+        """
+        costs = {}
+        total_holding_cost = 0
+        total_shortage_cost = 0
+        
+        for local_warehouse in self.local_warehouses:
+            warehouse_holding = 0
+            warehouse_shortage = 0
+            
+            for item in local_warehouse.items.values():
+                warehouse_holding += item.total_holding_cost
+                warehouse_shortage += item.total_shortage_cost
+            
+            costs[local_warehouse.city_code] = {
+                'holding_cost': warehouse_holding,
+                'shortage_cost': warehouse_shortage,
+                'total_cost': warehouse_holding + warehouse_shortage
+            }
+            total_holding_cost += warehouse_holding
+            total_shortage_cost += warehouse_shortage
+        
+        central_holding = 0
+        for item in self.central_warehouse.items.values():
+            central_holding += item.total_holding_cost
+        
+        costs['central_warehouse'] = {
+            'holding_cost': central_holding,
+            'shortage_cost': 0,
+            'total_cost': central_holding
+        }
+        total_holding_cost += central_holding
+        
+        costs['总计'] = {
+            'holding_cost': total_holding_cost,
+            'shortage_cost': total_shortage_cost,
+            'total_cost': total_holding_cost + total_shortage_cost,
+            'total_alpha': self.calculate_weighted_alpha()
+        }
+        
         return costs
+    
+    def objective_function(self, *args):
+        """目标函数：将入参解包为满足率，运行仿真并计算总成本"""
+        alpha_tuple = tuple(args)
+        alpha_dict = self._build_alpha_dict(alpha_tuple[0])
+        self.set_alpha(alpha_dict)
+        for local_warehouse in self.local_warehouses:
+            local_warehouse.reset_inventory()
+        self.central_warehouse.reset_inventory()
+        self.simulate(202501, 202512)
+        costs = self.calculate_costs()
+        total_alpha = self.calculate_weighted_alpha()
+        expect_alpha = 0.95
+        if total_alpha > expect_alpha:
+            return costs['总计']['total_cost']
+        else:
+            return 1e20
+    
+    def _build_alpha_dict(self, alpha_tuple):
+        """将入参元组转换为满足率字典"""
+        categories = sorted(self._get_unique_categories())
+        warehouses = sorted([w.city_code for w in self.local_warehouses])
+        category_alpha_by_warehouse = {}
+        idx = 0
+        for warehouse_key in warehouses:
+            category_alpha = {}
+            for cat in categories:
+                category_alpha[cat] = alpha_tuple[idx]
+                idx += 1
+            category_alpha_by_warehouse[warehouse_key] = category_alpha
+        
+        return category_alpha_by_warehouse
+    
+    def _get_unique_categories(self):
+        """获取所有地方仓库中的唯一类别"""
+        if not self.local_warehouses:
+            return set()
+        sample_warehouse = self.local_warehouses[0]
+        return {item.cls for item in sample_warehouse.items.values()}
+    
+    def optimize_alpha(self, n_iter=50, pop_size=200):
+        """使用遗传算法优化满足率"""
+        from sko.GA import GA
+        
+        categories = sorted(self._get_unique_categories())
+        warehouses = sorted([w.city_code for w in self.local_warehouses])
+        n_dim = len(categories) * len(warehouses)
+        lb = [0.95] * n_dim
+        ub = [0.99] * n_dim
+        
+        ga = GA(func=self.objective_function, n_dim=n_dim, size_pop=pop_size, max_iter=n_iter,
+                lb=lb, ub=ub, precision=1e-2,prob_mut=0.01)
+        
+        best_alpha_vector, min_cost = ga.run()
+        print(f'最低成本为{min_cost}')
+        
+        return best_alpha_vector, min_cost
+

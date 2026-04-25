@@ -42,6 +42,11 @@ class LocalWarehouse:
         """获取物资"""
         return self.items.get(item_key)
     
+    def reset_inventory(self):
+        """重置所有物资的库存状态"""
+        for item in self.items.values():
+            item.reset_inventory()
+    
     def simulate(self, start_year_month: int, end_year_month: int):
         """仿真函数，对所有物资进行仿真
         
@@ -227,6 +232,11 @@ class CentralWarehouse:
                 central_item.demand_distributions[month] = dist
             
             self.add_item(item_key, central_item)
+    
+    def reset_inventory(self):
+        """重置中心库所有物资的库存状态"""
+        for item in self.items.values():
+            item.reset_inventory()
     
     def simulate(self, local_warehouses: list):
         """中心库仿真
