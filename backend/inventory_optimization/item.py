@@ -208,8 +208,10 @@ class Item:
                 middle = sum(self.current_inventory[1:-1]) * self.holding_cost
                 self.total_holding_cost = first_last + middle
         
+        self.total_holding_cost = round(self.total_holding_cost,1)
+        
         # 计算缺货成本
         self.total_shortage_cost = sum(self.shortage_records) * self.shortage_cost
-        
+        self.total_shortage_cost = round(self.total_shortage_cost,1)
         # 计算总成本
         self.total_cost = self.total_holding_cost + self.total_shortage_cost

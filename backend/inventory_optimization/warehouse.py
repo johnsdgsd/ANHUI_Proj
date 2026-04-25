@@ -218,7 +218,7 @@ class CentralWarehouse:
             central_item = Item(
                 cls=local_item.cls,
                 dev_code=local_item.dev_code,
-                initial_inventory=0,
+                initial_inventory=10000,
                 holding_cost=local_item.holding_cost,
                 shortage_cost=0,
                 alpha=local_item.alpha
@@ -227,6 +227,52 @@ class CentralWarehouse:
                 central_item.demand_distributions[month] = dist
             
             self.add_item(item_key, central_item)
+    
+    def simulate(self, local_warehouses: list):
+        """中心库仿真
+        
+        订货量 = 所有地方仓库当前物资订货量之和 + 所有地方仓库当前物资期望下阶段需求之和 - 中心库当前库存
+        
+        Args:
+            local_warehouses: 地方仓库列表
+        """
+        if not local_warehouses:
+            return
+        
+        sample_local = local_warehouses[0]
+        sample_item_key = list(sample_local.items.keys())[0] if sample_local.items else None
+        if not sample_item_key:
+            return
+        
+        sample_item = sample_local.items[sample_item_key]
+        num_periods = len(sample_item.order_records)
+        
+        for item_key, central_item in self.items.items():
+            central_item.reset_inventory()
+        
+        for period in range(num_periods):
+            for item_key, central_item in self.items.items():
+                total_order = 0
+                total_next_demand = 0
+                
+                for local_warehouse in local_warehouses:
+                    local_item = local_warehouse.get_item(item_key)
+                    if not local_item:
+                        continue
+                    total_order += local_item.order_records[period]
+                    total_next_demand += local_item.expected_next_demand_list[period]
+                
+                initial_stock = central_item.current_inventory[-1]
+                current_order = total_order + total_next_demand - initial_stock
+                current_order = max(0,current_order)
+                current_stock = initial_stock + current_order
+                next_stock = current_stock - total_order
+                next_stock = max(0,next_stock)
+                
+                central_item.current_inventory.append(next_stock)
+        
+        for item_key,central_item in self.items.items():
+            central_item.calculate_total_cost()
     
     def add_local_warehouse(self, warehouse: LocalWarehouse):
         """添加地方库"""

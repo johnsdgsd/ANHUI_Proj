@@ -34,10 +34,7 @@ class InventoryOptimizer:
         
         for local_warehouse in self.local_warehouses:
             local_warehouse.initialize_from_dataframe(df, filter_columns)
-        
-        if self.local_warehouses:
-            self.central_warehouse.initialize_from_local_warehouse(self.local_warehouses[0])
-    
+
     def set_item_costs_from_dataframe(self, data_path: str):
         """根据数据表设置地方库物资的成本
         
@@ -118,6 +115,10 @@ class InventoryOptimizer:
         """
         for local_warehouse in self.local_warehouses:
             local_warehouse.simulate(start_year_month, end_year_month)
+
+        self.central_warehouse.initialize_from_local_warehouse(self.local_warehouses[0])
+        
+        self.central_warehouse.simulate(self.local_warehouses)
     
     def calculate_order_quantity(self, item: Item, period: int) -> float:
         """计算订货量"""
