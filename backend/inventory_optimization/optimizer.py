@@ -15,23 +15,43 @@ class InventoryOptimizer:
         self.central_warehouse.name = "中心库"
         self.data_df: Optional[pd.DataFrame] = None
     
-    def set_local_warehouses_from_dataframe(self, data_path: str):
+    def set_local_warehouses_from_dataframe(self, df:pd.DataFrame):
         """根据数据表设置地方库的物资
         
         根据数据表中每条记录的地市编码，匹配对应的地方仓库，
         并初始化该仓库的物资需求分布
         
         Args:
-            data_path: Excel文件路径，包含地市编码、设备码、需求分布类型、需求分布参数等列
+            df: DataFrame，包含 INSTALL_ID, STAT_MONTH, UNIT_CODE, UNIT_NAME, DEVICE_TYPE, DEVICE_CODE, INSTALL_NUM 等列
         """
-        df = pd.read_excel(data_path)
+        self.data_df = df.copy()
+
+        if 'INSTALL_ID' in df.columns:
+            df = df.drop(columns=['INSTALL_ID'])
+        
+        df = df.dropna()
+        
+        rename_map = {
+            'STAT_MONTH': '时间',
+            'UNIT_CODE': '单位编码',
+            'UNIT_NAME': '单位名称',
+            'DEVICE_TYPE': '设备类别',
+            'DEVICE_CODE': '设备码',
+            'INSTALL_NUM': '数量'
+        }
+        df = df.rename(columns=rename_map)
+        
+        df['时间'] = df['时间'].astype(int)
+        
+        df['月序号'] = df['时间'] % 100
+        
+        df = df.groupby(['单位编码', '设备类别', '设备码', '月序号'], as_index=False)['数量'].mean()
+        df = df.rename(columns={'数量': '月均安装数量'})
         
         df['需求分布类型'] = 'poisson'
-        df['需求分布参数'] = df['数量'].apply(lambda x: {'lambda_': x})
+        df['需求分布参数'] = df['月均安装数量'].apply(lambda x: {'lambda_': x})
         
-        self.data_df = df.copy()
-        
-        filter_columns = '地市编码'
+        filter_columns = '单位编码'
         
         for local_warehouse in self.local_warehouses:
             local_warehouse.initialize_from_dataframe(df, filter_columns)
@@ -196,12 +216,8 @@ class InventoryOptimizer:
         self.simulate(202501, 202512)
         costs = self.calculate_costs()
         total_alpha = self.calculate_weighted_alpha()
-        expect_alpha = 0.95
-        if total_alpha > expect_alpha:
-            return costs['总计']['total_cost']
-        else:
-            return 1e20
-    
+        return costs,total_alpha
+        
     def _build_alpha_dict(self, alpha_tuple):
         """将入参元组转换为满足率字典"""
         categories = sorted(self._get_unique_categories())
@@ -226,20 +242,49 @@ class InventoryOptimizer:
     
     def optimize_alpha(self, n_iter=50, pop_size=200):
         """使用遗传算法优化满足率"""
-        from sko.GA import GA
+        import pygad
         
         categories = sorted(self._get_unique_categories())
         warehouses = sorted([w.city_code for w in self.local_warehouses])
         n_dim = len(categories) * len(warehouses)
-        lb = [0.95] * n_dim
-        ub = [0.99] * n_dim
         
-        ga = GA(func=self.objective_function, n_dim=n_dim, size_pop=pop_size, max_iter=n_iter,
-                lb=lb, ub=ub, precision=1e-2,prob_mut=0.01)
-        
-        best_alpha_vector, min_cost = ga.run()
-        print(f'最佳参数组合为:{best_alpha_vector}')
-        print(f'最低成本为{min_cost}')
-        
-        return best_alpha_vector, min_cost
+        def fitness_func(ga_instance, solution, solution_idx):
+            costs,total_alpha = self.objective_function(solution)
+            if total_alpha > ga_instance.expect_alpha:
+                return -costs['总计']['total_cost']
+            else:
+                return -1e20
 
+        epsilon = 0.95        
+        ga = pygad.GA(
+            num_generations=n_iter,
+            num_parents_mating=pop_size // 2,
+            fitness_func=fitness_func,
+            sol_per_pop=pop_size,
+            num_genes=n_dim,
+            gene_type=float,
+            gene_space=[{'low': epsilon, 'high': 0.9999} for _ in range(n_dim)],
+            mutation_type="random",
+            on_generation = self.on_generation,
+            mutation_percent_genes=10,
+            # parallel_processing=['thread', 20]
+        )
+        ga.total_alpha = 0
+        ga.expect_alpha = epsilon
+        
+        ga.run()
+        
+        best_solution = ga.best_solution()[0]
+        best_cost = -ga.best_solution()[1]
+        
+        print(f'最佳参数组合为:{best_solution}')
+        print(f'最低成本为:{best_cost}')
+        
+        return best_solution, best_cost
+
+    def on_generation(self, ga):
+        """回调函数，每代结束后调用"""
+        best_solution = ga.best_solution()[0]
+        costs, best_alpha = self.objective_function(best_solution)
+        best_cost = costs['总计']['total_cost']
+        print(f"Gen {ga.generations_completed}: alpha={best_solution}, cost={best_cost:.2f}, total_alpha={best_alpha:.4f}")
