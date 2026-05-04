@@ -156,8 +156,6 @@ class Item:
         demand_quantile = self.generate_demand_quantile(month_number)
         # 计算订货量（需求分位数 - 初始库存，不能为负）
         order_quantity = max(0, demand_quantile - initial_stock)
-        if order_quantity ==0:
-            print()
         # 计算当前库存（初始库存 + 订货量）
         current_stock = initial_stock + order_quantity
         # 产生需求随机数

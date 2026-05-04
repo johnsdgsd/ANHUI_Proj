@@ -265,7 +265,7 @@ class InventoryOptimizer:
         Returns:
             嵌套字典，键为仓库编号，值为该仓库不同类别物资满足率字典
         """
-        category_list = ['电能表', '互感器', '终端', '通信模块']
+        category_list = ['01-电能表', '02-互感器', '09-终端', '54-通信模块']
         alpha_values = [0.95, 0.90, 0.85, 0.80]
         
         result = {}
