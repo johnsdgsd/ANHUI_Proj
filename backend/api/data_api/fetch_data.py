@@ -60,4 +60,31 @@ def query_aps_inventory_item_cost():
         raise
 
 
+def query_aps_inventory_init_stock_by_month(month: int):
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query-aps-inventory-init-stock-by-month'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "month": month
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
 

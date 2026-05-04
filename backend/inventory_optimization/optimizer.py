@@ -3,60 +3,238 @@ import pandas as pd
 import numpy as np
 from backend.inventory_optimization.warehouse import CentralWarehouse, LocalWarehouse, Item
 from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
-
+import warnings
 
 class InventoryOptimizer:
     """库存优化器"""
-    def __init__(self, city_mapping_path: str, city_codes_path: str):
-        self.local_warehouse_initializer = LocalWarehouseInitializer(city_mapping_path)
-        self.local_warehouses = self.local_warehouse_initializer.initialize_warehouses(city_codes_path)
-        self.central_warehouse = CentralWarehouse()
-        self.central_warehouse.warehouse_id = "central_warehouse"
-        self.central_warehouse.name = "中心库"
+    def __init__(self, init_stock_df: pd.DataFrame):
+        self.init_stock_df = init_stock_df
+        self.distribution_data = None
+
+        self.local_warehouse_initializer = LocalWarehouseInitializer()
+        self.local_warehouse_initializer.load_city_mapping(init_stock_df)
+        self.local_warehouses = self.local_warehouse_initializer.initialize_warehouses(init_stock_df)
+        self.central_warehouse = None
         self.data_df: Optional[pd.DataFrame] = None
     
-    def set_local_warehouses_from_dataframe(self, df:pd.DataFrame):
-        """根据数据表设置地方库的物资
+
+    def get_distributions_from_install_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """从安装数据获取需求分布
         
-        根据数据表中每条记录的地市编码，匹配对应的地方仓库，
-        并初始化该仓库的物资需求分布
+        输入的df包括INSTALL_ID, STAT_MONTH, UNIT_CODE, UNIT_NAME, DEVICE_TYPE, DEVICE_CODE, INSTALL_NUM
+        去掉ID列，生成单位编码、设备码、月份(1-12)的完整笛卡尔积，
+        并填充每个月份的数据为所有相同月份数据的均值
         
         Args:
             df: DataFrame，包含 INSTALL_ID, STAT_MONTH, UNIT_CODE, UNIT_NAME, DEVICE_TYPE, DEVICE_CODE, INSTALL_NUM 等列
+            
         """
-        self.data_df = df.copy()
-
-        if 'INSTALL_ID' in df.columns:
-            df = df.drop(columns=['INSTALL_ID'])
+        df_clean = df.copy()
         
-        df = df.dropna()
+        if 'INSTALL_ID' in df_clean.columns:
+            df_clean = df_clean.drop(columns=['INSTALL_ID'])
         
-        rename_map = {
-            'STAT_MONTH': '时间',
+        df_clean = df_clean.dropna(how='any')
+        
+        df_clean['月序号'] = df_clean['STAT_MONTH'] % 100
+        
+        # 从原始数据中获取所有唯一设备组合
+        unique_devices = df_clean[['UNIT_CODE', 'UNIT_NAME', 'DEVICE_TYPE', 'DEVICE_CODE']].drop_duplicates()
+        
+        # 生成完整的笛卡尔积（每个设备组合都有1-12月数据）
+        months = pd.DataFrame({'月序号': range(1, 13)})
+        full_cartesian = unique_devices.merge(months, how='cross')
+        
+        # 计算每个设备每个月的均值
+        monthly_avg = df_clean.groupby(['UNIT_CODE', 'DEVICE_CODE', '月序号'], as_index=False)['INSTALL_NUM'].mean()
+        monthly_avg = monthly_avg.rename(columns={'INSTALL_NUM': '月均安装数量'})
+        
+        # 将均值填充到完整笛卡尔积中
+        result = full_cartesian.merge(
+            monthly_avg,
+            on=['UNIT_CODE', 'DEVICE_CODE', '月序号'],
+            how='left'
+        )
+        
+        result = result.rename(columns={
             'UNIT_CODE': '单位编码',
             'UNIT_NAME': '单位名称',
             'DEVICE_TYPE': '设备类别',
-            'DEVICE_CODE': '设备码',
-            'INSTALL_NUM': '数量'
-        }
-        df = df.rename(columns=rename_map)
+            'DEVICE_CODE': '设备码'
+        })
         
-        df['时间'] = df['时间'].astype(int)
+        result['需求分布类型'] = 'poisson'
+        result['需求分布参数'] = result['月均安装数量'].apply(
+            lambda x: {'lambda_': round(x)} if pd.notna(x) else {'lambda_': 0}
+        )
         
-        df['月序号'] = df['时间'] % 100
-        
-        df = df.groupby(['单位编码', '设备类别', '设备码', '月序号'], as_index=False)['数量'].mean()
-        df = df.rename(columns={'数量': '月均安装数量'})
-        
-        df['需求分布类型'] = 'poisson'
-        df['需求分布参数'] = df['月均安装数量'].apply(lambda x: {'lambda_': x})
-        
-        filter_columns = '单位编码'
-        
-        for local_warehouse in self.local_warehouses:
-            local_warehouse.initialize_from_dataframe(df, filter_columns)
+        self.distribution_data = result
+        return result
 
-    def set_item_costs_from_dataframe(self, data_path: str):
+    def set_local_warehouses_from_dataframe(self):
+        """根据初始库存数据和需求分布数据设置地方库的物资
+        
+        根据初始库存数据中的单位以及设备码信息从需求分布数据中筛选匹配数据，
+        然后用筛选后的需求分布数据初始化各个地方库的物资。
+        对于没有匹配到数据的组合，也生成完整的12个月数据并填充默认值
+        """
+        if self.distribution_data is None:
+            raise ValueError("需要先调用 get_distributions_from_install_data 获取需求分布数据")
+        
+        # 从初始库存数据中提取需要的唯一组合
+        stock_combos = self.init_stock_df[['UNIT_CODE','UNIT_NAME', 'DEVICE_TYPE','DEVICE_CODE']].drop_duplicates().astype(str)
+        # 每个组合都要有1-12月，月序号列暂时填充nan
+        months = pd.DataFrame({'月序号': range(1, 13)})
+        stock_combos_with_months = stock_combos.merge(months, how='cross')
+        # 首先找出能匹配到的组合
+        stock_combos_renamed = stock_combos_with_months.rename(columns={
+            'UNIT_CODE': '单位编码',
+            'UNIT_NAME': '单位名称',
+            'DEVICE_TYPE': '设备类别',
+            'DEVICE_CODE': '设备码'
+        })
+        matched_dist = stock_combos_renamed.merge(
+            self.distribution_data,
+            on=['单位编码', '单位名称', '设备码', '月序号'],
+            how='left'
+        )
+
+        matched_dist['设备类别'] = matched_dist['设备类别_x']
+        
+        # 映射设备类别编码为名称
+        device_type_map = {
+            '01': '01-电能表',
+            '02': '02-互感器',
+            '09': '09-终端',
+            '54': '54-通信设备'
+        }
+        matched_dist['设备类别'] = matched_dist['设备类别'].map(device_type_map)
+        matched_dist = matched_dist.drop(columns=['设备类别_y','设备类别_x'])
+        matched_dist['月均安装数量'] = matched_dist['月均安装数量'].fillna(0).round(0).astype(int)
+        # 统计月均安装数量为0或nan的行数
+        zero_mask = (matched_dist['月均安装数量']== 0)
+        missing_count = zero_mask.sum()
+        if missing_count > 0:
+            warnings.warn(f"警告：有 {missing_count} 行数据没有匹配到需求分布，将使用默认的需求分布参数 (lambda_=5)", UserWarning)
+        
+        # 将月均安装数量为0或nan的行的需求分布参数统一置为5
+        matched_dist.loc[zero_mask, '需求分布参数'] = matched_dist.loc[zero_mask].apply(lambda row: {'lambda_': 5}, axis=1)
+        matched_dist.loc[zero_mask, '月均安装数量'] = 0
+        matched_dist.loc[zero_mask, '需求分布类型'] = 'poisson'
+        filter_col = '单位编码'
+        for local_warehouse in self.local_warehouses:
+            local_warehouse.initialize_from_dataframe(matched_dist, filter_col)
+        
+        # 根据初始库存数据设置物资的初始库存
+        if 'BEGIN_STOCK_NUM' in self.init_stock_df.columns:
+            for local_warehouse in self.local_warehouses:
+                warehouse_code = local_warehouse.city_code
+                # 筛选当前仓库的初始库存数据
+                warehouse_stock = self.init_stock_df[self.init_stock_df['UNIT_CODE'].astype(str) == warehouse_code]
+                for _, row in warehouse_stock.iterrows():
+                    dev_code = str(row['DEVICE_CODE'])
+                    initial_stock = float(row['BEGIN_STOCK_NUM'])
+                    local_warehouse.set_initial_inventory(dev_code, initial_stock)
+
+    def convert_local_to_central(self, local_warehouse: LocalWarehouse) -> CentralWarehouse:
+        """将地方库转换为中心库
+        
+        根据地方库创建一个新的中心库，复制物资信息但调整成本结构
+        
+        Args:
+            local_warehouse: 要转换的地方库
+            
+        Returns:
+            创建的中心库对象
+        """
+        central = CentralWarehouse()
+        central.warehouse_id = local_warehouse.warehouse_id
+        central.city_name = local_warehouse.city_name
+        central.city_code = local_warehouse.city_code
+        
+        # 复制物资，但中心库只有持有成本，没有缺货成本
+        for item_key, local_item in local_warehouse.items.items():
+            central_item = Item(
+                cls=local_item.cls,
+                dev_code=local_item.dev_code,
+                initial_inventory=local_item.initial_inventory,
+                holding_cost=local_item.holding_cost,
+                shortage_cost=0,  # 中心库没有缺货成本
+                alpha=local_item.alpha
+            )
+            # 复制需求分布
+            for month, dist in local_item.demand_distributions.items():
+                central_item.demand_distributions[month] = dist
+            
+            central.add_item(item_key, central_item)
+        return central
+    
+    def set_central_warehouse(self, name: str):
+        """从地方库中指定一个成为中心库
+        
+        根据名称找到对应的地方库，将其转换为中心库，并从地方库列表中移除
+        
+        Args:
+            name: 要设为中心库的地方库名称（city_name）
+        """
+        found = False
+        for warehouse in self.local_warehouses:
+            if warehouse.city_name == name:
+                # 转换为中央仓库
+                self.central_warehouse = self.convert_local_to_central(warehouse)
+                self.local_warehouses.remove(warehouse)
+                found = True
+                print(f"已将 {name} 设为中心库，并从地方库中移除")
+                break
+        
+        if not found:
+            raise ValueError(f"未找到名称为 '{name}' 的地方库")
+        
+        # 从初始库存数据中分离中心库和地方库的数据
+        central_code = self.central_warehouse.city_code
+        central_stock_df = self.init_stock_df[self.init_stock_df['UNIT_CODE'].astype(str) == central_code]
+        local_stock_df = self.init_stock_df[self.init_stock_df['UNIT_CODE'].astype(str) != central_code]
+        
+        # 统计物资种类
+        central_devices = set(central_stock_df['DEVICE_CODE'].astype(str).unique())
+        local_devices = set(local_stock_df['DEVICE_CODE'].astype(str).unique())
+        
+        print(f"中心库有 {len(central_devices)} 种物资")
+        print(f"地方库总计有 {len(local_devices)} 种物资")
+        
+        # 检查地方库有但中心库没有的物资
+        missing_in_central = local_devices - central_devices
+        if missing_in_central:
+            print(f"地方库有但中心库没有的物资: {len(missing_in_central)} 种")
+            # 为缺失的物资在中心库中初始化
+            for dev_code in missing_in_central:
+                # 从任意一个地方库获取该物资的信息作为模板
+                template_item = None
+                for warehouse in self.local_warehouses:
+                    template_item = warehouse.get_item(dev_code)
+                    if template_item:
+                        break
+                
+                if template_item:
+                    # 创建新的物资对象添加到中心库
+                    new_item = Item(
+                        cls=template_item.cls,
+                        dev_code=template_item.dev_code,
+                        initial_inventory=100,
+                        holding_cost=template_item.holding_cost,
+                        shortage_cost=0, 
+                        alpha=template_item.alpha
+                    )
+                    # 复制需求分布
+                    for month, dist in template_item.demand_distributions.items():
+                        new_item.demand_distributions[month] = dist
+                    
+                    self.central_warehouse.add_item(dev_code, new_item)
+                    print(f"已添加物资 {dev_code} 到中心库")
+        else:
+            print("所有地方库的物资中心库都已包含")
+
+    def set_item_costs_from_dataframe(self, df:pd.DataFrame):
         """根据数据表设置地方库物资的成本
         
         根据数据表中每条记录的设备码，设置对应物资的持有成本和缺货成本
@@ -64,20 +242,20 @@ class InventoryOptimizer:
         Args:
             data_path: Excel文件路径，包含设备码、持有成本、缺货成本等列
         """
-        df = pd.read_excel(data_path)
         
-        if '平均单价' in df.columns:
-            df['持有成本'] = (df['平均单价'] * 0.1).round(1)
-            df['缺货成本'] = (df['平均单价'] * 0.5).round(1)
+        if 'Price' in df.columns:
+            df['持有成本'] = (df['Price'] * 0.1).round(1)
+            df['缺货成本'] = (df['Price'] * 0.5).round(1)
         
         for local_warehouse in self.local_warehouses:
             for _, row in df.iterrows():
-                dev_code = str(row['设备码'])
+                dev_code = str(row['DEVICE_CODE'])
                 if '持有成本' in row:
                     local_warehouse.set_holding_cost(dev_code, float(row['持有成本']))
                 if '缺货成本' in row:
                     local_warehouse.set_shortage_cost(dev_code, float(row['缺货成本']))
-    
+
+
     def generate_alpha_dict(self) -> dict:
         """生成满足率字典
         
@@ -136,8 +314,6 @@ class InventoryOptimizer:
         """
         for local_warehouse in self.local_warehouses:
             local_warehouse.simulate(start_year_month, end_year_month)
-
-        self.central_warehouse.initialize_from_local_warehouse(self.local_warehouses[0])
         
         self.central_warehouse.simulate(self.local_warehouses)
     
@@ -213,7 +389,7 @@ class InventoryOptimizer:
         for local_warehouse in self.local_warehouses:
             local_warehouse.reset_inventory()
         self.central_warehouse.reset_inventory()
-        self.simulate(202501, 202512)
+        self.simulate(202601, 202612)
         costs = self.calculate_costs()
         total_alpha = self.calculate_weighted_alpha()
         return costs,total_alpha

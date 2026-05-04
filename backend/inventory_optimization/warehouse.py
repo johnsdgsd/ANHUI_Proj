@@ -102,16 +102,16 @@ class LocalWarehouse:
                 item = Item(
                     cls=cls[0],
                     dev_code=dev_code,
-                    initial_inventory=0.0,
-                    holding_cost=0.0,
-                    shortage_cost=0.0,
+                    initial_inventory=1000.0,
+                    holding_cost=10.0,
+                    shortage_cost=100.0,
                     alpha=0.0
                 )
                 
                 # 为该设备码的每个月设置需求分布
                 dev_code_data = group[group['设备码'] == dev_code]
                 for _, row in dev_code_data.iterrows():
-                    year_month = int(row['月份'])
+                    year_month = int(row['月序号'])
                     month = year_month % 100  # 从年月（如202601）中提取月份（1-12）
                     dist_type = row['需求分布类型']
                     params = row['需求分布参数']
@@ -208,7 +208,8 @@ class CentralWarehouse:
         self.items: Dict[str, Item] = {}  # item_key -> Item
         self.local_warehouses: Dict[str, LocalWarehouse] = {}  # warehouse_id -> LocalWarehouse
         self.warehouse_id = None
-        self.name = None
+        self.city_code = None
+        self.city_name = None
     
     def initialize_from_local_warehouse(self, local_warehouse: LocalWarehouse):
         """根据地方仓库初始化中心库的物资
@@ -280,6 +281,9 @@ class CentralWarehouse:
                 next_stock = max(0,next_stock)
                 
                 central_item.current_inventory.append(next_stock)
+                central_item.order_records.append(current_order)
+                central_item.demand_records.append(total_order)
+
         
         for item_key,central_item in self.items.items():
             central_item.calculate_total_cost()
