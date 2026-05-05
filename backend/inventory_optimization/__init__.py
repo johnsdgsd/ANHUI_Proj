@@ -3,6 +3,7 @@ from .cost_calculator import CostCalculator, DefaultCostCalculator
 from .item import Item
 from .warehouse import LocalWarehouse, CentralWarehouse
 from .optimizer import InventoryOptimizer
+from .RunOptimize import run_optimization_from_api
 
 __all__ = [
     'DemandDistribution',
@@ -14,5 +15,6 @@ __all__ = [
     'Item',
     'LocalWarehouse',
     'CentralWarehouse',
-    'InventoryOptimizer'
+    'InventoryOptimizer',
+    'run_optimization_from_api'
 ]

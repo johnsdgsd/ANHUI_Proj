@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
@@ -16,6 +17,10 @@ class InventoryOptimizer:
         self.local_warehouses = self.local_warehouse_initializer.initialize_warehouses(init_stock_df)
         self.central_warehouse = None
         self.data_df: Optional[pd.DataFrame] = None
+
+        self.best_solution = None
+        self.best_cost = None
+        self.context = None
     
 
     def get_distributions_from_install_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -278,14 +283,15 @@ class InventoryOptimizer:
         
         return result
     
-    def set_alpha(self, category_alpha_by_warehouse: dict):
+    @staticmethod
+    def set_alpha(category_alpha_by_warehouse: dict,context):
         """设置不同仓库不同类别物资的满足率
         
         Args:
             category_alpha_by_warehouse: 嵌套字典，键为仓库编号，值为该仓库不同类别物资满足率字典
                 例如: {'320100': {'电能表': 0.95, '互感器': 0.90}, '320200': {'电能表': 0.92}}
         """
-        for local_warehouse in self.local_warehouses:
+        for local_warehouse in context.local_warehouses:
             warehouse_key = local_warehouse.city_code
             category_alpha = category_alpha_by_warehouse.get(warehouse_key, {})
             if category_alpha:
@@ -304,20 +310,22 @@ class InventoryOptimizer:
             if initial_inventory:
                 for dev_code, inv in initial_inventory.items():
                     local_warehouse.set_initial_inventory(dev_code, float(inv))
-    
-    def simulate(self, start_year_month: int, end_year_month: int):
+
+    @staticmethod
+    def simulate(start_year_month: int, end_year_month: int,context):
         """仿真函数
         
         Args:
             start_year_month: 起始年月，格式如202501表示2025年1月
             end_year_month: 结束年月，格式如202512表示2025年12月
         """
-        for local_warehouse in self.local_warehouses:
+        for local_warehouse in context.local_warehouses:
             local_warehouse.simulate(start_year_month, end_year_month)
         
-        self.central_warehouse.simulate(self.local_warehouses)
+        context.central_warehouse.simulate(context.local_warehouses)
     
-    def calculate_weighted_alpha(self) -> float:
+    @staticmethod
+    def calculate_weighted_alpha(context) -> float:
         """计算加权满足率
         
         Returns:
@@ -326,7 +334,7 @@ class InventoryOptimizer:
         weighted_alpha_sum = 0
         total_demand_sum = 0
         
-        for local_warehouse in self.local_warehouses:
+        for local_warehouse in context.local_warehouses:
             for item in local_warehouse.items.values():
                 item_demand_sum = sum(item.D_list)
                 weighted_alpha_sum += item.alpha * item_demand_sum
@@ -334,7 +342,8 @@ class InventoryOptimizer:
         
         return weighted_alpha_sum / total_demand_sum if total_demand_sum > 0 else 0
     
-    def calculate_costs(self) -> Dict[str, float]:
+    @staticmethod
+    def calculate_costs(context) -> Dict[str, float]:
         """计算成本
         
         Returns:
@@ -344,7 +353,7 @@ class InventoryOptimizer:
         total_holding_cost = 0
         total_shortage_cost = 0
         
-        for local_warehouse in self.local_warehouses:
+        for local_warehouse in context.local_warehouses:
             warehouse_holding = 0
             warehouse_shortage = 0
             
@@ -361,7 +370,7 @@ class InventoryOptimizer:
             total_shortage_cost += warehouse_shortage
         
         central_holding = 0
-        for item in self.central_warehouse.items.values():
+        for item in context.central_warehouse.items.values():
             central_holding += item.total_holding_cost
         central_holding = round(central_holding,1)
         
@@ -376,28 +385,30 @@ class InventoryOptimizer:
             'holding_cost': total_holding_cost,
             'shortage_cost': total_shortage_cost,
             'total_cost': total_holding_cost + total_shortage_cost,
-            'total_alpha': self.calculate_weighted_alpha()
+            'total_alpha': InventoryOptimizer.calculate_weighted_alpha(context)
         }
         
         return costs
     
-    def objective_function(self, *args):
+    @staticmethod
+    def objective_function(*args,context):
         """目标函数：将入参解包为满足率，运行仿真并计算总成本"""
         alpha_tuple = tuple(args)
-        alpha_dict = self._build_alpha_dict(alpha_tuple[0])
-        self.set_alpha(alpha_dict)
-        for local_warehouse in self.local_warehouses:
+        alpha_dict = InventoryOptimizer._build_alpha_dict(alpha_tuple[0],context=context)
+        InventoryOptimizer.set_alpha(alpha_dict,context)
+        for local_warehouse in context.local_warehouses:
             local_warehouse.reset_inventory()
-        self.central_warehouse.reset_inventory()
-        self.simulate(202601, 202612)
-        costs = self.calculate_costs()
-        total_alpha = self.calculate_weighted_alpha()
+        context.central_warehouse.reset_inventory()
+        InventoryOptimizer.simulate(202601, 202612,context)
+        costs = InventoryOptimizer.calculate_costs(context)
+        total_alpha = InventoryOptimizer.calculate_weighted_alpha(context)
         return costs,total_alpha
-        
-    def _build_alpha_dict(self, alpha_tuple):
+    
+    @staticmethod
+    def _build_alpha_dict(alpha_tuple,context):
         """将入参元组转换为满足率字典"""
-        categories = sorted(self._get_unique_categories())
-        warehouses = sorted([w.city_code for w in self.local_warehouses])
+        categories = sorted(InventoryOptimizer._get_unique_categories(context = context))
+        warehouses = sorted([w.city_code for w in context.local_warehouses])
         category_alpha_by_warehouse = {}
         idx = 0
         for warehouse_key in warehouses:
@@ -409,45 +420,52 @@ class InventoryOptimizer:
         
         return category_alpha_by_warehouse
     
-    def _get_unique_categories(self):
+    @staticmethod
+    def _get_unique_categories(context):
         """获取所有地方仓库中的唯一类别"""
-        if not self.local_warehouses:
+        if not context.local_warehouses:
             return set()
-        sample_warehouse = self.local_warehouses[0]
+        sample_warehouse = context.local_warehouses[0]
         return {item.cls for item in sample_warehouse.items.values()}
+
+    @staticmethod
+    def fitness_func(ga_instance, solution, solution_idx):
+        costs,total_alpha = InventoryOptimizer.objective_function(solution,context = ga_instance.context)
+        if total_alpha > ga_instance.expect_alpha:
+            return -costs['总计']['total_cost']
+        else:
+            return -1e20
     
-    def optimize_alpha(self, n_iter=50, pop_size=200):
+    def optimize_alpha(self, n_iter=50, pop_size=200,epsilon = 0.95,n_processor = 1):
         """使用遗传算法优化满足率"""
         import pygad
         
-        categories = sorted(self._get_unique_categories())
+        context = SimpleNamespace()
+        context.local_warehouses = self.local_warehouses
+        context.central_warehouse = self.central_warehouse
+        self.context = context
+
+        categories = sorted(InventoryOptimizer._get_unique_categories(context))
         warehouses = sorted([w.city_code for w in self.local_warehouses])
         n_dim = len(categories) * len(warehouses)
-        
-        def fitness_func(ga_instance, solution, solution_idx):
-            costs,total_alpha = self.objective_function(solution)
-            if total_alpha > ga_instance.expect_alpha:
-                return -costs['总计']['total_cost']
-            else:
-                return -1e20
-
-        epsilon = 0.95        
+             
         ga = pygad.GA(
             num_generations=n_iter,
             num_parents_mating=pop_size // 2,
-            fitness_func=fitness_func,
+            fitness_func=InventoryOptimizer.fitness_func,
             sol_per_pop=pop_size,
             num_genes=n_dim,
             gene_type=float,
-            gene_space=[{'low': epsilon, 'high': 0.9999} for _ in range(n_dim)],
+            gene_space=[{'low': epsilon, 'high': 0.9999,'step':0.0001} for _ in range(n_dim)],
             mutation_type="random",
-            on_generation = self.on_generation,
+            on_generation = InventoryOptimizer.on_generation,
             mutation_percent_genes=10,
-            # parallel_processing=['thread', 20]
+            parallel_processing=['process', n_processor]
         )
         ga.total_alpha = 0
         ga.expect_alpha = epsilon
-        
+        ga.context = context
+
         ga.run()
         
         best_solution = ga.best_solution()[0]
@@ -455,12 +473,15 @@ class InventoryOptimizer:
         
         print(f'最佳参数组合为:{best_solution}')
         print(f'最低成本为:{best_cost}')
+        self.best_cost = best_cost
+        self.best_solution = best_solution
         
         return best_solution, best_cost
 
-    def on_generation(self, ga):
+    @staticmethod
+    def on_generation(ga):
         """回调函数，每代结束后调用"""
         best_solution = ga.best_solution()[0]
-        costs, best_alpha = self.objective_function(best_solution)
+        costs, best_alpha = InventoryOptimizer.objective_function(best_solution,context=ga.context)
         best_cost = costs['总计']['total_cost']
         print(f"Gen {ga.generations_completed}: alpha={best_solution}, cost={best_cost:.2f}, total_alpha={best_alpha:.4f}")
