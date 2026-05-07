@@ -5,7 +5,7 @@
 
 import pandas as pd
 from backend.inventory_optimization.optimizer import InventoryOptimizer
-from backend.inventory_optimization.warehouse import LocalWarehouse
+from backend.inventory_optimization.warehouse import CentralWarehouse, LocalWarehouse
 
 
 def run_optimization_from_api(
@@ -43,13 +43,21 @@ def run_optimization_from_api(
         query_aps_inventory_item_cost,
         insert_into_aps_inventory_fulfill_rate,
         insert_into_aps_inventory_replenish,
-        insert_into_aps_inventory_replenish_qty
+        insert_into_aps_inventory_replenish_qty,
+        query_aps_qua_sto_by_month,
+        query_aps_unqua_sto_by_month
     )
     
     try:
-        # 获取数据
+        # 获取初始库存数据
         init_stock = query_aps_inventory_init_stock_by_month(init_stock_month)
+        #合格品库存
+        qua_sto = query_aps_qua_sto_by_month(init_stock_month)
+        #不合格品库存
+        unqua_sto = query_aps_unqua_sto_by_month(init_stock_month)
+        #安装量数据
         install_df = query_device_install_data_by_month_range(install_start_month, install_end_month)
+        #物资价格
         item_cost = query_aps_inventory_item_cost()
         
         # 创建库存优化器
@@ -60,12 +68,13 @@ def run_optimization_from_api(
         
         # 初始化地方库
         optimizer.set_local_warehouses_from_dataframe()
-        
-        # 设置物资成本
+        #初始化中心库
+        optimizer.central_warehouse = CentralWarehouse()
+        optimizer.central_warehouse.city_name = '中心库'
+        optimizer.central_warehouse.initialize_from_sto_data(qua_sto,unqua_sto)
+        optimizer.central_warehouse.update_items_from_local_warehouses(optimizer.local_warehouses)
+        # 设置地方库和中心库物资成本
         optimizer.set_item_costs_from_dataframe(item_cost)
-        
-        # 设置中心库
-        optimizer.set_central_warehouse(central_warehouse_name)
         
         # 运行优化
         best_solution, best_cost = optimizer.optimize_alpha(

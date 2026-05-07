@@ -240,18 +240,19 @@ class InventoryOptimizer:
             print("所有地方库的物资中心库都已包含")
 
     def set_item_costs_from_dataframe(self, df:pd.DataFrame):
-        """根据数据表设置地方库物资的成本
-        
+        """根据数据表设置地方库和中心库物资的成本
+
         根据数据表中每条记录的设备码，设置对应物资的持有成本和缺货成本
-        
+
         Args:
-            data_path: Excel文件路径，包含设备码、持有成本、缺货成本等列
+            df: DataFrame，包含设备码、持有成本、缺货成本等列
         """
-        
+
         if 'Price' in df.columns:
             df['持有成本'] = (df['Price'] * 0.1).round(1)
             df['缺货成本'] = (df['Price'] * 0.5).round(1)
-        
+
+        # 设置地方库物资成本
         for local_warehouse in self.local_warehouses:
             for _, row in df.iterrows():
                 dev_code = str(row['DEVICE_CODE'])
@@ -259,6 +260,13 @@ class InventoryOptimizer:
                     local_warehouse.set_holding_cost(dev_code, float(row['持有成本']))
                 if '缺货成本' in row:
                     local_warehouse.set_shortage_cost(dev_code, float(row['缺货成本']))
+
+        # 设置中心库物资成本（中心库只有持有成本，没有缺货成本）
+        if self.central_warehouse:
+            for _, row in df.iterrows():
+                dev_code = str(row['DEVICE_CODE'])
+                if '持有成本' in row:
+                    self.central_warehouse.items[dev_code].holding_cost = float(row['持有成本'])
 
 
     def generate_alpha_dict(self) -> dict:

@@ -1,3 +1,4 @@
+from numbers import Number
 import requests
 import pandas as pd
 from backend.config.config import API_CONFIG
@@ -202,6 +203,129 @@ def insert_into_aps_inventory_replenish_qty(df: pd.DataFrame):
             "message": "数据插入成功",
             "inserted_count": len(records)
         }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+
+def query_aps_qua_sto_by_month(rele_month:int):
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query-aps-qua-sto-by-month'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "rele_month":rele_month
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_aps_unqua_sto_by_month(rele_month:int):
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query-aps-unqua-sto-by-month'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "rele_month":rele_month
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_adam_dist_scheme_by_date_range(start_date:str,end_date:str):
+    '''
+    根据日期范围查询配送方案表
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_dist_scheme_by_date_range'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "start_date":start_date,
+            "end_date":end_date
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_dist_scheme_det_by_distschemeid(id:Number):
+    '''
+    根据配送计划id查询配送计划明细表
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_dist_scheme_det_by_distschemeid'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "id":id
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
     except requests.exceptions.RequestException as e:
         raise
     except Exception as e:

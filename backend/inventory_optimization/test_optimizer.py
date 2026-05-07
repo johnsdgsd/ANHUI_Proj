@@ -1,8 +1,7 @@
 import os
 import sys
 from backend.inventory_optimization.optimizer import InventoryOptimizer
-from backend.api.data_api.fetch_data import query_device_install_data_by_month_range,query_aps_inventory_init_stock_by_month
-from backend.api.data_api.fetch_data import query_aps_inventory_item_cost
+from backend.api.data_api.fetch_data import *
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from datetime import datetime
 
@@ -32,7 +31,15 @@ if __name__ == '__main__':
     # optimizer.set_local_warehouses_from_dataframe(demand_data_file)
     # optimizer.set_item_costs_from_dataframe(dev_cost_file)
     # optimizer.optimize_alpha(100,200)
-
-    tag = datetime.now().strftime('%Y%m%d%H%M%S')
-    #不能使用多进程调试
-    run_optimization_from_api(202605,202204,202604,tag,n_iter=1,pop_size=10,n_processor=1)
+    # tag = datetime.now().strftime('%Y%m%d%H%M%S')
+    # #不能使用多进程调试
+    # run_optimization_from_api(202605,202204,202604,tag,n_iter=1,pop_size=10,n_processor=1)
+    df = query_adam_dist_scheme_by_date_range('2026-05-01','2026-05-31')
+    print(df)
+    ids = [10001,10002]
+    dfs = []
+    for id in ids :
+        df = query_adam_dist_scheme_det_by_distschemeid(id)
+        dfs.append(df)
+    result_df = pd.concat(dfs, ignore_index=True)
+    print(result_df)

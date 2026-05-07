@@ -211,33 +211,133 @@ class CentralWarehouse:
         self.city_code = None
         self.city_name = None
     
-    def initialize_from_local_warehouse(self, local_warehouse: LocalWarehouse):
-        """根据地方仓库初始化中心库的物资
-        
-        中心库的物资种类和类别与地方仓库相同，
-        只有持有成本，没有缺货成本
-        
+    def initialize_from_sto_data(self, qua_sto: pd.DataFrame, unqua_sto: pd.DataFrame,):
+        """根据合格品和不合格品库存数据初始化中心库物资
+
+        首先合并两个库存数据，然后根据合并结果创建物资对象
+
         Args:
-            local_warehouse: 任意一个地方仓库对象
+            qua_sto: 合格品库存DataFrame，包含DEV_CLS, DEV_CODE_NO, QUA_STO列
+            unqua_sto: 不合格品库存DataFrame，包含DEV_CLS, PRO_SPEC_NO, UNQUA_STO列
         """
-        for item_key, local_item in local_warehouse.items.items():
-            central_item = Item(
-                cls=local_item.cls,
-                dev_code=local_item.dev_code,
-                initial_inventory=10000,
-                holding_cost=local_item.holding_cost,
+
+        # 合并库存数据
+        merged_df = self.merge_inventory_data(qua_sto, unqua_sto)
+
+        # 根据合并结果初始化物资
+        for _, row in merged_df.iterrows():
+            cls = row['设备类别']
+            dev_code = row['设备码']
+            initial_inventory = row['库存值']
+
+            # 创建物资对象
+            item = Item(
+                cls=cls,
+                dev_code=dev_code,
+                initial_inventory=initial_inventory,
+                holding_cost=0,
                 shortage_cost=0,
-                alpha=local_item.alpha
+                alpha=0
             )
-            for month, dist in local_item.demand_distributions.items():
-                central_item.demand_distributions[month] = dist
-            
-            self.add_item(item_key, central_item)
+
+            # 生成item_key并添加到中心库
+            self.add_item(dev_code, item)
+
+    def merge_inventory_data(self, qualified_df: pd.DataFrame, unqualified_df: pd.DataFrame) -> pd.DataFrame:
+        """合并合格品和不合格品库存数据
+
+        从合格品df中提取DEV_CLS, DEV_CODE_NO, QUA_STO三列
+        从不合格品df中提取DEV_CLS, PRO_SPEC_NO, UNQUA_STO三列
+        如果某设备码的库存值两个df都有，结果相加
+        如果某设备码的库存值只有其中一个df有，只算这一个
+
+        Args:
+            qualified_df: 合格品库存DataFrame，包含DEV_CLS, DEV_CODE_NO, QUA_STO列
+            unqualified_df: 不合格品库存DataFrame，包含DEV_CLS, PRO_SPEC_NO, UNQUA_STO列
+
+        Returns:
+            pd.DataFrame: 合并后的库存数据，包含设备类别、设备码、库存值三列
+        """
+        # 提取并重命名合格品数据
+        qualified = qualified_df[['DEV_CLS', 'DEV_CODE_NO', 'QUA_STOCK']].copy()
+        qualified.columns = ['设备类别', '设备码', '库存值']
+
+        # 提取并重命名不合格品数据
+        unqualified = unqualified_df[['DEV_CLS', 'PRO_SPEC_NO', 'UNQUA_STOCK']].copy()
+        unqualified.columns = ['设备类别', '设备码', '库存值']
+
+        # 按设备类别和设备码分组求和
+        qualified_grouped = qualified.groupby(['设备类别', '设备码'], as_index=False)['库存值'].sum()
+        unqualified_grouped = unqualified.groupby(['设备类别', '设备码'], as_index=False)['库存值'].sum()
+
+        # 合并两个数据集
+        merged = pd.merge(
+            qualified_grouped,
+            unqualified_grouped,
+            on=['设备类别', '设备码'],
+            how='outer',
+            suffixes=('_合格', '_不合格')
+        )
+
+        # 填充缺失值为0
+        merged['库存值_合格'] = merged['库存值_合格'].fillna(0)
+        merged['库存值_不合格'] = merged['库存值_不合格'].fillna(0)
+
+        # 计算总库存值
+        merged['库存值'] = merged['库存值_合格'] + merged['库存值_不合格']
+
+        # 返回最终的三列结果
+        return merged[['设备类别', '设备码', '库存值']]
     
     def reset_inventory(self):
         """重置中心库所有物资的库存状态"""
         for item in self.items.values():
             item.reset_inventory()
+
+    def update_items_from_local_warehouses(self, local_warehouses: list):
+        """根据地方仓库列表同步物资
+
+        检查哪些设备码当前中心库没有，没有的要补上
+        初始库存默认为0，成本项和地方库的一样
+
+        Args:
+            local_warehouses: 地方仓库列表
+        """
+
+        # 收集所有地方仓库的设备码
+        all_local_items = set()
+        item_templates = {}  # 用于存储每个设备码的模板（从任意地方库获取）
+
+        for warehouse in local_warehouses:
+            for item_key, item in warehouse.items.items():
+                all_local_items.add(item_key)
+                if item_key not in item_templates:
+                    item_templates[item_key] = item
+
+        # 检查中心库缺少哪些物资
+        central_item_keys = set(self.items.keys())
+        missing_items = all_local_items - central_item_keys
+
+        # 为缺失的物资创建新的Item对象
+        for item_key in missing_items:
+            template_item = item_templates[item_key]
+
+            # 创建新的物资对象，初始库存为0
+            new_item = Item(
+                cls=template_item.cls,
+                dev_code=template_item.dev_code,
+                initial_inventory=0,
+                holding_cost=0,
+                shortage_cost=0,  # 中心库没有缺货成本
+                alpha=0
+            )
+
+            # 添加到中心库
+            self.add_item(item_key, new_item)
+            print(f"已添加物资 {item_key}到中心库")
+
+        print(f"共添加 {len(missing_items)} 种物资到中心库")
+        return len(missing_items)
     
     def simulate(self, local_warehouses: list):
         """中心库仿真
