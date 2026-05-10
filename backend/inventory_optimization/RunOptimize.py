@@ -5,7 +5,7 @@
 
 import pandas as pd
 from backend.inventory_optimization.optimizer import InventoryOptimizer
-from backend.inventory_optimization.warehouse import CentralWarehouse, LocalWarehouse
+from backend.inventory_optimization.warehouse import CentralWarehouse
 
 
 def run_optimization_from_api(
@@ -40,25 +40,27 @@ def run_optimization_from_api(
     from backend.api.data_api.fetch_data import (
         query_aps_inventory_init_stock_by_month,
         query_device_install_data_by_month_range,
-        query_aps_inventory_item_cost,
+        query_adam_pre_range_info,
         insert_into_aps_inventory_fulfill_rate,
         insert_into_aps_inventory_replenish,
         insert_into_aps_inventory_replenish_qty,
-        query_aps_qua_sto_by_month,
-        query_aps_unqua_sto_by_month
+        query_adam_qua_stock_sample_by_year_month,
+        query_adam_pend_stock_sample_by_year_month
     )
     
     try:
+        year = str(init_stock_month // 100)
+        month = f"{init_stock_month % 100 -1:02d}"
         # 获取初始库存数据
         init_stock = query_aps_inventory_init_stock_by_month(init_stock_month)
         #合格品库存
-        qua_sto = query_aps_qua_sto_by_month(init_stock_month)
+        qua_sto = query_adam_qua_stock_sample_by_year_month(year,month)
         #不合格品库存
-        unqua_sto = query_aps_unqua_sto_by_month(init_stock_month)
+        unqua_sto = query_adam_pend_stock_sample_by_year_month(year,month)
         #安装量数据
         install_df = query_device_install_data_by_month_range(install_start_month, install_end_month)
-        #物资价格
-        item_cost = query_aps_inventory_item_cost()
+        #预测范围中的物资价格
+        item_cost = query_adam_pre_range_info()
         
         # 创建库存优化器
         optimizer = InventoryOptimizer(init_stock)
@@ -120,7 +122,7 @@ def run_optimization_from_api(
                         'TAG':tag,
                         'BASE_STOCK_NUM':int(demand)
                     }
-                )
+                ) 
                 order_result_data.append(
                     {
                         'STAT_MONTH':init_stock_month,

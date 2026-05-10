@@ -1,6 +1,4 @@
 from typing import Any
-
-
 import pandas as pd
 import os
 import sys
@@ -32,7 +30,7 @@ class LocalWarehouseInitializer:
         self.city_map = unique_cities.set_index('UNIT_CODE')['UNIT_NAME'].astype(str).to_dict()
         print(f"加载地市映射信息，共 {len(self.city_map)} 条记录")
     
-    def initialize_warehouses(self, init_stock_df: pd.DataFrame) -> list:
+    def initialize_warehouses(self, init_stock_df: pd.DataFrame) -> list[LocalWarehouse]:
         """根据初始库存数据初始化所有地方仓库
         
         Args:

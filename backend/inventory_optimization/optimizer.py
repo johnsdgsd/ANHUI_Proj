@@ -38,11 +38,10 @@ class InventoryOptimizer:
         
         if 'INSTALL_ID' in df_clean.columns:
             df_clean = df_clean.drop(columns=['INSTALL_ID'])
-        
+
         df_clean = df_clean.dropna(how='any')
-        
         df_clean['月序号'] = df_clean['STAT_MONTH'] % 100
-        
+
         # 从原始数据中获取所有唯一设备组合
         unique_devices = df_clean[['UNIT_CODE', 'UNIT_NAME', 'DEVICE_TYPE', 'DEVICE_CODE']].drop_duplicates()
         
@@ -68,12 +67,21 @@ class InventoryOptimizer:
             'DEVICE_CODE': '设备码'
         })
         
+        # 填充月均安装数量为NaN的值：使用该单位该设备码的均值填充
+        nan_count_before = result['月均安装数量'].isna().sum()
+        result['月均安装数量'] = result.groupby(['单位编码', '设备码'])['月均安装数量'].transform(
+            lambda x: x.fillna(x.mean())
+        )
+        nan_count_after = result['月均安装数量'].isna().sum()
+        print(f"月均安装数量填充完成：填充前NaN数量 {nan_count_before}，填充后NaN数量 {nan_count_after}")
+        
         result['需求分布类型'] = 'poisson'
         result['需求分布参数'] = result['月均安装数量'].apply(
             lambda x: {'lambda_': round(x)} if pd.notna(x) else {'lambda_': 0}
         )
         
         self.distribution_data = result
+        result.to_excel("需求分布.xlsx",index=False)
         return result
 
     def set_local_warehouses_from_dataframe(self):
@@ -247,7 +255,7 @@ class InventoryOptimizer:
         Args:
             df: DataFrame，包含设备码、持有成本、缺货成本等列
         """
-
+        # df = df[['DEV_CODE','TAX_UP']]
         if 'Price' in df.columns:
             df['持有成本'] = (df['Price'] * 0.1).round(1)
             df['缺货成本'] = (df['Price'] * 0.5).round(1)

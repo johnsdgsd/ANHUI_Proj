@@ -33,7 +33,6 @@ def query_device_install_data_by_month_range(start_month:int,end_month: int):
     except Exception as e:
         raise
 
-
 def query_aps_inventory_item_cost():
     try:
         host = API_CONFIG["database"]["host"]
@@ -59,7 +58,6 @@ def query_aps_inventory_item_cost():
         raise
     except Exception as e:
         raise
-
 
 def query_aps_inventory_init_stock_by_month(month: int):
     try:
@@ -88,7 +86,6 @@ def query_aps_inventory_init_stock_by_month(month: int):
         raise
     except Exception as e:
         raise
-
 
 def insert_into_aps_inventory_fulfill_rate(df: pd.DataFrame):
     """插入满足率数据到数据库
@@ -128,7 +125,6 @@ def insert_into_aps_inventory_fulfill_rate(df: pd.DataFrame):
         raise
     except Exception as e:
         raise
-
 
 def insert_into_aps_inventory_replenish(df: pd.DataFrame):
     """插入基准库存数据到数据库
@@ -208,7 +204,61 @@ def insert_into_aps_inventory_replenish_qty(df: pd.DataFrame):
     except Exception as e:
         raise
 
+def insert_into_adam_plan_day_ias_pre(df: pd.DataFrame):
+    """插入日补库计划数据到数据库
 
+    Args:
+        df: DataFrame，包含以下列：
+            - PLAN_MONTH_IAS_PRE_ID: 唯一标识
+            - PRE_DATE: 补库日期
+            - REC_ORG_NO: 接收单位编码（市/县）
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - DEV_CODE: 设备码
+            - PLAN_IAS_NUM: 计划补库数量
+            - EST_STOCK_NUM: 预计库存
+            - GLOBAL_SCHEME_ID: 全局方案标识
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/insert_into_adam_plan_day_ias_pre'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
 
 def query_aps_qua_sto_by_month(rele_month:int):
     try:
@@ -238,7 +288,6 @@ def query_aps_qua_sto_by_month(rele_month:int):
     except Exception as e:
         raise
 
-
 def query_aps_unqua_sto_by_month(rele_month:int):
     try:
         host = API_CONFIG["database"]["host"]
@@ -266,7 +315,6 @@ def query_aps_unqua_sto_by_month(rele_month:int):
         raise
     except Exception as e:
         raise
-
 
 def query_adam_dist_scheme_by_date_range(start_date:str,end_date:str):
     '''
@@ -330,3 +378,252 @@ def query_adam_dist_scheme_det_by_distschemeid(id:Number):
         raise
     except Exception as e:
         raise
+
+def query_adam_pre_range_info():
+    '''
+    查询预测范围数据
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_pre_range_info'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {}
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_qua_stock_sample_by_year_month(year:str, month:str):
+    """
+    通过年月时间查询合格品库存数据
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_qua_stock_sample_by_year_month'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "year":year,
+            "month":month
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_pend_stock_sample_by_year_month(year:str, month:str):
+    """
+    通过年月时间查询待检库存数据
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_pend_stock_sample_by_year_month'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "year":year,
+            "month":month
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_adam_wd_dmd_pre_by_year_month_and_pretype(year:str, month:str, pre_type:str):
+    """
+    通过年月以及预测类型查询周/日市县需求预测结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_wd_dmd_pre_by_year_month_and_pretype'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "year":year,
+            "month":month,
+            "pre_type":pre_type
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_y_mgt_org():
+    '''
+    查询组织架构信息
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_y_mgt_org'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {}
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_spec_code_config():
+    '''
+    查询规格设备码信息
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_spec_code_config'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {}
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+
+def query_adam_del_site_conf():
+    '''
+    查询配送站点信息
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_del_site_conf'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {}
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_adam_plan_day_ias_pre_by_date(date:str):
+    '''
+    根据日期查询日补库计划
+    '''
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/query_adam_plan_day_ias_pre_by_date'
+        url = f"http://{host}:{port}{endpoint}"
+        json = {
+            "date":date
+        }
+        response = requests.post(url, json=json)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+

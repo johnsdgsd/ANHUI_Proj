@@ -59,6 +59,18 @@ class DemandDistribution(ABC):
             分布均值
         """
         pass
+    
+    @abstractmethod
+    def calculate_fill_rate(self, inventory: float) -> float:
+        """根据库存值计算满足率（需求小于等于库存的概率）
+        
+        Args:
+            inventory: 库存值
+            
+        Returns:
+            满足率，范围0-1
+        """
+        pass
 
 class NormalDistribution(DemandDistribution):
     """正态分布"""
@@ -79,6 +91,12 @@ class NormalDistribution(DemandDistribution):
     
     def get_mean(self) -> float:
         return self.mean
+    
+    def calculate_fill_rate(self, inventory: float) -> float:
+        # 使用CDF计算需求小于等于库存的概率
+        period_mean = self.mean * self.rate
+        period_std = self.std * (self.rate ** 0.5)
+        return norm.cdf(inventory, loc=period_mean, scale=period_std)
 
 class PoissonDistribution(DemandDistribution):
     """泊松分布"""
@@ -99,6 +117,11 @@ class PoissonDistribution(DemandDistribution):
     
     def get_mean(self) -> float:
         return self.lambda_
+    
+    def calculate_fill_rate(self, inventory: float) -> float:
+        # 使用CDF计算需求小于等于库存的概率
+        period_lambda = self.lambda_ * self.rate
+        return poisson.cdf(inventory, period_lambda)
 
 class UniformDistribution(DemandDistribution):
     """均匀分布"""
@@ -119,3 +142,15 @@ class UniformDistribution(DemandDistribution):
     
     def get_mean(self) -> float:
         return (self.low + self.high) / 2
+    
+    def calculate_fill_rate(self, inventory: float) -> float:
+        # 使用CDF计算需求小于等于库存的概率
+        period_low = self.low * self.rate
+        period_high = self.high * self.rate
+        
+        if inventory <= period_low:
+            return 0.0
+        elif inventory >= period_high:
+            return 1.0
+        else:
+            return (inventory - period_low) / (period_high - period_low)

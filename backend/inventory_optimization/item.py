@@ -1,4 +1,6 @@
+from math import ceil
 from typing import Dict, Optional, Tuple
+import random
 from .demand_distribution import DemandDistribution
 
 class Item:
@@ -101,6 +103,25 @@ class Item:
         if month not in self.demand_distributions:
             raise ValueError(f"月份 {month} 的需求分布不存在")
         return self.demand_distributions[month].generate_random()
+    
+    def calculate_initial_fill_rate(self, month: int) -> float:
+        """根据初始库存计算指定月份的初始满足率
+        
+        Args:
+            month: 月份编号（1-12）
+            
+        Returns:
+            初始满足率，范围0-1
+            
+        Raises:
+            ValueError: 当月份不存在时
+        """
+        if month not in self.demand_distributions:
+            raise ValueError(f"月份 {month} 的需求分布不存在")
+        
+        distribution = self.demand_distributions[month]
+        res = distribution.calculate_fill_rate(self.initial_inventory)
+        return min(0.99999999,res), distribution.generate_demand(0.95)
     
     def _get_next_year_month(self, year_month: int) -> int:
         """获取下一个月
@@ -215,3 +236,10 @@ class Item:
         self.total_shortage_cost = round(self.total_shortage_cost,1)
         # 计算总成本
         self.total_cost = self.total_holding_cost + self.total_shortage_cost
+
+    def get_weekly_threshold(self, week_seq:int, beta:float , alpha:float)-> tuple[int,int,int]:
+        distribution = self.demand_distributions[week_seq]
+        low =  distribution.generate_demand(beta)
+        high = distribution.generate_demand(alpha)
+        mid = (low + high) / 2
+        return ceil(low), ceil(mid), ceil(high)

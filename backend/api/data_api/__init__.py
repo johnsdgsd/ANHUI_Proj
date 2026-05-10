@@ -5,10 +5,16 @@ from .fetch_data import (
     insert_into_aps_inventory_fulfill_rate,
     insert_into_aps_inventory_replenish,
     insert_into_aps_inventory_replenish_qty,
+    insert_into_adam_plan_day_ias_pre,
     query_aps_qua_sto_by_month,
     query_aps_unqua_sto_by_month,
     query_adam_dist_scheme_by_date_range,
-    query_adam_dist_scheme_det_by_distschemeid
+    query_adam_dist_scheme_det_by_distschemeid,
+    query_adam_pre_range_info,
+    query_adam_qua_stock_sample_by_year_month,
+    query_adam_pend_stock_sample_by_year_month,query_adam_wd_dmd_pre_by_year_month_and_pretype,
+    query_adam_y_mgt_org,query_adam_spec_code_config,query_adam_del_site_conf,
+    query_adam_plan_day_ias_pre_by_date
 )
 
 __all__ = [
@@ -18,8 +24,17 @@ __all__ = [
     'insert_into_aps_inventory_fulfill_rate',
     'insert_into_aps_inventory_replenish',
     'insert_into_aps_inventory_replenish_qty',
+    'insert_into_adam_plan_day_ias_pre',
     'query_aps_qua_sto_by_month',
     'query_aps_unqua_sto_by_month',
     'query_adam_dist_scheme_by_date_range',
-    'query_adam_dist_scheme_det_by_distschemeid'
+    'query_adam_dist_scheme_det_by_distschemeid',
+    'query_adam_pre_range_info',
+    'query_adam_qua_stock_sample_by_year_month',
+    'query_adam_pend_stock_sample_by_year_month',
+    'query_adam_wd_dmd_pre_by_year_month_and_pretype',
+    'query_adam_y_mgt_org',
+    'query_adam_spec_code_config',
+    'query_adam_del_site_conf',
+    'query_adam_plan_day_ias_pre_by_date'
 ]

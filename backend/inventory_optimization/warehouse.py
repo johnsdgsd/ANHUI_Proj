@@ -201,7 +201,6 @@ class LocalWarehouse:
                 item.holding_cost = category_costs[item.cls]['holding_cost']
                 item.shortage_cost = category_costs[item.cls]['shortage_cost']
 
-
 class CentralWarehouse:
     """中心库"""
     def __init__(self):
@@ -399,5 +398,4 @@ class CentralWarehouse:
             item_key: 物资键（可以是设备码或其他唯一标识）
             item: 物资对象
         """
-        self.items[item_key] = item
-    
+        self.items[item_key] = item 
