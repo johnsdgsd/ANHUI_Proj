@@ -8,7 +8,7 @@ from backend.api.data_api.fetch_data import *
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from datetime import datetime
 from backend.inventory_optimization import DailyReplenishmentPlan
-
+import ast
 
 def f1():
     print()
@@ -124,5 +124,17 @@ def f1():
 if __name__ == '__main__':
     print()
     from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery
-    DelivPlan = AdjustDaliyDelivery('2026-05-08')
+    # DelivPlan = AdjustDaliyDelivery('2026-05-08')
+    # print(DelivPlan)
+    DelivPlan = pd.read_excel('delivery_plan.xlsx')
+    site_info = query_adam_del_site_conf()
+    site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
+    Path_no = []
+    for planpath in DelivPlan['PlanPath']:
+        p = []
+        idx_list = ast.literal_eval(planpath)
+        for idx in idx_list:
+            p.append(site_info.loc[idx-1,'ORG_NO'])
+        Path_no.append(p)
+    DelivPlan['PathNo'] = Path_no
     print(DelivPlan)

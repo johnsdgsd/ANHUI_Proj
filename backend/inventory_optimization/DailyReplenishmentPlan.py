@@ -2,7 +2,6 @@
 日补库计划生成脚本
 包括汇总配送方案结果得到日补库计划，根据日补库计划调整配送计划，获取配送计划数据等
 """
-
 import pandas as pd
 import numpy as np
 from geopy.distance import geodesic
@@ -154,6 +153,7 @@ def AdjustDaliyDelivery(date:str):
     """
     根据日补库计划调整日配送
     """
+    from backend.api.data_api.fetch_data import query_adam_del_site_conf
     logging.basicConfig(
         level=logging.INFO,  # 设置日志级别为 INFO
         format="%(asctime)s - %(levelname)s - %(message)s",  # 设置日志格式
@@ -223,10 +223,10 @@ def AdjustDaliyDelivery(date:str):
     DelivDay = 1
     VNums_All = VNums * DelivDay # 每种车辆可以派车的总次数
 
-
+    # 由于箱数较少，基本上没有整车配送
     for i in range(LocationNum):
         LI = LocationInds[i]  # 获取当前排序的路径索引
-        while DemandsBoxs[LI-1] >= VeCap[1] + MinDeliverNum:  # 确定是否可以继续配送
+        while DemandsBoxs[LI-1] >= VeCap[2] + MinDeliverNum:  # 确定是否可以继续配送，是否大于最小车的箱数
             # 确定需要使用的车辆种类
             for j in range(VeTypeNum):
                 if DemandsBoxs[LI-1] >= VeCap[j] + MinDeliverNum and VNums_All[j] >= 1:
@@ -411,4 +411,15 @@ def AdjustDaliyDelivery(date:str):
     }
 
     DelivPlan= pd.DataFrame(DelivPlan)
+    #增加配送地点编号
+    site_info = query_adam_del_site_conf()
+    site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
+    Path_no = []
+    for planpath in DelivPlan['PlanPath']:
+        p = []
+        for idx in planpath:
+            p.append(site_info.loc[idx-1,'ORG_NO'])
+        Path_no.append(p)
+    DelivPlan['PathNo'] = Path_no
+    
     return DelivPlan
