@@ -45,7 +45,8 @@ def LoadDelivData(date:str):
             if idx.any():
                 Demands[i, j] = Number[idx].values[0]
     Demands=pd.DataFrame(Demands)
-    
+    # 最多三个地点
+    MaxLen = 3 if len(set(LocationInd)) >=3 else 2
     #车辆信息
     VehicleTb = {
         "VeType":['大号','中号','小号'],
@@ -83,7 +84,7 @@ def LoadDelivData(date:str):
     DMat.columns = range(1, numLocations+ 1)
     DMat.index = range(1, numLocations+ 1)
 
-    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat
+    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen
 
 def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
     """
@@ -165,34 +166,6 @@ def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
 
     return DelivPlan
 
-def ExpandDeviceDetail(DelivPlan, SubTypeList):
-    """
-    将配送计划按设备码展开为明细表。
-    
-    参数:
-        DelivPlan: 包含 PathNo, DevicePieces 的 DataFrame
-        SubTypeList: 包含 DEV_CODE 的设备码表 (索引对应设备码编号 0-based)
-    返回:
-        明细 DataFrame，列：OrgNo, DevCode, Quantity
-    """
-    Rows = []
-    for _, Plan in DelivPlan.iterrows():
-        PathNo = Plan['PathNo']          # 例如 ['3441501', '34406']
-        DevicePieces = Plan['DevicePieces']   # 列表的列表，内层为设备码件数数组
-        # 遍历每个停靠点
-        for StopIdx, (Org, Pieces) in enumerate(zip(PathNo, DevicePieces)):
-            # 遍历设备码
-            for DevIdx, Qty in enumerate(Pieces):
-                if Qty > 0:
-                    DevCode = SubTypeList.iloc[DevIdx]['DEV_CODE']
-                    Rows.append({
-                        'OrgNo': Org,
-                        'DevCode': DevCode,
-                        'Quantity': int(Qty)
-                    })
-    DetailDf = pd.DataFrame(Rows)
-    return DetailDf
-
 def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
     """
     将配送计划解析为 ADAM_DIST_SCHEME（主表）和 ADAM_DIST_SCHEME_DET（明细表）
@@ -242,7 +215,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
         MainRows.append({
             'DIST_SCHEME_ID': SchemeId,
             'CAR_TYPE': f"0{VeType}",          # 可替换为实际车型代码
-            'PLAN_DIST_DATE': pd.to_datetime(PlanDate).date(),
+            'PLAN_DIST_DATE': PlanDate,
             'DIST_FLAG': 'Y',                     # 默认配送
             'LATE_FLAG': 'N',
             'LOAD_RATE': LoadRate,
@@ -254,7 +227,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
         # 处理明细：遍历每个停靠点
         for StopIdx, (OrgNo, StopPieces) in enumerate(zip(PathNo, DevicePieces)):
             DistSeq = StopIdx + 1
-            LoadSeq = len(PathNo) + 1 - DistSeq   # 假设装车顺序与配送顺序相同，可改为逆序： len(PathNo) + 1 - DistSeq
+            LoadSeq = len(PathNo) -  StopIdx   # 假设装车顺序与配送顺序相同，可改为逆序： len(PathNo) + 1 - DistSeq
             for DevIdx, Qty in enumerate(StopPieces):
                 if Qty == 0:
                     continue
@@ -280,7 +253,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
                     'DIST_SEQ': DistSeq,
                     'LOAD_SEQ': LoadSeq,
                     'PLAN_DIST_NUM': int(Qty),
-                    'EST_TOT_DIST_MIST': round(EstDist, 4),
+                    'EST_TOT_DIST_MIST':"" ,#round(EstDist, 4)
                     'DIST_EXP': round(DistExp, 4),
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
@@ -374,7 +347,7 @@ def AdjustDaliyDelivery(date:str):
         format="%(asctime)s - %(levelname)s - %(message)s",  # 设置日志格式
         stream=sys.stdout  # 将日志输出到控制台
     )
-    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT=LoadDelivData(date)
+    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen=LoadDelivData(date)
     EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
     SubTypeNum = len(SubTypeList)
     DemandsBoxs = np.zeros((LocationNum, SubTypeNum))
@@ -387,7 +360,8 @@ def AdjustDaliyDelivery(date:str):
     logging.info("计算路径数")
     DMAT = DMAT.values
     DMAT= DMAT + DMAT.T
-    PathInfo, _ = GetPathDis(DMAT, 3)
+
+    PathInfo, _ = GetPathDis(DMAT, MaxLen)
     PathInfo=pd.DataFrame(PathInfo)
 
     SaveDis = np.zeros(len(PathInfo))

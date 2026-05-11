@@ -627,3 +627,117 @@ def query_adam_plan_day_ias_pre_by_date(date:str):
     except Exception as e:
         raise
 
+def insert_into_adam_dist_scheme(df: pd.DataFrame):
+    """插入配送方案主表数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - DIST_SCHEME_ID: 唯一标识
+            - CAR_TYPE: 车辆类型
+            - PLAN_DIST_DATE: 计划配送日期
+            - DIST_FLAG: 是否配送
+            - LATE_FLAG: 是否逾期配送
+            - LOAD_RATE: 装载率
+            - CREATE_DATE: 创建时间
+            - UPDATE_DATE: 更新时间
+            - GLOBAL_SCHEME_ID: 全局方案标识
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/insert_into_adam_dist_scheme'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def insert_into_adam_dist_scheme_det(df: pd.DataFrame):
+    """插入配送方案明细表数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - DIST_SCHEME_DET_ID: 方案明细唯一标识
+            - DIST_SCHEME_ID: 方案唯一标识
+            - REC_ORG_NO: 接收单位
+            - DEV_CODE: 设备码
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - DIST_SEQ: 配送顺序
+            - LOAD_SEQ: 装车顺序
+            - PLAN_DIST_NUM: 计划配送数量
+            - EST_TOT_DIST_MIST: 预计配送里程
+            - DIST_EXP: 配送费用
+            - GLOBAL_SCHEME_ID: 全局方案标识
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/insert_into_adam_dist_scheme_det'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
