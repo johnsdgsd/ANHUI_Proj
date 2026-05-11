@@ -1,14 +1,13 @@
-import os
-import sys
-from numpy import rec
-
 from backend.inventory_optimization.optimizer import InventoryOptimizer
-from backend.inventory_optimization.warehouse import CentralWarehouse
+from backend.inventory_optimization.warehouse import CentralWarehouse,LocalWarehouse
+from backend.inventory_optimization.item import Item
 from backend.api.data_api.fetch_data import *
+from backend.inventory_optimization.demand_distribution import PoissonDistribution
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from datetime import datetime
 from backend.inventory_optimization import DailyReplenishmentPlan
-import ast
+import ast 
+from backend.data_cleaning.process_historical_install_data import process_historical_install_data
 
 def f1():
     print()
@@ -117,12 +116,101 @@ def f1():
     InventoryOrder = pd.DataFrame(order_result_data)
     insert_into_aps_inventory_replenish_qty(InventoryOrder)
 
+def f2():
+    import pandas as pd
+    # 1. 读取初始库存数据并去重
+    stock_file_path = r'C:\Users\Administrator\Desktop\NARI_APS_INVENTORY_INIT_STOCK.xlsx'
+    stock_df = pd.read_excel(stock_file_path)
+    # 按单位编码和设备码去重
+    stock_df = stock_df.drop_duplicates(subset=['UNIT_CODE', 'DEVICE_CODE'], keep='first')
+    print(f"初始库存数据共 {len(stock_df)} 行（去重后）")
+    
+    # 2. 读取安装量数据
+    install_df = process_historical_install_data()
+    print(f"安装量数据共 {len(install_df)} 行")
+    
+    # 3. 读取满足率数据
+    fulfill_file_path = r'C:\Users\Administrator\Desktop\NARI_APS_INVENTORY_FULFILL_RATE.xlsx'
+    fulfill_df = pd.read_excel(fulfill_file_path)
+    print(f"满足率数据共 {len(fulfill_df)} 行")
+    
+    # 4. 初始化LocalWarehouse列表
+    warehouses = []
+    # 按单位编码分组，一个仓库对应多个物资
+    for unit_code, group in fulfill_df.groupby('UNIT_CODE'):
+        # 创建仓库
+        warehouse = LocalWarehouse(warehouse_id=None,city_code=unit_code,city_name=None)
+        
+        # 遍历该仓库下的所有设备码
+        for device_code, device_group in group.groupby('DEVICE_CODE'):
+            # 获取满足率
+            fulfill_rate = device_group['FULFILL_RATE'].iloc[0]
+            
+            # 获取初始库存（确保数据类型一致）
+            stock_row = stock_df[
+                (stock_df['UNIT_CODE'].astype(str) == str(unit_code)) & 
+                (stock_df['DEVICE_CODE'].astype(str) == str(device_code))
+            ]
+            begin_stock_num = stock_row['BEGIN_STOCK_NUM'].iloc[0] if not stock_row.empty else 0
+            
+            # 获取安装量（确保数据类型一致）
+            install_row = install_df[
+                (install_df['单位编码'].astype(str) == str(unit_code)) & 
+                (install_df['设备码编号'].astype(str) == str(device_code))
+            ]
+            avg_install = install_row['平均安装数量'].iloc[0] if not install_row.empty else 5
+            
+            # 添加物资到仓库
+            item = Item(dev_code=device_code, initial_inventory=begin_stock_num, alpha=fulfill_rate,cls = None,holding_cost=0,shortage_cost=0)
+            item.set_demand_distribution(5,PoissonDistribution(lambda_=avg_install))
+            warehouse.add_item(device_code,item)
+            
+            print(f"仓库 {unit_code} 物资 {device_code} 初始化完成：初始库存 {begin_stock_num}，安装量 {avg_install}，满足率 {fulfill_rate}")
+        
+        # 将仓库添加到列表
+        warehouses.append(warehouse)
 
 
+    tag = datetime.now().strftime("%Y%m%d%H%M%S")
+    demand_result_data = []
+    order_result_data = []
+    for local_warehouse in warehouses:
+        for item_key, item in local_warehouse.items.items():
+            demand = item.generate_demand_quantile(5)
+            order = max(0, demand - item.initial_inventory)
+            demand_result_data.append(
+                {
+                    'STAT_MONTH': 202605,
+                    'UNIT_CODE': local_warehouse.city_code,
+                    'UNIT_NAME': local_warehouse.city_name,
+                    'DEVICE_TYPE': item.cls,
+                    'DEVICE_CODE': item.dev_code,
+                    'TAG': tag,
+                    'BASE_STOCK_NUM': int(demand)
+                }
+            )
+            order_result_data.append(
+                {
+                    'STAT_MONTH': 202605,
+                    'UNIT_CODE': local_warehouse.city_code,
+                    'UNIT_NAME': local_warehouse.city_name,
+                    'DEVICE_TYPE': item.cls,
+                    'DEVICE_CODE': item.dev_code,
+                    'TAG': tag,
+                    'REPLENISH_NUM': order
+                }
+            )
+    return pd.DataFrame(demand_result_data),pd.DataFrame(order_result_data)
 
 
 if __name__ == '__main__':
     print()
-    from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery
-    DelivPlan = AdjustDaliyDelivery('2026-05-08')
-    print(DelivPlan)
+    from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
+    # DailyReplenishmentPlan('2026-05-01','2026-05-31')
+    MainScheme , DetailScheme = AdjustDaliyDelivery('2026-05-06')
+    print(MainScheme ,'\n', DetailScheme)
+    # demand,order = f2()
+    # demand.to_excel("使用新的历史安装量并转换设备码后的库存阈值.xlsx",index=False)
+    # order.to_excel("使用新的历史安装量并转换设备码后的各单位补货量.xlsx",index=False)
+    # print(demand)
+    # print(order)

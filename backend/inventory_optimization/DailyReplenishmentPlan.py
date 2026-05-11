@@ -10,6 +10,8 @@ import pulp
 import logging
 import sys
 from collections import defaultdict
+import datetime
+
 
 def LoadDelivData(date:str):
     '''
@@ -163,7 +165,6 @@ def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
 
     return DelivPlan
 
-
 def ExpandDeviceDetail(DelivPlan, SubTypeList):
     """
     将配送计划按设备码展开为明细表。
@@ -191,6 +192,110 @@ def ExpandDeviceDetail(DelivPlan, SubTypeList):
                     })
     DetailDf = pd.DataFrame(Rows)
     return DetailDf
+
+def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
+    """
+    将配送计划解析为 ADAM_DIST_SCHEME（主表）和 ADAM_DIST_SCHEME_DET（明细表）
+    参数：
+        DelivPlan   : 包含 PathInd, VeType, Price, PlanPath, DeNum, PathNo, PathDis, DevicePieces
+        PlanDate    : 计划日期字符串 (e.g., '2026-05-11')
+        SubTypeList : 设备码配置，至少包含 DEV_CODE 列；可选 DEV_CLS, DEV_CATEG
+        VeCap       : 各车型容量数组
+    返回：
+        MainDf   : 主表 DataFrame
+        DetailDf : 明细表 DataFrame
+    """
+    # 生成全局方案标识（基于日期，去掉 '-' 转为整数）
+    GlobalSchemeId = int(PlanDate.replace('-', ''))
+    CurrentDateStr = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    MainRows = []
+    DetailRows = []
+
+    # 用于明细ID递增
+    DetailIdSeq = 1
+
+    # 遍历每一趟配送（每行代表一辆车一条路线）
+    for RowIdx, Row in DelivPlan.iterrows():
+        SchemeId = GlobalSchemeId * 1000 + RowIdx + 1   # 主表唯一ID
+
+        VeType = int(Row['VeType'])
+        PathDis = Row['PathDis']
+        Price = Row['Price']
+        DeNum = Row['DeNum']
+        PathNo = Row['PathNo']
+        DevicePieces = Row['DevicePieces']   # 列表，长度等于停靠点数，每个元素是各设备码件数数组
+
+        # 计算总箱数、总件数（用于分摊费用）
+        TotalBoxes = sum(DeNum)
+        TotalPieces = 0
+        for StopPieces in DevicePieces:
+            TotalPieces += sum(StopPieces)
+
+        # 装载率 = 实际箱数 / 车辆容量
+        if VeType >= 1 and VeType <= len(VeCap):
+            LoadRate = f"{TotalBoxes / VeCap[VeType-1] * 100:.1f}%"
+        else:
+            LoadRate = "0%"
+
+        # 主表记录
+        MainRows.append({
+            'DIST_SCHEME_ID': SchemeId,
+            'CAR_TYPE': f"0{VeType}",          # 可替换为实际车型代码
+            'PLAN_DIST_DATE': pd.to_datetime(PlanDate).date(),
+            'DIST_FLAG': 'Y',                     # 默认配送
+            'LATE_FLAG': 'N',
+            'LOAD_RATE': LoadRate,
+            'CREATE_DATE': CurrentDateStr,
+            'UPDATE_DATE': CurrentDateStr,
+            'GLOBAL_SCHEME_ID': GlobalSchemeId
+        })
+
+        # 处理明细：遍历每个停靠点
+        for StopIdx, (OrgNo, StopPieces) in enumerate(zip(PathNo, DevicePieces)):
+            DistSeq = StopIdx + 1
+            LoadSeq = len(PathNo) + 1 - DistSeq   # 假设装车顺序与配送顺序相同，可改为逆序： len(PathNo) + 1 - DistSeq
+            for DevIdx, Qty in enumerate(StopPieces):
+                if Qty == 0:
+                    continue
+                DevCode = SubTypeList.iloc[DevIdx]['DEV_CODE']
+                DevCls = SubTypeList.iloc[DevIdx].get('DEV_CLS', '')
+                DevCateg = SubTypeList.iloc[DevIdx].get('DEV_CATEG', '')
+
+                # 费用和里程分摊：按件数比例
+                if TotalPieces > 0:
+                    Ratio = Qty / TotalPieces
+                else:
+                    Ratio = 0
+                EstDist = PathDis * Ratio          # 分摊里程（可根据业务调整）
+                DistExp = Price * Ratio            # 分摊费用
+
+                DetailRows.append({
+                    'DIST_SCHEME_DET_ID': DetailIdSeq,
+                    'DIST_SCHEME_ID': SchemeId,
+                    'REC_ORG_NO': str(OrgNo),
+                    'DEV_CODE': DevCode,
+                    'DEV_CLS': DevCls,
+                    'DEV_CATEG': DevCateg,
+                    'DIST_SEQ': DistSeq,
+                    'LOAD_SEQ': LoadSeq,
+                    'PLAN_DIST_NUM': int(Qty),
+                    'EST_TOT_DIST_MIST': round(EstDist, 4),
+                    'DIST_EXP': round(DistExp, 4),
+                    'GLOBAL_SCHEME_ID': GlobalSchemeId
+                })
+                DetailIdSeq += 1
+
+    MainDf = pd.DataFrame(MainRows)
+    DetailDf = pd.DataFrame(DetailRows)
+
+    # 调整列顺序与给定表结构一致
+    MainDf = MainDf[['DIST_SCHEME_ID', 'CAR_TYPE', 'PLAN_DIST_DATE', 'DIST_FLAG', 'LATE_FLAG',
+                     'LOAD_RATE', 'CREATE_DATE', 'UPDATE_DATE', 'GLOBAL_SCHEME_ID']]
+    DetailDf = DetailDf[['DIST_SCHEME_DET_ID', 'DIST_SCHEME_ID', 'REC_ORG_NO', 'DEV_CODE',
+                         'DEV_CLS', 'DEV_CATEG', 'DIST_SEQ', 'LOAD_SEQ', 'PLAN_DIST_NUM',
+                         'EST_TOT_DIST_MIST', 'DIST_EXP', 'GLOBAL_SCHEME_ID']]
+    return MainDf, DetailDf
 
 
 def DailyReplenishmentPlan(start_date: str, end_date: str) -> pd.DataFrame:
@@ -270,7 +375,7 @@ def AdjustDaliyDelivery(date:str):
         stream=sys.stdout  # 将日志输出到控制台
     )
     Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT=LoadDelivData(date)
-
+    EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
     SubTypeNum = len(SubTypeList)
     DemandsBoxs = np.zeros((LocationNum, SubTypeNum))
     for i in range(SubTypeNum):
@@ -282,7 +387,7 @@ def AdjustDaliyDelivery(date:str):
     logging.info("计算路径数")
     DMAT = DMAT.values
     DMAT= DMAT + DMAT.T
-    PathInfo, _ = GetPathDis(DMAT, 2)
+    PathInfo, _ = GetPathDis(DMAT, 3)
     PathInfo=pd.DataFrame(PathInfo)
 
     SaveDis = np.zeros(len(PathInfo))
@@ -292,7 +397,6 @@ def AdjustDaliyDelivery(date:str):
         if len(path) != 1:
             SaveDis[i] = (PathInfo.loc[path[0]-1, 'PathDis'] + PathInfo.loc[path[1]-1, 'PathDis']) - PathInfo.loc[i, 'PathDis']
 
-    #
     logging.info("对 SaveDis 排序并获取索引")
     sorted_indices= np.argsort(SaveDis, kind='stable') + 1
     sorted_indices = sorted_indices[len(DMAT)-1:]
@@ -347,7 +451,7 @@ def AdjustDaliyDelivery(date:str):
             PathInd[PlanInd-1] = LI
             PlanPath[PlanInd-1] = LI
             PlanPath[PlanInd - 1]=[PlanPath[PlanInd-1]]
-            Price[PlanInd-1] = VeUnitPrice[j] * PathInfo.loc[LI-1,'PathDis']  # 计算价格
+            Price[PlanInd - 1] = VeUnitPrice[j] * VeCap[j] * PathInfo.loc[LI - 1, 'PathDis'] # 计算价格
             PlanInd += 1
     VTypeTimes=VNums_All
 
@@ -379,7 +483,7 @@ def AdjustDaliyDelivery(date:str):
         if DemandsBoxs[orig_idx] < MinDeliverNum:
             mindeliver_map[pos] = DemandsBoxs[orig_idx]   # pos 为 0‑based（在 active_nodes 中的下标）
 
-    # ===================== 2. 构建压缩模型 =====================
+    # ===================== 2. 构建压缩模型（含空载惩罚） =====================
     prob = pulp.LpProblem("deleivplan_compact", pulp.LpMinimize)
 
     # 变量字典
@@ -400,15 +504,24 @@ def AdjustDaliyDelivery(date:str):
             I_vl[(v, l)] = pulp.LpVariable(
                 f"I_v{v}_l{l}", lowBound=0, upBound=1, cat='Integer')
 
-    # 目标函数：最小化 Σ cost_{v,l} * I_{v,l}
+    # ---------- 目标函数：距离 × [ 载箱量×单价 + (容量·I - 载箱量)×空载惩罚 ] ----------
     prob += pulp.lpSum(
-        VeUnitPrice[v - 1] * PathInfo_active.loc[l - 1, 'PathDis'] * I_vl[(v, l)]
-        for v in range(1, VeTypeNum + 1) for l in range(1, PathNum_new + 1)
+        PathInfo_active.loc[l - 1, 'PathDis'] * (
+            pulp.lpSum(
+                VeUnitPrice[v - 1] * x_nvl[(n, v, l)]
+                for n in range(1, N_active + 1)
+            )
+            + EmptyPenalty[v - 1] * (
+                VeCap[v - 1] * I_vl[(v, l)]
+                - pulp.lpSum(x_nvl[(n, v, l)] for n in range(1, N_active + 1))
+            )
+        )
+        for v in range(1, VeTypeNum + 1)
+        for l in range(1, PathNum_new + 1)
     )
 
-    # 约束1：需求等式约束
+    # ---------- 约束1：需求等式约束 ----------
     for n in range(1, N_active + 1):
-        # 找出包含该活性节点的所有 (v, l) 组合
         terms = []
         orig_node = active_nodes[n - 1] + 1   # 原始 1‑based 节点号
         for l in range(1, PathNum_new + 1):
@@ -417,11 +530,10 @@ def AdjustDaliyDelivery(date:str):
                     terms.append(x_nvl[(n, v, l)])
         prob += pulp.lpSum(terms) == demands_active[n - 1]
 
-    # 约束2 & 3：容量约束 + 最小配送量约束（合并循环）
+    # ---------- 约束2 & 3：容量约束 + 最小配送量约束 ----------
     for v in range(1, VeTypeNum + 1):
         for l in range(1, PathNum_new + 1):
             path = PathInfo_active.loc[l - 1, 'Path']   # 1‑based 原始节点列表
-            # 收集该路径上所有活性节点对应的变量
             vars_in_path = []
             first_var = None
             last_var = None
@@ -435,7 +547,7 @@ def AdjustDaliyDelivery(date:str):
                     if raw_node == path[-1]:
                         last_var = var
 
-            # 容量约束
+            # 容量约束：总配送量 ≤ 容量·I
             if vars_in_path:
                 prob += pulp.lpSum(vars_in_path) <= VeCap[v - 1] * I_vl[(v, l)]
 
@@ -453,7 +565,7 @@ def AdjustDaliyDelivery(date:str):
                 min_q_last = mindeliver_map.get(pos_last, MinDeliverNum)
                 prob += last_var >= min_q_last * I_vl[(v, l)]
 
-    # 约束4：每种车型的使用次数上限
+    # ---------- 约束4：每种车型的使用次数上限 ----------
     for v in range(1, VeTypeNum + 1):
         prob += pulp.lpSum(I_vl[(v, l)] for l in range(1, PathNum_new + 1)) <= VTypeTimes[v - 1]
 
@@ -481,9 +593,6 @@ def AdjustDaliyDelivery(date:str):
         # 路径节点（原始 1‑based）
         path_nodes = PathInfo.loc[orig_path_idx - 1, 'Path'].copy()  # 列表
         PlanPath[PlanInd - 1] = path_nodes
-        Price[PlanInd - 1] = VeUnitPrice[v - 1] * PathInfo.loc[orig_path_idx - 1, 'PathDis']
-        VeType[PlanInd - 1] = VeTypeI
-        PathInd[PlanInd - 1] = PathIndI
 
         # 计算每个节点的配送量（活性节点取整，非活性节点为 0）
         deliv_vec = np.zeros(len(path_nodes))
@@ -491,11 +600,19 @@ def AdjustDaliyDelivery(date:str):
             if (node - 1) in active_nodes:
                 pos = np.where(active_nodes == node - 1)[0][0] + 1   # 新索引 1‑based
                 deliv_vec[j] = round(x_nvl[(pos, v, l)].value())
-            # 其他节点保持为 0
+        total_boxes = np.sum(deliv_vec)
+
+        # ---------- 价格 = 距离 × (载箱成本 + 空载惩罚) ----------
+        loaded_cost = VeUnitPrice[v - 1] * total_boxes
+        empty_cost = EmptyPenalty[v - 1] * (VeCap[v - 1] - total_boxes)
+        Price[PlanInd - 1] = (loaded_cost + empty_cost) * PathInfo.loc[orig_path_idx - 1, 'PathDis']
+
+        VeType[PlanInd - 1] = VeTypeI
+        PathInd[PlanInd - 1] = PathIndI
         DeNum[PlanInd - 1] = deliv_vec
         PlanInd += 1
 
-    # ===================== 5. 生成最终计划 DataFrame（与原格式完全一致） =====================
+    # ===================== 5. 生成最终计划 DataFrame =====================
     DeNum = DeNum[:PlanInd - 1]
     VeType = VeType[:PlanInd - 1]
     PathInd = PathInd[:PlanInd - 1]
@@ -521,6 +638,9 @@ def AdjustDaliyDelivery(date:str):
             p.append(site_info.loc[idx-1,'ORG_NO'])
         Path_no.append(p)
     DelivPlan['PathNo'] = Path_no
+    DelivPlan['PathDis'] = DelivPlan['PathInd'].apply(lambda i: PathInfo.loc[i-1, 'PathDis'])
     DelivPlan = GenerateDelivPlan(DelivPlan,Demands,SubTypeList)
-    
-    return ExpandDeviceDetail(DelivPlan,SubTypeList)
+    # DelivPlan = ExpandDeviceDetail(DelivPlan,SubTypeList)
+
+    MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap)
+    return MainScheme , DetailScheme
