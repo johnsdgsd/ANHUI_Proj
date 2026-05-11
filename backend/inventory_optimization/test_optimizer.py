@@ -124,17 +124,5 @@ def f1():
 if __name__ == '__main__':
     print()
     from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery
-    # DelivPlan = AdjustDaliyDelivery('2026-05-08')
-    # print(DelivPlan)
-    DelivPlan = pd.read_excel('delivery_plan.xlsx')
-    site_info = query_adam_del_site_conf()
-    site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
-    Path_no = []
-    for planpath in DelivPlan['PlanPath']:
-        p = []
-        idx_list = ast.literal_eval(planpath)
-        for idx in idx_list:
-            p.append(site_info.loc[idx-1,'ORG_NO'])
-        Path_no.append(p)
-    DelivPlan['PathNo'] = Path_no
+    DelivPlan = AdjustDaliyDelivery('2026-05-08')
     print(DelivPlan)

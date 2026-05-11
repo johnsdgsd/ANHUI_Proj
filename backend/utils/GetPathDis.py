@@ -34,12 +34,11 @@ def GetPathDis(DMat, MaxLen):
         CurInd += 1
 
     # 处理 PathSet[3] 到 PathSet[MaxLen]
-    # print('是否需要修改为permutation获取排列数?')
     for i in range(2, MaxLen):
         PathSetI = PathSet[i]
         for j in range(PathSetI.shape[0]):
             PathIJ = PathSetI[j]
-            PathOrders = np.array(list(combinations(PathIJ, i)))  
+            PathOrders = np.array(list(combinations(PathIJ, i+1)))
             PermNumIJ = PathOrders.shape[0]
             DisIJs = np.zeros(PermNumIJ)
 

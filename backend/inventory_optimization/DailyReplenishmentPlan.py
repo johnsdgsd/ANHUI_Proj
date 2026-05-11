@@ -9,6 +9,7 @@ from backend.utils import GetPathDis
 import pulp
 import logging
 import sys
+from collections import defaultdict
 
 def LoadDelivData(date:str):
     '''
@@ -48,7 +49,7 @@ def LoadDelivData(date:str):
         "VeType":['大号','中号','小号'],
         "VeCap":[1100,900,410],
         "VNum":[12,35,34],
-        "VeUnitPrice":[0.7,0.7,0.7]
+        "VeUnitPrice":[0.07,0.07,0.07]
     }
     VehicleTb = pd.DataFrame(VehicleTb)
 
@@ -81,6 +82,115 @@ def LoadDelivData(date:str):
     DMat.index = range(1, numLocations+ 1)
 
     return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat
+
+def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
+    """
+    后处理配送计划：考虑不能混装，将每个地点的总箱数按整数箱分配还原为各设备码件数。
+    
+    参数:
+        DelivPlan: pd.DataFrame, 必须包含 'PlanPath' 和 'DeNum' 列
+        Demands:   pd.DataFrame, 形状 (LocationNum, SubTypeNum), 每个地点各设备码的原始需求件数
+        SubTypeList: pd.DataFrame, 必须包含 'PACK_BOX_NUM' 列
+    
+    返回:
+        DelivPlan: pd.DataFrame, 新增 'DevicePieces' 列，记录每个停靠点每种设备码的实际配送件数
+    """
+    SubTypeNum = len(SubTypeList)
+    LocationNum = Demands.shape[0]
+
+    # 1. 将每个地点的需求转换为箱子列表（按设备顺序，满箱在前，尾箱在后）
+    LocBoxes = {}  # key: 地点编号(1-based), value: list of (设备码索引, 箱内件数)
+    for LocIdx in range(LocationNum):
+        BoxList = []
+        for DevIdx in range(SubTypeNum):
+            DemandQty = Demands.iloc[LocIdx, DevIdx]
+            if DemandQty == 0:
+                continue
+            BoxCap = SubTypeList.iloc[DevIdx]['PACK_BOX_NUM']
+            FullBoxes = int(DemandQty // BoxCap)
+            Remainder = DemandQty % BoxCap
+            # 满箱
+            for _ in range(FullBoxes):
+                BoxList.append((DevIdx, BoxCap))
+            # 尾箱（如果存在）
+            if Remainder > 0:
+                BoxList.append((DevIdx, Remainder))
+        LocBoxes[LocIdx + 1] = BoxList
+
+    # 2. 收集每个地点在哪些配送记录中出现，及分配的箱数
+    NodeRecords = defaultdict(list)  # key: 地点编号, value: list of (行索引, 箱数, 路径中的位置)
+    for RowIdx, Row in DelivPlan.iterrows():
+        Path = Row['PlanPath']
+        DeNums = Row['DeNum']
+        if not isinstance(DeNums, list):
+            DeNums = list(DeNums)
+        for Pos, (Node, Box) in enumerate(zip(Path, DeNums)):
+            NodeRecords[Node].append((RowIdx, int(round(Box)), Pos))
+
+    # 3. 初始化新列 DevicePieces（每个元素是一个列表，长度等于停靠点数，每个停靠点存一个零数组）
+    DelivPlan['DevicePieces'] = None
+    for RowIdx, Row in DelivPlan.iterrows():
+        StopCount = len(Row['PlanPath'])
+        DelivPlan.at[RowIdx, 'DevicePieces'] = [
+            np.zeros(SubTypeNum, dtype=int) for _ in range(StopCount)
+        ]
+
+    # 4. 对每个地点，按配送顺序依次分配箱子，并汇总各设备码件数
+    for Node, Records in NodeRecords.items():
+        BoxesTotal = LocBoxes.get(Node, [])
+        if not BoxesTotal:
+            continue
+
+        # 按计划索引排序，确保分配顺序与配送顺序一致
+        RecordsSorted = sorted(Records, key=lambda x: x[0])
+        BoxCounts = [R[1] for R in RecordsSorted]
+
+        if sum(BoxCounts) != len(BoxesTotal):
+            logging.warning(
+                f"地点 {Node} 的分配箱数总和 {sum(BoxCounts)} 与预计算箱子数 {len(BoxesTotal)} 不一致"
+            )
+            continue
+
+        Start = 0
+        for (RowIdx, _, Pos), Count in zip(RecordsSorted, BoxCounts):
+            AssignedBoxes = BoxesTotal[Start:Start + Count]
+            Start += Count
+            # 汇总件数
+            Pieces = np.zeros(SubTypeNum, dtype=int)
+            for DevIdx, Qty in AssignedBoxes:
+                Pieces[DevIdx] += Qty
+            DelivPlan.at[RowIdx, 'DevicePieces'][Pos] = Pieces
+
+    return DelivPlan
+
+
+def ExpandDeviceDetail(DelivPlan, SubTypeList):
+    """
+    将配送计划按设备码展开为明细表。
+    
+    参数:
+        DelivPlan: 包含 PathNo, DevicePieces 的 DataFrame
+        SubTypeList: 包含 DEV_CODE 的设备码表 (索引对应设备码编号 0-based)
+    返回:
+        明细 DataFrame，列：OrgNo, DevCode, Quantity
+    """
+    Rows = []
+    for _, Plan in DelivPlan.iterrows():
+        PathNo = Plan['PathNo']          # 例如 ['3441501', '34406']
+        DevicePieces = Plan['DevicePieces']   # 列表的列表，内层为设备码件数数组
+        # 遍历每个停靠点
+        for StopIdx, (Org, Pieces) in enumerate(zip(PathNo, DevicePieces)):
+            # 遍历设备码
+            for DevIdx, Qty in enumerate(Pieces):
+                if Qty > 0:
+                    DevCode = SubTypeList.iloc[DevIdx]['DEV_CODE']
+                    Rows.append({
+                        'OrgNo': Org,
+                        'DevCode': DevCode,
+                        'Quantity': int(Qty)
+                    })
+    DetailDf = pd.DataFrame(Rows)
+    return DetailDf
 
 
 def DailyReplenishmentPlan(start_date: str, end_date: str) -> pd.DataFrame:
@@ -208,12 +318,11 @@ def AdjustDaliyDelivery(date:str):
     PathInfo.index= range(len(PathInfo))
 
     PlanInd = 1  # 配送计划编号
-    DeNum = [None] * 1000  # 存放每次配送的数量
+    DeNum = [None] * 1000  # 存放每次配送的装箱数量
     VeType = np.zeros(1000, dtype=int)  # 存放每次配送用的车辆种类
     PathInd = np.zeros(1000, dtype=int)  # 配送的路径编号
     Price = np.zeros(1000)  # 配送的价格
     PlanPath = [None] * 1000  # 配送路径，使用列表存储
-
 
     logging.info("首先用单一的配送车辆，进行整车配送,优先对距离远的进行整车配送")
     LocationDis = PathInfo.loc[:LocationNum-1, 'PathDis'].to_numpy()
@@ -243,165 +352,156 @@ def AdjustDaliyDelivery(date:str):
     VTypeTimes=VNums_All
 
     logging.info("路径箱数分配：决策变量是x_n,v,l 整数三维（目的地，车辆种类，路径序号）；I_v,l,0,1变量")
-    XNum1 = LocationNum * VeTypeNum * PathNum
-    XNum2 = VeTypeNum * PathNum
-    prob = pulp.LpProblem("deleivplan", pulp.LpMinimize)
-    x = pulp.LpVariable.dicts("x", range(1, XNum1+XNum2 +1),  cat='Integer')
-    lb = np.zeros(XNum1+XNum2)
-    ub = np.ones(XNum1+XNum2)
+    logging.info("构建压缩路径‑箱数规划模型")
 
-    '''变量取值范围'''
-    for i in range(1, LocationNum + 1):
-        ub[(i - 1) * XNum2 : i * XNum2 ] = DemandsBoxs[i - 1]
-    for i in range(1, XNum1+XNum2 +1):
-        x[i].lowBound = lb[i - 1]
-        x[i].upBound = ub[i - 1]
+    # ===================== 1. 提取活性节点并过滤可用路径 =====================
+    active_nodes = np.where(DemandsBoxs > 0)[0]          # 0‑based 索引
+    active_set = set(active_nodes + 1)                  # 1‑based 集合，便于判断
 
+    # 只保留首尾节点都在活性集合中的路径
+    keep_idx = []
+    for i in range(len(PathInfo)):
+        p = PathInfo.loc[i, 'Path']
+        if p[0] in active_set and p[-1] in active_set:
+            keep_idx.append(i)
+    PathInfo_active = PathInfo.iloc[keep_idx].reset_index(drop=True)
 
-    '''目标函数'''
-    c_vl = np.zeros(XNum2)
-    for l in range(1, PathNum + 1):
+    # 保存原始路径编号（用于最后映射回原始计划）
+    orig_path_indices = [PathInfo.index[i] + 1 for i in keep_idx]   # 原始 Ind（1‑based）
+
+    N_active = len(active_nodes)           # 活性网点数
+    PathNum_new = len(PathInfo_active)     # 可用路径数
+    demands_active = DemandsBoxs[active_nodes]   # 活性网点剩余需求
+
+    # 最小配送量映射：需求 < 20 的活性网点
+    mindeliver_map = {}
+    for pos, orig_idx in enumerate(active_nodes):
+        if DemandsBoxs[orig_idx] < MinDeliverNum:
+            mindeliver_map[pos] = DemandsBoxs[orig_idx]   # pos 为 0‑based（在 active_nodes 中的下标）
+
+    # ===================== 2. 构建压缩模型 =====================
+    prob = pulp.LpProblem("deleivplan_compact", pulp.LpMinimize)
+
+    # 变量字典
+    x_nvl = {}   # (n, v, l) ，n 从 1 开始
+    I_vl = {}    # (v, l)
+
+    # 创建分配变量 x_{n,v,l}
+    for n in range(1, N_active + 1):
         for v in range(1, VeTypeNum + 1):
-            Ind = (v - 1) * PathNum+l-1
-            c_vl[Ind] = VeUnitPrice[v - 1] * PathInfo.loc[l - 1,'PathDis']
+            for l in range(1, PathNum_new + 1):
+                x_nvl[(n, v, l)] = pulp.LpVariable(
+                    f"x_n{n}_v{v}_l{l}", lowBound=0,
+                    upBound=demands_active[n - 1], cat='Integer')
 
-    f = np.zeros(XNum1 + XNum2)
-    f[XNum1:] = c_vl
-    prob += pulp.lpSum(f[i - 1] * x[i] for i in range(1, XNum1 + XNum2 + 1))
-
-
-
-    '''去掉前面一部分为0的变量'''
-    xInds = np.zeros((XNum1, 1), dtype=bool)
-    for l in range(PathNum):
-        nL = PathInfo.loc[l,'Path']  # 假设 PathInfo 是一个包含 Path 属性的对象列表
-        for i in range(len(nL)):
-            nI = nL[i]  # nI 包含在路径中
-            Ind1 = (nI - 1) * XNum2
-            Ind2s = l
-            Ind3s=PathNum + l
-            xInds[Ind1 + Ind2s] = True
-            xInds[Ind1 + Ind3s] = True
-    xInds= np.where(xInds)[0]+1
-    xInds = np.append(xInds, np.arange(XNum1+1, XNum1+XNum2+1))
-
-
-    logging.info("等式约束，保证各地配送数量等于需求数量")
-    Aeq = np.zeros((LocationNum, XNum1 + XNum2))
-    for l in range(1, PathNum + 1):
-        nL = PathInfo.loc[l - 1, 'Path']  # 获取路径 l 所经过的位置
-        for i in range(len(nL)):  # 遍历路径中的每个位置
-            nI = nL[i]  # 获取路径中的位置 nI
-            Ind1 = (nI - 1) * XNum2
-            Ind2s = [(v - 1) * PathNum + l - 1 for v in range(1, VeTypeNum + 1)]
-            for Ind2 in Ind2s:
-                Aeq[nI - 1, Ind1 + Ind2] = 1
-
-
-    for i in range(1, LocationNum + 1):
-        #prob += pulp.lpSum(Aeq[i - 1, j-1] * x[j] for j in range(1, XNum1 + XNum2 + 1)) ==DemandsBoxs[i - 1]
-        prob += pulp.lpSum(Aeq[i - 1, j - 1] * x[j] for j in xInds) == DemandsBoxs[i - 1]
-    '''不等式约束-车次和容量约束，每次配送不得超过车辆容量，总配送车次不能超过车次上限'''
-
-    A1 = np.zeros((XNum2 + VeTypeNum, XNum1 + XNum2))
-    b1 = np.zeros(XNum2 + VeTypeNum)
-
-
-    for l in range(1, PathNum + 1):
-        nL = PathInfo.loc[l - 1, 'Path']
-        for v in range(1, VeTypeNum + 1):
-            RowInd = (v - 1) * PathNum + l - 1
-            Pv = VeCap[v - 1]  # 获取车辆容量
-            A1[RowInd, XNum1 + RowInd] = -Pv
-
-            # 遍历路径中的每个位置
-            for i in range(len(nL)):
-                n = nL[i]
-                A1[RowInd, (n - 1) * XNum2 + RowInd] = 1
-
-    # 增加车次约束
-    b1[XNum2:] = VTypeTimes
-
+    # 创建选择变量 I_{v,l}
     for v in range(1, VeTypeNum + 1):
-        A1[XNum2 + v - 1, XNum1 + (v - 1) * PathNum:XNum1 + v * PathNum] = 1
+        for l in range(1, PathNum_new + 1):
+            I_vl[(v, l)] = pulp.LpVariable(
+                f"I_v{v}_l{l}", lowBound=0, upBound=1, cat='Integer')
 
+    # 目标函数：最小化 Σ cost_{v,l} * I_{v,l}
+    prob += pulp.lpSum(
+        VeUnitPrice[v - 1] * PathInfo_active.loc[l - 1, 'PathDis'] * I_vl[(v, l)]
+        for v in range(1, VeTypeNum + 1) for l in range(1, PathNum_new + 1)
+    )
 
-    for i in range(1, XNum2 + VeTypeNum+1):
-       #prob += pulp.lpSum(A1[i-1, j-1] * x[j] for j in range(1, XNum1 + XNum2 + 1))<= b1[i-1]
-       prob += pulp.lpSum(A1[i - 1, j - 1] * x[j] for j in xInds) <= b1[i - 1]
+    # 约束1：需求等式约束
+    for n in range(1, N_active + 1):
+        # 找出包含该活性节点的所有 (v, l) 组合
+        terms = []
+        orig_node = active_nodes[n - 1] + 1   # 原始 1‑based 节点号
+        for l in range(1, PathNum_new + 1):
+            if orig_node in PathInfo_active.loc[l - 1, 'Path']:
+                for v in range(1, VeTypeNum + 1):
+                    terms.append(x_nvl[(n, v, l)])
+        prob += pulp.lpSum(terms) == demands_active[n - 1]
 
-    logging.info("最小配送数量约束，数值最小配送数量为20，如果某地本身的需求数量小于20，那么该地最小配送数量设置为该地的需求数量")
-    mindeliverind = np.where(DemandsBoxs < MinDeliverNum)[0]
-    mindeliver = DemandsBoxs[mindeliverind]
-    A2 = np.zeros((XNum2, XNum1 + XNum2))
-    b2 = np.zeros(XNum2)
+    # 约束2 & 3：容量约束 + 最小配送量约束（合并循环）
+    for v in range(1, VeTypeNum + 1):
+        for l in range(1, PathNum_new + 1):
+            path = PathInfo_active.loc[l - 1, 'Path']   # 1‑based 原始节点列表
+            # 收集该路径上所有活性节点对应的变量
+            vars_in_path = []
+            first_var = None
+            last_var = None
+            for raw_node in path:
+                if (raw_node - 1) in active_nodes:
+                    pos = np.where(active_nodes == raw_node - 1)[0][0] + 1   # 转换为 1‑based 新索引
+                    var = x_nvl[(pos, v, l)]
+                    vars_in_path.append(var)
+                    if raw_node == path[0]:
+                        first_var = var
+                    if raw_node == path[-1]:
+                        last_var = var
 
-    for l in range(1,PathNum+1):
-        nL = PathInfo.loc[l - 1, 'Path']
-        for v in range(1,VeTypeNum+1):
-            RowInd = (v - 1) * PathNum + l
-            n = nL[0]
-            if n-1 in mindeliverind:
-                A2[RowInd-1, XNum1 + RowInd-1] = DemandsBoxs[n-1]
-            else:
-                A2[RowInd-1, XNum1 + RowInd-1] = MinDeliverNum
-            A2[RowInd-1, (n - 1) * XNum2 + RowInd-1] = -1
-    for i in range(1, XNum2+1):
-      # prob += pulp.lpSum(A2[i-1, j-1] * x[j] for j in range(1, XNum1 + XNum2 + 1))<= b2[i-1]
-       prob += pulp.lpSum(A2[i - 1, j - 1] * x[j] for j in xInds) <= b2[i - 1]
+            # 容量约束
+            if vars_in_path:
+                prob += pulp.lpSum(vars_in_path) <= VeCap[v - 1] * I_vl[(v, l)]
 
+            # 最小配送量约束（首节点）
+            if first_var is not None:
+                first_node_raw = path[0]
+                pos_first = np.where(active_nodes == first_node_raw - 1)[0][0]   # 0‑based
+                min_q = mindeliver_map.get(pos_first, MinDeliverNum)
+                prob += first_var >= min_q * I_vl[(v, l)]
 
-    A3 = np.zeros((XNum2, XNum1 + XNum2))
-    b3 = np.zeros(XNum2)
+            # 尾节点最小配送量（路径长度>1，且尾节点不同于首节点）
+            if last_var is not None and len(path) > 1 and path[-1] != path[0]:
+                last_node_raw = path[-1]
+                pos_last = np.where(active_nodes == last_node_raw - 1)[0][0]
+                min_q_last = mindeliver_map.get(pos_last, MinDeliverNum)
+                prob += last_var >= min_q_last * I_vl[(v, l)]
 
-    for l in range(1,PathNum+1):
-        nL = PathInfo.loc[l - 1, 'Path']
-        for v in range(1,VeTypeNum+1):
-            RowInd = (v - 1) * PathNum + l
-            n = nL[-1]
-            if n-1 in mindeliverind:
-                A3[RowInd-1, XNum1 + RowInd-1] = DemandsBoxs[n-1]
-            else:
-                A3[RowInd-1, XNum1 + RowInd-1] = MinDeliverNum
-            A3[RowInd-1, (n - 1) * XNum2 + RowInd-1] = -1
-    for i in range(1, XNum2+1):
-       #prob += pulp.lpSum(A3[i-1, j-1] * x[j] for j in range(1, XNum1 + XNum2 + 1))<= b3[i-1]
-       prob += pulp.lpSum(A3[i-1, j-1] * x[j] for j in xInds)<= b3[i-1]
+    # 约束4：每种车型的使用次数上限
+    for v in range(1, VeTypeNum + 1):
+        prob += pulp.lpSum(I_vl[(v, l)] for l in range(1, PathNum_new + 1)) <= VTypeTimes[v - 1]
 
-
-    logging.info("开始求解路径-箱数规划")
+    # ===================== 3. 求解 =====================
+    logging.info("开始求解压缩路径‑箱数规划")
     solver = pulp.PULP_CBC_CMD(
-            msg=True,
-            options=['ratioGap=0.01', 'sec=60']  # 1% 的相对差距和60秒的时间限制
-        )
+        msg=True,
+        options=['ratioGap=0.01', 'sec=60']
+    )
     prob.solve(solver)
-    logging.info(f"求解路径-箱数规划完成,目标函数值为:{pulp.value(prob.objective)}")
-    
-    x_values = {i: (x[i].value() if x[i].value() is not None else 0) for i in range(1, XNum1 + XNum2 + 1)}
+    logging.info(f"求解完成，目标值：{pulp.value(prob.objective)}")
 
-    '''对所求x进行解析，生成路径-箱数配送计划'''
-    x= np.array(list(x_values.values()))
+    # ===================== 4. 解映射，追加到计划数组 =====================
+    selected = []
+    for v in range(1, VeTypeNum + 1):
+        for l in range(1, PathNum_new + 1):
+            if I_vl[(v, l)].value() is not None and abs(I_vl[(v, l)].value() - 1) < 0.1:
+                selected.append((v, l))
 
-    vlInds = np.where(np.abs(x[XNum1:] - 1) < 0.1)[0] #从0开始索引的找出Ivl位置
-    vlInds =vlInds +1
-    for i in vlInds:
-        VeTypeI = (i // PathNum) + 1
-        PathIndI = (i % PathNum) if (i % PathNum) != 0 else PathNum
-        PlanPath[PlanInd-1]=PathInfo.loc[PathIndI - 1, 'Path']  # PathInfo 是 pandas DataFrame，获取路径
-        Price[PlanInd-1]=VeUnitPrice[VeTypeI - 1] * PathInfo.loc[PathIndI - 1, 'PathDis']
-        VeType[PlanInd-1]=VeTypeI
-        PathInd[PlanInd-1]=PathIndI
-        DeNum[PlanInd-1]=np.zeros(len(PlanPath[PlanInd-1]))
-        for j in range(len(PlanPath[PlanInd-1])):
-            nIndJ = PlanPath[PlanInd-1][j]
-            DeNum[PlanInd-1][j] = round(x[(nIndJ - 1) * XNum2 + i-1])
+    for v, l in selected:
+        orig_path_idx = orig_path_indices[l - 1]          # 原始 PathInfo 编号（1‑based）
+        VeTypeI = v
+        PathIndI = orig_path_idx
+
+        # 路径节点（原始 1‑based）
+        path_nodes = PathInfo.loc[orig_path_idx - 1, 'Path'].copy()  # 列表
+        PlanPath[PlanInd - 1] = path_nodes
+        Price[PlanInd - 1] = VeUnitPrice[v - 1] * PathInfo.loc[orig_path_idx - 1, 'PathDis']
+        VeType[PlanInd - 1] = VeTypeI
+        PathInd[PlanInd - 1] = PathIndI
+
+        # 计算每个节点的配送量（活性节点取整，非活性节点为 0）
+        deliv_vec = np.zeros(len(path_nodes))
+        for j, node in enumerate(path_nodes):
+            if (node - 1) in active_nodes:
+                pos = np.where(active_nodes == node - 1)[0][0] + 1   # 新索引 1‑based
+                deliv_vec[j] = round(x_nvl[(pos, v, l)].value())
+            # 其他节点保持为 0
+        DeNum[PlanInd - 1] = deliv_vec
         PlanInd += 1
 
+    # ===================== 5. 生成最终计划 DataFrame（与原格式完全一致） =====================
     DeNum = DeNum[:PlanInd - 1]
     VeType = VeType[:PlanInd - 1]
     PathInd = PathInd[:PlanInd - 1]
     Price = Price[:PlanInd - 1]
     PlanPath = PlanPath[:PlanInd - 1]
+
     DelivPlan = {
         'PathInd': PathInd,
         'VeType': VeType,
@@ -409,8 +509,8 @@ def AdjustDaliyDelivery(date:str):
         'PlanPath': PlanPath,
         'DeNum': DeNum
     }
+    DelivPlan = pd.DataFrame(DelivPlan)
 
-    DelivPlan= pd.DataFrame(DelivPlan)
     #增加配送地点编号
     site_info = query_adam_del_site_conf()
     site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
@@ -421,5 +521,6 @@ def AdjustDaliyDelivery(date:str):
             p.append(site_info.loc[idx-1,'ORG_NO'])
         Path_no.append(p)
     DelivPlan['PathNo'] = Path_no
+    DelivPlan = GenerateDelivPlan(DelivPlan,Demands,SubTypeList)
     
-    return DelivPlan
+    return ExpandDeviceDetail(DelivPlan,SubTypeList)
