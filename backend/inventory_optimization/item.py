@@ -123,6 +123,25 @@ class Item:
         res = distribution.calculate_fill_rate(self.initial_inventory)
         return min(0.99999999,res), distribution.generate_demand(0.95)
     
+    def calculate_initial_fillrate_with_rate(self, month: int,rate:float) -> float:
+        """根据初始库存计算指定月份的初始满足率,可指定比率
+        
+        Args:
+            month: 月份编号（1-12）
+            
+        Returns:
+            初始满足率，范围0-1
+            
+        Raises:
+            ValueError: 当月份不存在时
+        """
+        if month not in self.demand_distributions:
+            raise ValueError(f"月份 {month} 的需求分布不存在")
+        
+        distribution = self.demand_distributions[month]
+        res = distribution.calculate_fillrate_with_rate(rate,self.initial_inventory)
+        return min(0.99999999,res), self.demand_distributions[5].lambda_,self.demand_distributions[6].lambda_,self.demand_distributions[4].lambda_
+    
     def _get_next_year_month(self, year_month: int) -> int:
         """获取下一个月
         

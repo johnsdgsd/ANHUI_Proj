@@ -72,6 +72,18 @@ class DemandDistribution(ABC):
         """
         pass
 
+    @abstractmethod
+    def calculate_fillrate_with_rate(self, rate: float, inventory: float) -> float:
+        """根据库存值计算满足率（需求小于等于库存的概率）
+        
+        Args:
+            inventory: 库存值
+            
+        Returns:
+            满足率，范围0-1
+        """
+        pass
+
 class NormalDistribution(DemandDistribution):
     """正态分布"""
     def __init__(self, mean: float, std: float, T: int = 1, tn: float = 0.25):
@@ -97,6 +109,12 @@ class NormalDistribution(DemandDistribution):
         period_mean = self.mean * self.rate
         period_std = self.std * (self.rate ** 0.5)
         return norm.cdf(inventory, loc=period_mean, scale=period_std)
+        
+    def calculate_fillrate_with_rate(self, rate: float, inventory: float) -> float:
+        # 使用CDF计算调整后的需求小于等于库存的概率
+        adjusted_mean = self.mean * rate
+        adjusted_std = self.std * (rate ** 0.5)
+        return norm.cdf(inventory, loc=adjusted_mean, scale=adjusted_std)
 
 class PoissonDistribution(DemandDistribution):
     """泊松分布"""
@@ -111,6 +129,10 @@ class PoissonDistribution(DemandDistribution):
         quantile = poisson.ppf(alpha, period_lambda)
         return float(math.ceil(quantile))
     
+    def calculate_fillrate_with_rate(self,rate:float,inventory:float) -> float:
+        period_lambda = self.lambda_ * rate
+        return poisson.cdf(inventory,period_lambda)
+
     def generate_random(self) -> float:
         # 生成随机需求：使用原始lambda，不进行rate调整
         return float(poisson.rvs(self.lambda_))
@@ -154,3 +176,15 @@ class UniformDistribution(DemandDistribution):
             return 1.0
         else:
             return (inventory - period_low) / (period_high - period_low)
+
+    def calculate_fillrate_with_rate(self, rate: float, inventory: float) -> float:
+        # 使用CDF计算调整后的需求小于等于库存的概率
+        adjusted_low = self.low * rate
+        adjusted_high = self.high * rate
+        
+        if inventory <= adjusted_low:
+            return 0.0
+        elif inventory >= adjusted_high:
+            return 1.0
+        else:
+            return (inventory - adjusted_low) / (adjusted_high - adjusted_low)

@@ -472,7 +472,6 @@ def query_adam_pend_stock_sample_by_year_month(year:str, month:str):
     except Exception as e:
         raise
 
-
 def query_adam_wd_dmd_pre_by_year_month_and_pretype(year:str, month:str, pre_type:str):
     """
     通过年月以及预测类型查询周/日市县需求预测结果
@@ -564,8 +563,6 @@ def query_adam_spec_code_config():
     except Exception as e:
         raise
 
-
-
 def query_adam_del_site_conf():
     '''
     查询配送站点信息
@@ -594,7 +591,6 @@ def query_adam_del_site_conf():
         raise
     except Exception as e:
         raise
-
 
 def query_adam_plan_day_ias_pre_by_date(date:str):
     '''
@@ -741,3 +737,4 @@ def insert_into_adam_dist_scheme_det(df: pd.DataFrame):
         raise
     except Exception as e:
         raise
+

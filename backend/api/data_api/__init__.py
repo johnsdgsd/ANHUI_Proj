@@ -14,7 +14,8 @@ from .fetch_data import (
     query_adam_qua_stock_sample_by_year_month,
     query_adam_pend_stock_sample_by_year_month,query_adam_wd_dmd_pre_by_year_month_and_pretype,
     query_adam_y_mgt_org,query_adam_spec_code_config,query_adam_del_site_conf,
-    query_adam_plan_day_ias_pre_by_date
+    query_adam_plan_day_ias_pre_by_date,insert_into_adam_dist_scheme,
+    insert_into_adam_dist_scheme_det
 )
 
 __all__ = [
@@ -36,5 +37,7 @@ __all__ = [
     'query_adam_y_mgt_org',
     'query_adam_spec_code_config',
     'query_adam_del_site_conf',
-    'query_adam_plan_day_ias_pre_by_date'
+    'query_adam_plan_day_ias_pre_by_date',
+    'insert_into_adam_dist_scheme',
+    'insert_into_adam_dist_scheme_det'
 ]
