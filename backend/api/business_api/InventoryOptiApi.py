@@ -5,36 +5,15 @@
 
 from flask import Blueprint, request, jsonify
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
-
+from backend.inventory_optimization.GetWeeklyThreshold import GenerateWeeklyThreshold
+from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
 # 创建蓝图
 inventory_opti_bp = Blueprint('inventory_opti', __name__, url_prefix='/inventory')
 
 @inventory_opti_bp.route('/optimize', methods=['POST'])
 def optimize():
-    """库存优化接口
-    
-    Request Body:
-        {
-            "init_stock_month": 202605,      // 初始库存月份
-            "install_start_month": 202204,   // 安装量起始月份
-            "install_end_month": 202604,     // 安装量结束月份
-            "central_warehouse_name": "合肥供电公司",  // 中心库名称
-            "n_iter": 100,                   // 遗传算法迭代次数 (可选，默认100)
-            "pop_size": 200,                 // 种群大小 (可选，默认200)
-            "target_service_level": 0.95,    // 目标满足率 (可选，默认0.95)
-            "n_processor": 10                // 并行处理器数量 (可选，默认1)
-        }
-    
-    Returns:
-        {
-            "success": true,
-            "best_solution": [...],
-            "best_cost": 12345.67,
-            "central_warehouse": "合肥供电公司",
-            "n_iter": 100,
-            "pop_size": 200,
-            "target_service_level": 0.95
-        }
+    """
+    库存优化接口
     """
     try:
         data = request.get_json() or {}
@@ -79,7 +58,99 @@ def optimize():
         }), 500
 
 
-@inventory_opti_bp.route('/health', methods=['GET'])
-def health():
-    """健康检查接口"""
-    return jsonify({"status": "ok", "service": "inventory_optimization"})
+@inventory_opti_bp.route('/generate-weekly-threshold', methods=['POST'])
+def GenerateWeeklyThresholdRoute():
+    """生成周度库存阈值并插入数据库"""
+    try:
+        data = request.get_json() or {}
+        year = data.get('year')
+        month = data.get('month')
+
+        if not year or not month:
+            return jsonify({"success": False, "error": "缺少必需参数: year, month"}), 400
+
+        dfThreshold,result = GenerateWeeklyThreshold(year, month)
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
+def AdjustDailyDeliveryPlan():
+    """
+    调整日补库计划接口
+    请求参数（JSON）:
+        adjustDate: 调整日期，如 "2026-05-06"
+    """
+    from backend.api.data_api.fetch_data import insert_into_adam_dist_scheme,insert_into_adam_dist_scheme_det
+    try:
+        Data = request.get_json() or {}
+        AdjustDate = Data.get('adjustDate')
+
+        if not AdjustDate:
+            return jsonify({
+                "success": False,
+                "error": "缺少必需参数: adjustDate"
+            }), 400
+
+        MainScheme, DetailScheme = AdjustDaliyDelivery(AdjustDate)
+
+        # 插入配送主表
+        MainResult = insert_into_adam_dist_scheme(MainScheme)
+        # 插入配送明细表
+        DetailResult = insert_into_adam_dist_scheme_det(DetailScheme)
+
+        TotalSuccess = MainResult.get('success_count', 0) + DetailResult.get('success_count', 0)
+        TotalFailed = MainResult.get('failed_count', 0) + DetailResult.get('failed_count', 0)
+
+        return jsonify({
+            "success": TotalFailed == 0,
+            "message": f"日补库计划调整完成",
+            "mainResult": MainResult,
+            "detailResult": DetailResult
+        })
+
+    except Exception as E:
+        return jsonify({
+            "success": False,
+            "error": str(E)
+        }), 500
+
+
+@inventory_opti_bp.route('/generate-daily-replenishment', methods=['POST'])
+def GenerateDailyReplenishmentPlan():
+    """
+    生成日度补库计划接口
+    请求参数（JSON）:
+        startDate: 计划起始日期，如 "2026-05-01"
+        endDate: 计划结束日期，如 "2026-05-31"
+    """
+    try:
+        Data = request.get_json() or {}
+        StartDate = Data.get('start_date')
+        EndDate = Data.get('end_date')
+
+        if not StartDate or not EndDate:
+            return jsonify({
+                "success": False,
+                "error": "缺少必需参数: start_date, end_date"
+            }), 400
+
+        # 生成日度补库计划
+        DaliyReplPlan, result = DailyReplenishmentPlan(StartDate, EndDate)
+
+        TotalSuccess = result.get('success_count', 0)
+        TotalFailed = result.get('failed_count', 0)
+
+        return jsonify({
+            "success": TotalFailed == 0,
+            "message": f"日度补库计划生成完成",
+            "result": result
+        })
+
+    except Exception as E:
+        return jsonify({
+            "success": False,
+            "error": str(E)
+        }), 500

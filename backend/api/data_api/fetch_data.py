@@ -738,3 +738,64 @@ def insert_into_adam_dist_scheme_det(df: pd.DataFrame):
     except Exception as e:
         raise
 
+def insert_into_adam_stock_week_limt_pre(df: pd.DataFrame):
+    """插入库存阈值预测表（周）数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - STOCK_WEEK_LIMT_PRE_ID: 唯一标识
+            - PRE_YEAR: 年份
+            - PRE_QUARTER: 季度
+            - PRE_MONTH: 月份
+            - PRE_WEEK: 周次
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - DEV_CODE: 设备码
+            - PRE_UP: 预测上限
+            - PRE_DOWN: 预测下限
+            - BASE_LIMT: 基准库存
+            - PRE_TIME: 预测时间
+            - GLOBAL_SCHEME_ID: 全局方案标识
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/insert_into_adam_stock_week_limt_pre'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+

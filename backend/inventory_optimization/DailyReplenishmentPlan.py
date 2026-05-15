@@ -271,7 +271,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
     return MainDf, DetailDf
 
 
-def DailyReplenishmentPlan(start_date: str, end_date: str) -> pd.DataFrame:
+def DailyReplenishmentPlan(start_date: str, end_date: str):
     """生成日补库计划
     根据指定日期范围的配送方案数据，生成日补库计划。
 
@@ -333,8 +333,7 @@ def DailyReplenishmentPlan(start_date: str, end_date: str) -> pd.DataFrame:
     ).reset_index(drop=True)
     DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(10001,10001+len(DaliyReplPlan))
     DaliyReplPlan['EST_STOCK_NUM'] = None
-    insert_into_adam_plan_day_ias_pre(DaliyReplPlan)
-    return DaliyReplPlan
+    return DaliyReplPlan,insert_into_adam_plan_day_ias_pre(DaliyReplPlan)
 
 
 def AdjustDaliyDelivery(date:str):

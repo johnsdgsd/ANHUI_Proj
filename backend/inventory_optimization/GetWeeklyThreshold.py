@@ -1,3 +1,4 @@
+import datetime
 import pandas as pd
 from backend.inventory_optimization.item import Item
 from backend.inventory_optimization.demand_distribution import PoissonDistribution
@@ -12,7 +13,9 @@ def GenerateWeeklyThreshold(year:str, month:str):
 
     from backend.api.data_api.fetch_data import (
         query_adam_wd_dmd_pre_by_year_month_and_pretype,
-        query_adam_del_site_conf)
+        query_adam_del_site_conf,
+        query_adam_spec_code_config,
+        insert_into_adam_stock_week_limt_pre)
 
     pre_type = '周预测'
     #获得站点信息，去掉省中心
@@ -65,26 +68,42 @@ def GenerateWeeklyThreshold(year:str, month:str):
     
     WeekSeq = df_grouped['PRE_WEEK'].unique()
     res_df = []
+    stock_id = 1
+    
+    # 读取设备分类和类别映射
+    spec_df = query_adam_spec_code_config()
+    dev_cls_mapping = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
+    dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
+
+    tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     for warehouse in local_warehouses:
         for item_key,item in warehouse.items.items():
             for week_seq in WeekSeq:
                 low , mid , high = item.get_weekly_threshold(week_seq,beta,alpha)
+                # 获取设备分类和类别
+                dev_cls = dev_cls_mapping.get(item.dev_code, '').zfill(2)
+                dev_categ = dev_categ_mapping.get(item.dev_code, '').zfill(2)
                 record = {
-                    "ORG_NO":warehouse.city_code,
-                    "DEV_CODE":item.dev_code,
-                    "ORG_NAME":warehouse.city_name,
-                    "PRE_WEEK":week_seq,
-                    "LOW":low,
-                    "MID":mid,
-                    "HIGH":high
+                    "STOCK_WEEK_LIMT_PRE_ID": stock_id,
+                    "PRE_YEAR": year,
+                    "PRE_QUARTER": df_grouped['PRE_QUARTER'].iloc[0],
+                    "PRE_MONTH": month,
+                    "PRE_WEEK": week_seq,
+                    "DEV_CLS": dev_cls,
+                    "DEV_CATEG": dev_categ,
+                    "DEV_CODE": item.dev_code,
+                    "PRE_UP": high,
+                    "PRE_DOWN": low,
+                    "BASE_LIMT": mid,
+                    "PRE_TIME": pretime,
+                    "GLOBAL_SCHEME_ID": tag
                 }
                 res_df.append(record)
+                stock_id += 1
     
     WeeklyThreshold = pd.DataFrame(res_df)
-    WeeklyThreshold['PRE_YEAR'] = df_grouped['PRE_YEAR']
-    WeeklyThreshold['PRE_MONTH'] = df_grouped['PRE_MONTH']
-    WeeklyThreshold['PRE_QUARTER'] = df_grouped['PRE_QUARTER']
-    return WeeklyThreshold
+    return WeeklyThreshold,insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
 
     
     

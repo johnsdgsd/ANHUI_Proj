@@ -522,12 +522,12 @@ def GenerateSchemeFromRawData(raw_df, dist_calculator):
 
 if __name__ == '__main__':
     print()
-    # from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
-    # # DailyReplenishmentPlan('2026-05-01','2026-05-31')
-    # MainScheme , DetailScheme = AdjustDaliyDelivery('2026-05-06')
-    # print(MainScheme ,'\n', DetailScheme)
-    # insert_into_adam_dist_scheme(MainScheme)
-    # insert_into_adam_dist_scheme_det(DetailScheme)
+    from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
+    DailyReplenishmentPlan('2026-05-01','2026-05-31')
+    MainScheme , DetailScheme = AdjustDaliyDelivery('2026-05-06')
+    print(MainScheme ,'\n', DetailScheme)
+    insert_into_adam_dist_scheme(MainScheme)
+    insert_into_adam_dist_scheme_det(DetailScheme)
     # demand,order = f2()
     # demand.to_excel("使用新的历史安装量并转换设备码后的库存阈值.xlsx",index=False)
     # order.to_excel("使用新的历史安装量并转换设备码后的各单位补货量.xlsx",index=False)

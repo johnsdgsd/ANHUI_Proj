@@ -13,7 +13,6 @@ def run_optimization_from_api(
     install_start_month: int,
     install_end_month: int,
     tag:str,
-    central_warehouse_name: str = '合肥供电公司',
     n_iter: int = 1,
     pop_size: int = 200,
     epsilon: float = 0.95,
@@ -34,7 +33,7 @@ def run_optimization_from_api(
         n_processor: 并行处理器数量
         
     Returns:
-        dict: 优化结果
+         优化结果
     """
     # 在函数内部导入，避免循环导入
     from backend.api.data_api.fetch_data import (
@@ -139,6 +138,8 @@ def run_optimization_from_api(
         insert_into_aps_inventory_replenish(InventoryThreshold)
         InventoryOrder = pd.DataFrame(order_result_data)
         insert_into_aps_inventory_replenish_qty(InventoryOrder)
+
+        return InventoryThreshold,InventoryOrder
 
 
    
