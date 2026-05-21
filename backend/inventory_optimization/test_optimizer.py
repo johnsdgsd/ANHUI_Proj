@@ -522,12 +522,12 @@ def GenerateSchemeFromRawData(raw_df, dist_calculator):
 
 if __name__ == '__main__':
     print()
-    from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
-    DailyReplenishmentPlan('2026-05-01','2026-05-31')
-    MainScheme , DetailScheme = AdjustDaliyDelivery('2026-05-06')
-    print(MainScheme ,'\n', DetailScheme)
-    insert_into_adam_dist_scheme(MainScheme)
-    insert_into_adam_dist_scheme_det(DetailScheme)
+    # from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
+    # DailyReplenishmentPlan('2026-05-01','2026-05-31')
+    # MainScheme , DetailScheme = AdjustDaliyDelivery('2026-05-06')
+    # print(MainScheme ,'\n', DetailScheme)
+    # insert_into_adam_dist_scheme(MainScheme)
+    # insert_into_adam_dist_scheme_det(DetailScheme)
     # demand,order = f2()
     # demand.to_excel("使用新的历史安装量并转换设备码后的库存阈值.xlsx",index=False)
     # order.to_excel("使用新的历史安装量并转换设备码后的各单位补货量.xlsx",index=False)
@@ -535,33 +535,39 @@ if __name__ == '__main__':
     # print(order)
     # f5()
     # 构建距离计算器（只需执行一次）
-    dist_calc = build_dist_calculator_from_db()
-    file_path = r"D:\WYJ\库存优化与检定排程\数据\4月配送明细.xlsx"
-    raw_df = pd.read_excel(file_path)
-    print(raw_df.columns.tolist())
-    print(raw_df.head())
+    # dist_calc = build_dist_calculator_from_db()
+    # file_path = r"D:\WYJ\库存优化与检定排程\数据\4月配送明细.xlsx"
+    # raw_df = pd.read_excel(file_path)
+    # print(raw_df.columns.tolist())
+    # print(raw_df.head())
     # 传入生成函数
-    main_df, detail_df = GenerateSchemeFromRawData(
-        raw_df,
-        dist_calculator=dist_calc
-    )
-    import os
-    output_dir = r"C:\Users\Administrator\Desktop\hengxiang"
-    os.makedirs(output_dir, exist_ok=True)  # 若目录不存在则创建
-    output_file = os.path.join(output_dir, "四月配送主表与明细表.xlsx")
+    # main_df, detail_df = GenerateSchemeFromRawData(
+    #     raw_df,
+    #     dist_calculator=dist_calc
+    # )
+    # import os
+    # output_dir = r"C:\Users\Administrator\Desktop\hengxiang"
+    # os.makedirs(output_dir, exist_ok=True)  # 若目录不存在则创建
+    # output_file = os.path.join(output_dir, "四月配送主表与明细表.xlsx")
+    #
+    # # 2. 写入 Excel（一个文件多个 Sheet）
+    # with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    #     if not main_df.empty:
+    #         main_df.to_excel(writer, sheet_name='主表', index=False)
+    #     if not detail_df.empty:
+    #         detail_df.to_excel(writer, sheet_name='明细表', index=False)
+    #
+    # print(f"文件已保存至：{output_file}")
+    #
+    # # 3. 计算并打印明细表总成本
+    # if not detail_df.empty:
+    #     total_cost = detail_df['DIST_EXP'].sum()
+    #     print(f"明细表所有配送费用总和：{total_cost:,.4f} 元")
+    # else:
+    #     print("明细表为空，无费用数据")
 
-    # 2. 写入 Excel（一个文件多个 Sheet）
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        if not main_df.empty:
-            main_df.to_excel(writer, sheet_name='主表', index=False)
-        if not detail_df.empty:
-            detail_df.to_excel(writer, sheet_name='明细表', index=False)
-
-    print(f"文件已保存至：{output_file}")
-
-    # 3. 计算并打印明细表总成本
-    if not detail_df.empty:
-        total_cost = detail_df['DIST_EXP'].sum()
-        print(f"明细表所有配送费用总和：{total_cost:,.4f} 元")
-    else:
-        print("明细表为空，无费用数据")
+    # query_adam_org_stock_sample_by_month('202605')
+    # query_adam_yqm_dmd_pre_by_year('2026')
+    # query_adam_glob_strategy_scheme_by_month('202405')
+    # query_adam_glob_strategy_scheme_itt_by_schemeid(1)
+    query_adam_yqm_dmd_pre_by_year_month('2026','05')

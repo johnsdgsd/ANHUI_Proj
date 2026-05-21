@@ -16,6 +16,10 @@ from backend.Scheduling.Getworkday import Getworkday
 
 # 创建蓝图
 bp = Blueprint('aps_scheduling', __name__, url_prefix='/api/aps')
+host = API_CONFIG["database"]["host"]
+port = API_CONFIG["database"]["port"]
+SQL_API_URL = f"http://{host}:{port}/exec"
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -26,10 +30,6 @@ for handler in logger.handlers[:]:
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(console_handler)
-
-host = API_CONFIG["database"]["host"]
-port = API_CONFIG["database"]["port"]
-SQL_API_URL = f"http://{host}:{port}/exec"
 
 
 def generate_safe_id():
@@ -74,18 +74,37 @@ def execute_batch(sql_id, data_list):
     logging.info(f"[{sql_id}] 成功插入 {success_count}/{len(data_list)} 条数据")
 
 
-def run_full_aps_process(target_month):
-    try:
-        logging.info(f">>> [开始] 执行 {target_month} 任务...")
 
-        target_dt = datetime.strptime(target_month, '%Y%m')
+def update_pre_conc_status(preConcId, stat):
+    """辅助函数：更新预测结论表的状态"""
+    if not preConcId:
+        return
+    url = f"{SQL_API_URL}/update_pre_conc_status"
+    try:
+        # 传给 Java 后端的 key 依然叫 pre_conc_id，因为 DS_SQL 里配置的是 #{pre_conc_id}
+        response = requests.post(url, json={"pre_conc_id": preConcId, "stat": stat})
+        response.raise_for_status()
+        logging.info(f"状态更新成功: preConcId [{preConcId}] -> STAT [{stat}]")
+    except Exception as e:
+        logging.error(f"状态更新失败: preConcId [{preConcId}] 报错: {e}")
+
+
+def run_full_aps_process(preMonth, preConcId=None):
+    try:
+        logging.info(f">>> [开始] 执行 {preMonth} 任务...")
+
+        # 【状态机】：一开始立刻把状态改成 02-预测中
+        update_pre_conc_status(preConcId, '02')
+
+        target_dt = datetime.strptime(preMonth, '%Y%m')
         prev_month_dt = target_dt - relativedelta(months=1)
         prev_year = prev_month_dt.strftime('%Y')
         prev_month = prev_month_dt.strftime('%m')
         current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         logging.info("提取业务数据...")
-        df_demand = fetch_data("query_replenish_demand", {"stat_month": target_month})
+        # 这里的传参已经改为 preMonth
+        df_demand = fetch_data("query_replenish_demand", {"stat_month": preMonth})
         df_qua = fetch_data("query_qua_stock", {"sam_year": prev_year, "sam_month": prev_month})
         df_pend = fetch_data("query_pend_stock", {"sam_year": prev_year, "sam_month": prev_month})
         df_orders = fetch_data("query_unused_pur_orders")
@@ -93,6 +112,8 @@ def run_full_aps_process(target_month):
 
         if df_demand.empty:
             logging.info("补货需求为空，无需排程。")
+            # 正常结束（即使无数据也算成功）
+            update_pre_conc_status(preConcId, '03')
             return
 
         for df in [df_demand, df_qua, df_pend, df_orders, df_mapping]:
@@ -145,7 +166,7 @@ def run_full_aps_process(target_month):
             box_cap = box_mapping.get(dev_code, 5)
             max_pieces_per_batch = 2500 * box_cap  # 绝对不可逾越的单日物理红线
 
-            # 【报错拦截 1】：如果供应商要求的最小发货量 M 直接干爆了仓库单日上限，直接报错！
+            # 【报错拦截】：直接干爆单日上限
             if M > max_pieces_per_batch:
                 logging.error(
                     f"❌ [业务报错] 设备 {dev_code} 的最小订单量(M={M}只) 超过仓库单日2500箱的承载上限({max_pieces_per_batch}只)！已跳过该设备，请人工协调。")
@@ -170,12 +191,9 @@ def run_full_aps_process(target_month):
                     remainder = batch_qty - chunk
 
                     if 0 < remainder < M:
-                        # 如果按 2500 箱切，剩下的尾数不满足 M
-                        # 尝试把尾数补足到 M，看剩下的 chunk 还够不够 M
                         chunk = batch_qty - M
 
                         if chunk < M:
-                            # 如果调整后，连切下来的这一块也小于 M 了，说明数学上绝对无解
                             logging.error(
                                 f"❌ [业务报错] 设备 {dev_code} 订单数({int(order['ORDER_NUM'])}) 无法在死守 2500箱 且满足 最小起订量(M={M}) 的前提下完成拆分！已跳过。")
                             valid_split = False
@@ -190,11 +208,10 @@ def run_full_aps_process(target_month):
                     target_req -= chunk
                     actual_assigned_qty += chunk
 
-                # 如果上面切分过程报错无解，直接放弃这个订单
                 if not valid_split:
                     continue
 
-                # 收尾：把合法剩下的最后一点塞进去
+                # 收尾
                 if batch_qty > 0:
                     dev_lot_list.append({
                         'DEV_CODE_NO': dev_code,
@@ -208,7 +225,7 @@ def run_full_aps_process(target_month):
                 lot_list_data.extend(dev_lot_list)
                 month_plan_data.append({
                     "MONTH_PLAN_ARR_ID": generate_safe_id(),
-                    "PLAN_ARR_NO": f"MP-{target_month}-{dev_code}",
+                    "PLAN_ARR_NO": f"MP-{preMonth}-{dev_code}",  # 已改为 preMonth
                     "PRE_YEAR": target_dt.strftime('%Y'),
                     "PRE_MONTH": target_dt.strftime('%m'),
                     "DEV_CODE": dev_code,
@@ -220,10 +237,13 @@ def run_full_aps_process(target_month):
 
         if LotList.empty:
             logging.warning("匹配不到可用订单，排程结束。")
+            # 正常结束
+            update_pre_conc_status(preConcId, '03')
             return
 
         logging.info(f"开始排程算法，共按订单生成了 {len(LotList)} 个有效批次...")
-        work_days = Getworkday(int(target_month))
+        # 传参改为 preMonth
+        work_days = Getworkday(int(preMonth))
 
         ARR_PLAN_RESULT = GetArrPlan(LotList, df_mapping, work_days)
 
@@ -240,7 +260,7 @@ def run_full_aps_process(target_month):
 
             day_plan_data.append({
                 "DAY_PLAN_ARR_PRE_ID": generate_safe_id(),
-                "PLAN_ARR_NO": f"DP-{target_month}-{row['DEV_CODE_NO']}-{idx}",
+                "PLAN_ARR_NO": f"DP-{preMonth}-{row['DEV_CODE_NO']}-{idx}",  # 已改为 preMonth
                 "DEV_CODE": row['DEV_CODE_NO'],
                 "PLAN_ARR_NUM": int(row['PLAN_ARR_NUM']),
                 "PLAN_ARR_DATE": plan_date_str,
@@ -249,66 +269,75 @@ def run_full_aps_process(target_month):
             })
 
         execute_batch("insert_day_plan_arr_batch", day_plan_data)
-        logging.info(f">>> [成功] {target_month} 任务结束。")
+        logging.info(f">>> [成功] {preMonth} 任务结束。")
+
+        # 【状态机】：顺利执行完，状态改为 03-预测成功
+        update_pre_conc_status(preConcId, '03')
 
     except Exception as e:
         logging.error(f">>> [错误] {str(e)}", exc_info=True)
+        # 【状态机】：万一报错崩溃了，状态兜底改为 04-预测失败
+        update_pre_conc_status(preConcId, '04')
 
 
 @bp.route('/plan/run', methods=['POST'])
 def handle_run_request():
     try:
-        data = request.get_json()
-        if not data or 'month' not in data:
-            return jsonify({"code": 400, "msg": "参数错误"}), 400
+        data = request.get_json() or {}
 
-        month_param = str(data['month'])
-        threading.Thread(target=run_full_aps_process, args=(month_param,)).start()
+        # 1. 获取时间参数 preMonth，如果不传或为空，默认计算下个月
+        preMonth = data.get('preMonth')
+        if not preMonth:
+            next_month_dt = datetime.now() + relativedelta(months=1)
+            preMonth = next_month_dt.strftime('%Y%m')
+            logging.info(f"未传入 preMonth，默认使用下个月: {preMonth}")
+        else:
+            preMonth = str(preMonth)
 
-        return jsonify({"code": 200, "msg": f"排程生成中: {month_param}"}), 200
+        # 2. 获取预测结果表ID preConcId
+        preConcId = data.get('preConcId')
+
+        # 3. 开启后台线程执行
+        threading.Thread(target=run_full_aps_process, args=(preMonth, preConcId)).start()
+
+        return jsonify({"code": 200, "msg": f"排程生成中: {preMonth}", "preConcId": preConcId}), 200
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
-
 
 
 @bp.route('/plan/check_deliver/run', methods=['POST'])
 def handle_check_deliver_request():
     """
     接收前端传来的滚动排程请求，具体到日。
-    请求体示例: {"start_date": "20260501"}
+    请求体示例: {"preTime": "20260501", "preConcId": "123456"}
     """
     try:
-        data = request.get_json()
-        if not data or 'start_date' not in data:
-            return jsonify({"code": 400, "msg": "参数错误，必须包含 start_date (例如: 20260501)"}), 400
+        data = request.get_json() or {}
+        if 'preTime' not in data:
+            return jsonify({"code": 400, "msg": "参数错误，必须包含 preTime (例如: 20260501)"}), 400
 
-        # 获取前端传来的纯数字字符串，例如 "20260501"
-        raw_date_str = str(data['start_date']).strip()
+        # 1. 获取前端传来的纯数字字符串
+        raw_date_str = str(data['preTime']).strip()
 
-        # 1. 按照 YYYYMMDD 格式解析
+        # 2. 获取预测结果表ID
+        preConcId = data.get('preConcId')
+
+        # 3. 按照 YYYYMMDD 格式解析
         dt_obj = datetime.strptime(raw_date_str, '%Y%m%d')
 
-        # 2. 转换回底层算法需要的 YYYY-MM-DD 标准格式
+        # 4. 转换回底层算法需要的 YYYY-MM-DD 标准格式
         algorithm_date_str = dt_obj.strftime('%Y-%m-%d')
 
-        # 开启后台线程执行，传入带有横杠的标准日期
-        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str,)).start()
+        # 5. 开启后台线程执行，传入标准日期和 preConcId
+        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, preConcId)).start()
 
-        return jsonify({"code": 200,
-                        "msg": f"检定和配送排程后台生成中, 接收参数: {raw_date_str}, 算法已识别为: {algorithm_date_str}"}), 200
+        return jsonify({
+            "code": 200,
+            "msg": f"检定和配送排程后台生成中, 接收参数: {raw_date_str}, 算法已识别为: {algorithm_date_str}",
+            "preConcId": preConcId
+        }), 200
 
     except ValueError:
         return jsonify({"code": 400, "msg": "日期格式错误，请使用 8位数字 的 YYYYMMDD 格式，例如: 20260501"}), 400
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
-
-
-# # 添加蓝图导出
-# __all__ = ['bp']
-
-# if __name__ == '__main__':
-#     # 用于单独测试
-#     from flask import Flask
-#     app = Flask(__name__)
-#     app.register_blueprint(bp)
-#     app.run(host='0.0.0.0', port=2500, debug=True)

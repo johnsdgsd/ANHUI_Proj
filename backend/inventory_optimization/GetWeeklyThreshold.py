@@ -68,7 +68,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     
     WeekSeq = df_grouped['PRE_WEEK'].unique()
     res_df = []
-    stock_id = 1
+
     
     # 读取设备分类和类别映射
     spec_df = query_adam_spec_code_config()
@@ -76,6 +76,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
 
     tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    stock_id = int(tag) * 100 
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     for warehouse in local_warehouses:
         for item_key,item in warehouse.items.items():

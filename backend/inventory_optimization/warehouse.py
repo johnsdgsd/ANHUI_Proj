@@ -246,23 +246,23 @@ class CentralWarehouse:
         """合并合格品和不合格品库存数据
 
         从合格品df中提取DEV_CLS, DEV_CODE_NO, QUA_STO三列
-        从不合格品df中提取DEV_CLS, PRO_SPEC_NO, UNQUA_STO三列
+        从不合格品df中提取DEV_CLS, DEV_CODE, UNQUA_STO三列
         如果某设备码的库存值两个df都有，结果相加
         如果某设备码的库存值只有其中一个df有，只算这一个
 
         Args:
-            qualified_df: 合格品库存DataFrame，包含DEV_CLS, DEV_CODE_NO, QUA_STO列
-            unqualified_df: 不合格品库存DataFrame，包含DEV_CLS, PRO_SPEC_NO, UNQUA_STO列
+            qualified_df: 合格品库存DataFrame，包含DEV_CLS, DEV_CODE_NO, QUA_STOCK_NUM列
+            unqualified_df: 不合格品库存DataFrame，包含DEV_CLS, DEV_CODE, ME_UNQUA_STOCK_NUM列
 
         Returns:
             pd.DataFrame: 合并后的库存数据，包含设备类别、设备码、库存值三列
         """
         # 提取并重命名合格品数据
-        qualified = qualified_df[['DEV_CLS', 'DEV_CODE_NO', 'QUA_STOCK']].copy()
+        qualified = qualified_df[['DEV_CLS', 'DEV_CODE', 'QUA_STOCK_NUM']].copy()
         qualified.columns = ['设备类别', '设备码', '库存值']
 
         # 提取并重命名不合格品数据
-        unqualified = unqualified_df[['DEV_CLS', 'PRO_SPEC_NO', 'UNQUA_STOCK']].copy()
+        unqualified = unqualified_df[['DEV_CLS', 'DEV_CODE', 'ME_UNQUA_STOCK_NUM']].copy()
         unqualified.columns = ['设备类别', '设备码', '库存值']
 
         # 按设备类别和设备码分组求和

@@ -4,10 +4,12 @@ from geopy.distance import geodesic
 import logging
 import sys
 
+
 def LoadDeliChcekData(target_month, start_date_str):
-    from backend.Scheduling.Service_CheckDeliver import fetch_data
+    from Service_CheckDeliver import fetch_data
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
+    # ================= 0. 基础网点与设备属性初始化 =================
     df_demand = fetch_data("query_remain_demand", {"stat_month": target_month})
     if df_demand.empty: raise ValueError("当月无需求数据")
     df_demand.columns = [c.upper() for c in df_demand.columns]
@@ -26,46 +28,74 @@ def LoadDeliChcekData(target_month, start_date_str):
 
     SubTypeList = df_mapping.drop_duplicates(subset='DEV_CODE_NO').reset_index(drop=True)
 
-    # ====== 【核心修复】：智能补全 DEV_CODE_DESC ======
+    # 智能补全 DEV_CODE_DESC
     if 'DEV_CODE_DESC' not in SubTypeList.columns:
         if 'DEV_CODE_DESC' in df_demand.columns:
-            # 尝试从需求表(df_demand)里把描述“借”过来映射上
             desc_map = dict(zip(df_demand['DEV_CODE_NO'], df_demand['DEV_CODE_DESC']))
             SubTypeList['DEV_CODE_DESC'] = SubTypeList['DEV_CODE_NO'].map(desc_map).fillna('')
         else:
-            # 如果 SQL 里完全没查出这个字段，安全兜底设为空字符串，绝不报错
             SubTypeList['DEV_CODE_DESC'] = ''
-    # ===================================================
 
     SubTypeNum = len(SubTypeList)
 
+    # 构建哈希索引字典，提升查找效率
+    org_idx_map = {locations.loc[i + 1, 'ORG_NO']: i for i in range(LocationNum)}
+    dev_idx_map = {SubTypeList.loc[j, 'DEV_CODE_NO']: j for j in range(SubTypeNum)}
+
+    # ================= 1. 盘点需求与扣减 =================
+    logging.info(">>> 开始盘点发货需求与扣减已配送明细...")
     Demands = np.zeros((LocationNum, SubTypeNum))
-    for i in range(LocationNum):
-        org_no = locations.loc[i + 1, 'ORG_NO']
-        org_demands = df_demand[df_demand['ORG_NO'] == org_no]
-        for j in range(SubTypeNum):
-            dev_code = SubTypeList.loc[j, 'DEV_CODE_NO']
-            match = org_demands[org_demands['DEV_CODE_NO'] == dev_code]
-            if not match.empty: Demands[i, j] = match['REQ_NUM'].sum()
+
+    for _, r in df_demand.iterrows():
+        i = org_idx_map.get(r['ORG_NO'])
+        j = dev_idx_map.get(r['DEV_CODE_NO'])
+        if i is not None and j is not None:
+            Demands[i, j] += r['REQ_NUM']
+
+    df_delivered = fetch_data("query_delivered_details", {"target_month": target_month})
+    if not df_delivered.empty:
+        df_delivered.columns = [c.upper() for c in df_delivered.columns]
+        for _, r in df_delivered.iterrows():
+            i = org_idx_map.get(r['REC_ORG_NO'])
+            j = dev_idx_map.get(r['DEV_CODE'])
+            if i is not None and j is not None:
+                Demands[i, j] = max(0, Demands[i, j] - int(r['DELIVERED_NUM']))
+
+    # ================= 2. 盘点合格库存与在途检定 =================
+    logging.info(">>> 开始合并现有合格库存与检定完工/在途库存...")
+    InitQuaStock = np.zeros(SubTypeNum)
 
     df_qua = fetch_data("query_realtime_qua_stock")
-    InitQuaStock = np.zeros(SubTypeNum)
     if not df_qua.empty:
         df_qua.columns = [c.upper() for c in df_qua.columns]
-        for j in range(SubTypeNum):
-            dev_code = SubTypeList.loc[j, 'DEV_CODE_NO']
-            match = df_qua[df_qua['DEV_CODE_NO'] == dev_code]
-            if not match.empty: InitQuaStock[j] = match['QUA_STOCK_NUM'].sum()
+        for _, r in df_qua.iterrows():
+            j = dev_idx_map.get(r['DEV_CODE_NO'])
+            if j is not None:
+                InitQuaStock[j] += r['QUA_STOCK_NUM']
 
+    df_inspected = fetch_data("query_completed_inspections", {"target_month": target_month})
+    if not df_inspected.empty:
+        df_inspected.columns = [c.upper() for c in df_inspected.columns]
+        for _, r in df_inspected.iterrows():
+            j = dev_idx_map.get(r['DEV_CODE'])
+            if j is not None:
+                InitQuaStock[j] += int(r['INSPECTED_NUM'])
+
+    # ================= 3. 获取混合待检批次 =================
+    logging.info(">>> 获取检定池任务 (含现存待检与未来到货)...")
     LotList = fetch_data("query_future_arr_plan", {"start_date": start_date_str})
     if not LotList.empty:
         LotList.columns = [c.upper() for c in LotList.columns]
         LotList['PLAN_DATE'] = pd.to_datetime(LotList['PLAN_DATE'])
         LotList['RemNum'] = LotList['PLAN_ARR_NUM'].astype(int)
+        LotList = LotList.sort_values(by=['PLAN_DATE', 'SOURCE_TYPE'], ascending=[True, False]).reset_index(drop=True)
 
+    # ================= 4. 读取产线产能及距离矩阵 =================
     DeviceCaps = fetch_data("query_check_line")
-    if not DeviceCaps.empty: DeviceCaps.columns = [c.upper() for c in DeviceCaps.columns]
+    if not DeviceCaps.empty:
+        DeviceCaps.columns = [c.upper() for c in DeviceCaps.columns]
 
+    logging.info(">>> 计算网点距离矩阵...")
     num_nodes = LocationNum + 1
     DMAT = np.zeros((num_nodes, num_nodes))
     lats = locations['LAT'].values
@@ -76,9 +106,26 @@ def LoadDeliChcekData(target_month, start_date_str):
                 dist = geodesic((lats[i], lons[i]), (lats[j], lons[j])).km
                 DMAT[i, j] = DMAT[j, i] = 1.15 * dist
 
-    VeCap = np.array([1100, 900, 410])
-    VNums = np.array([6, 10, 9])
-    VeUnitPrice = np.array([0, 0, 0])
-    VeTypeNum = 3
+    # ================= 5. 【核心重构】：通过 ds_sql 动态拉取车队参数 =================
+    logging.info(">>> 从 ds_sql 动态引擎读取车队运力及单价配置...")
+    df_van_conf = fetch_data("query_vehicle_conf")
+
+    if not df_van_conf.empty:
+        df_van_conf.columns = [c.upper() for c in df_van_conf.columns]
+        # 虽然 SQL 里已经加了 ORDER BY，这里再防御性保证一次 01, 02, 03 顺序
+        df_van_conf = df_van_conf.sort_values(by='CAR_TYPE').reset_index(drop=True)
+
+        VeCap = df_van_conf['VEHICLE_CAP'].astype(int).values
+        VNums = df_van_conf['VEHICLE_NUM'].astype(int).values
+        VeUnitPrice = df_van_conf['VEHICLE_CARRI'].astype(float).values
+        VeTypeNum = len(df_van_conf)
+        logging.info(f"✅ 成功通过 HTTP 接口拉取 {VeTypeNum} 种车型配置。")
+    else:
+        logging.warning("⚠️ 未能从 query_vehicle_conf 接口获取到数据，启用默认兜底配置！")
+        # 兜底配置：01小型, 02中型, 03大型
+        VeCap = np.array([459, 901, 1071])
+        VNums = np.array([9, 10, 6])
+        VeUnitPrice = np.array([0.0695, 0.0695, 0.0695])
+        VeTypeNum = 3
 
     return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations

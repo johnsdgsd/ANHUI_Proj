@@ -3,14 +3,15 @@
 提供库存优化相关的业务接口
 """
 
+import datetime
 from flask import Blueprint, request, jsonify
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from backend.inventory_optimization.GetWeeklyThreshold import GenerateWeeklyThreshold
 from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
+from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
 # 创建蓝图
 inventory_opti_bp = Blueprint('inventory_opti', __name__, url_prefix='/inventory')
 
-@inventory_opti_bp.route('/optimize', methods=['POST'])
 def optimize():
     """
     库存优化接口
@@ -19,35 +20,38 @@ def optimize():
         data = request.get_json() or {}
         
         # 获取必需参数
-        init_stock_month = data.get('init_stock_month')
-        install_start_month = data.get('install_start_month')
-        install_end_month = data.get('install_end_month')
-        central_warehouse_name = data.get('central_warehouse_name')
+        init_stock_month = data.get('preMonth')
+        preConcId = data.get('preConcId')
+        install_start_month = None
+        install_end_month = None
+        tag = 0
         
         # 参数校验
-        if not all([init_stock_month, install_start_month, install_end_month, central_warehouse_name]):
+        if not all([init_stock_month,preConcId]):
             return jsonify({
                 "success": False,
-                "error": "缺少必需参数: init_stock_month, install_start_month, install_end_month, central_warehouse_name"
+                "error": "缺少必需参数: preMonth,preConcId"
             }), 400
         
         # 获取可选参数
         n_iter = data.get('n_iter', 100)
         pop_size = data.get('pop_size', 200)
-        target_service_level = data.get('target_service_level', 0.95)
-        n_processor = data.get('n_processor', 1)
+        epsilon = data.get('epsilon', 0.95)
+        n_processor = data.get('n_processor', 10)
         
         # 运行优化
-        result = run_optimization_from_api(
+        InventoryThreshold,InventoryOrder = run_optimization_from_api(
             init_stock_month=init_stock_month,
-            install_start_month=install_start_month,
-            install_end_month=install_end_month,
-            central_warehouse_name=central_warehouse_name,
             n_iter=n_iter,
             pop_size=pop_size,
-            target_service_level=target_service_level,
-            n_processor=n_processor
+            epsilon=epsilon,
+            n_processor=n_processor,
+            tag = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         )
+        from backend.api.data_api.fetch_data import (
+        insert_into_adam_plan_month_ias_pre,insert_into_adam_stock_month_limit_pre)
+        result=insert_into_adam_stock_month_limit_pre(InventoryThreshold)
+        result=insert_into_adam_plan_month_ias_pre(InventoryOrder)
         
         return jsonify(result)
         
@@ -57,19 +61,59 @@ def optimize():
             "error": str(e)
         }), 500
 
+# 月度补库和月度阈值
+@inventory_opti_bp.route('/optimize', methods=['POST'])
+def GetMonthThresholdAndOrder():
+    try:
+        data = request.get_json() or {}
+        
+        # 获取必需参数
+        yearMonth = data.get('preMonth')
+        preConcId = data.get('preConcId')
+        tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        
+        # 参数校验
+        if not all([yearMonth,preConcId]):
+            return jsonify({
+                "success": False,
+                "error": "缺少必需参数: preMonth,preConcId"
+            }), 400
+        
+        year = yearMonth[:4]
+        month = yearMonth[4:6]
+        from backend.api.data_api.fetch_data import (
+            query_adam_org_stock_sample_by_month,
+            insert_into_adam_stock_month_limit_pre,
+            insert_into_adam_plan_month_ias_pre)
+        init_stock = query_adam_org_stock_sample_by_month(yearMonth)
+        Threshold,Order = GenerateMonthlyThresholdAndOrder(year,month,init_stock,tag)
+        result=insert_into_adam_stock_month_limit_pre(Threshold)
+        result=insert_into_adam_plan_month_ias_pre(Order)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
+
+# 周度阈值
 @inventory_opti_bp.route('/generate-weekly-threshold', methods=['POST'])
 def GenerateWeeklyThresholdRoute():
     """生成周度库存阈值并插入数据库"""
     try:
         data = request.get_json() or {}
-        year = data.get('year')
-        month = data.get('month')
+        yearMonth = data.get('preMonth')
+        year = int(yearMonth) // 100
+        month = int(yearMonth) % 100
+        preConcId = data.get('preConcId')
 
-        if not year or not month:
-            return jsonify({"success": False, "error": "缺少必需参数: year, month"}), 400
+        if not year or not month or not preConcId:
+            return jsonify({"success": False, "error": "缺少必需参数"}), 400
 
-        dfThreshold,result = GenerateWeeklyThreshold(year, month)
+        dfThreshold,result = GenerateWeeklyThreshold(str(year), str(month))
 
         return jsonify(result)
     except Exception as e:

@@ -255,7 +255,8 @@ class InventoryOptimizer:
         Args:
             df: DataFrame，包含设备码、持有成本、缺货成本等列
         """
-        # df = df[['DEV_CODE','TAX_UP']]
+        df = df[['DEV_CODE','TAX_UP']]
+        df = df.rename({'TAX_UP':'Price','DEV_CODE':'DEVICE_CODE'})
         if 'Price' in df.columns:
             df['持有成本'] = (df['Price'] * 0.1).round(1)
             df['缺货成本'] = (df['Price'] * 0.5).round(1)

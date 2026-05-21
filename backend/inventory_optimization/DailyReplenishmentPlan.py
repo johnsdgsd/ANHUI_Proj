@@ -333,6 +333,10 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
     ).reset_index(drop=True)
     DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(10001,10001+len(DaliyReplPlan))
     DaliyReplPlan['EST_STOCK_NUM'] = None
+    # 添加状态和类型列
+    DaliyReplPlan['DAILY_PLAN_STATUS'] = '01'
+    DaliyReplPlan['REPLE_TASK_TYPE'] = '03'
+    DaliyReplPlan['TASK_SOURCE'] = '03'
     return DaliyReplPlan,insert_into_adam_plan_day_ias_pre(DaliyReplPlan)
 
 
