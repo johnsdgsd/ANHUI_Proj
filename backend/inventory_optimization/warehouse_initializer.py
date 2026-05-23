@@ -25,9 +25,11 @@ class LocalWarehouseInitializer:
         
         if 'ORG_NAME' not in init_stock_df.columns:
             raise ValueError("init_stock_df 必须包含 ORG_NAME 列")
-        
+
+        print(f'输入初始化地市映射数据条数{len(init_stock_df)}')
         unique_cities = init_stock_df[['ORG_NO', 'ORG_NAME']].drop_duplicates()
         self.city_map = unique_cities.set_index('ORG_NO')['ORG_NAME'].astype(str).to_dict()
+        print(f'加载初始库存信息，共{len(unique_cities)}个地市仓库库存数据')
         print(f"加载地市映射信息，共 {len(self.city_map)} 条记录")
     
     def initialize_warehouses(self, init_stock_df: pd.DataFrame) -> list[LocalWarehouse]:
@@ -39,8 +41,8 @@ class LocalWarehouseInitializer:
         Returns:
             列表，包含初始化的所有LocalWarehouse对象
         """
-        if 'UNIT_CODE' not in init_stock_df.columns:
-            raise ValueError("init_stock_df 必须包含 UNIT_CODE 列")
+        if 'ORG_NO' not in init_stock_df.columns:
+            raise ValueError("init_stock_df 必须包含 ORG_NO 列")
         
         city_codes = init_stock_df['ORG_NO'].dropna().unique()
         

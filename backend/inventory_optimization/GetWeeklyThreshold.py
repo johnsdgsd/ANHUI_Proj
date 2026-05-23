@@ -17,13 +17,14 @@ def GenerateWeeklyThreshold(year:str, month:str):
         query_adam_spec_code_config,
         insert_into_adam_stock_week_limt_pre)
 
-    pre_type = '周预测'
+    pre_type = '04'
     #获得站点信息，去掉省中心
     org_df = query_adam_del_site_conf()
     org_df = org_df[org_df['STAT_NAME'] != '营销服务中心']
     org_dict = org_df.set_index('ORG_NO')['ORG_NAME'].to_dict()
     #获得预测结果表
     df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year,month,pre_type)
+    print(f'成功读取周度预测结果，时间：{year}{month}类型：{pre_type}，数据量：{len(df)}条')
     columns_to_drop = ['WD_DMD_PRE_ID', 'PRE_TYPE', 'PRE_DATE']
     df = df.drop(columns=columns_to_drop, errors='ignore')
     df['ORG_NAME'] = df['ORG_NO'].map(org_dict)
@@ -35,9 +36,11 @@ def GenerateWeeklyThreshold(year:str, month:str):
     
     # 重命名列名
     df_grouped = df_grouped.rename(columns={'PRE_NUM': '预测数量'})
-    
+
+    print(f'聚合后周度预测值数据为：{len(df_grouped)}')
     # 准备初始化仓库的临时数据
-    df_temp = df_grouped[['ORG_NO','ORG_NAME']].rename(columns={'ORG_NO':'UNIT_CODE','ORG_NAME':'UNIT_NAME'}).drop_duplicates()
+    df_temp = df_grouped[['ORG_NO','ORG_NAME']].drop_duplicates()
+    print(f'去重后的数据量为:{len(df_temp)}')
     LWI = LocalWarehouseInitializer()
     LWI.load_city_mapping(df_temp)
     local_warehouses = LWI.initialize_warehouses(df_temp)
@@ -76,7 +79,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
 
     tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    stock_id = int(tag) * 100 
+    stock_id = int(tag)
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     for warehouse in local_warehouses:
         for item_key,item in warehouse.items.items():
@@ -104,6 +107,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
                 stock_id += 1
     
     WeeklyThreshold = pd.DataFrame(res_df)
+    print(f'生成周度阈值结果{len(WeeklyThreshold)}条')
     return WeeklyThreshold,insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
 
     

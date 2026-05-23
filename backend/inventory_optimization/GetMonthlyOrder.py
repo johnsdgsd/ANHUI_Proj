@@ -5,17 +5,19 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+from numpy.matlib import empty
+
 from backend.inventory_optimization.item import Item
 from backend.inventory_optimization.demand_distribution import PoissonDistribution
 from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
 
 
-def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFrame,tag:str):
+def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFrame,tag:str,alpha:float):
     '''
     计算月度各市县库存阈值
     '''
     # beta = 0.95  # 基准库存置信水平
-    alpha = 0.99  # 库存上限置信水平
+    # alpha = 0.99  # 库存上限置信水平
 
     from backend.api.data_api.fetch_data import (
         query_adam_yqm_dmd_pre_by_year_month,
@@ -26,7 +28,7 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
 
     # 获得月度预测结果表
     df = query_adam_yqm_dmd_pre_by_year_month(year, month)
-    
+    print(f'获取月度需求预测数据成功，日期{year}{month}，数据量：{len(df)}')
     # 按单位、设备码分组，汇总预测数量（将所有业务类型的数据相加）
     df_grouped = df.groupby(
         ['PRE_YEAR', 'PRE_MONTH', 'ORG_NO', 'DEV_CODE'],
@@ -46,15 +48,18 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     
     # 按照 ORG_NO, DEV_CODE 分组
     grouped = df_grouped.groupby(['ORG_NO', 'DEV_CODE'])
-    
+
+    demand_pre_res = []
+
     for (org_no, dev_code), group in grouped:
         warehouse = warehouse_dict.get(str(org_no))
         if not warehouse:
             continue
-            
+
         # 获取月度预测数量
         monthly_demand = group['预测数量'].iloc[0]
-        init_stock_val = init_stock.loc[(init_stock['ORG_NO'] == org_no) & (init_stock['DEV_CODE'] == dev_code), 'STOCK_NUM'].values
+        mask = (init_stock['ORG_NO'] == org_no) & (init_stock['DEV_CODE'] == dev_code)
+        init_stock_val = init_stock.loc[mask, 'STOCK_NUM'].sum()
         # 创建物资
         item = Item(
             cls=None,
@@ -71,11 +76,18 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
         
         # 将物资添加到仓库
         warehouse.add_item(dev_code, item)
+
+        demand_item = {
+            'ORG_NO':org_no,
+            'DEV_CODE':dev_code,
+            'PRE_NUM':monthly_demand
+        }
+        demand_pre_res.append(demand_item)
     
     threshold_df = []
     order_df = []
     # 生成初始时间戳（精确到毫秒）
-    timestamp = int(datetime.now().strftime('%Y%m%d%H%M%S%f')[:17])
+    timestamp = int(datetime.now().strftime('%Y%m%d%H%M%S'))
     stock_id = timestamp
 
     spec_df = query_adam_spec_code_config()
@@ -127,4 +139,4 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     
     MonthlyThreshold = pd.DataFrame(threshold_df)
     MonthlyOrder = pd.DataFrame(order_df)
-    return MonthlyThreshold,MonthlyOrder
+    return MonthlyThreshold,MonthlyOrder,pd.DataFrame(demand_pre_res)

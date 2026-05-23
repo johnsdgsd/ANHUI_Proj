@@ -257,7 +257,7 @@ class Item:
         self.total_cost = self.total_holding_cost + self.total_shortage_cost
 
     def get_weekly_threshold(self, week_seq:int, beta:float , alpha:float)-> tuple[int,int,int]:
-        distribution = self.demand_distributions[week_seq]
+        distribution = self.demand_distributions[int(week_seq)]
         low =  distribution.generate_demand(beta)
         high = distribution.generate_demand(alpha)
         mid = (low + high) / 2

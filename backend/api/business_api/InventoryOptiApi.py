@@ -84,15 +84,25 @@ def GetMonthThresholdAndOrder():
         from backend.api.data_api.fetch_data import (
             query_adam_org_stock_sample_by_month,
             insert_into_adam_stock_month_limit_pre,
-            insert_into_adam_plan_month_ias_pre)
+            insert_into_adam_plan_month_ias_pre,
+            update_adam_pre_conc_stat)
+
+        update_adam_pre_conc_stat(int(preConcId),'02')
         init_stock = query_adam_org_stock_sample_by_month(yearMonth)
-        Threshold,Order = GenerateMonthlyThresholdAndOrder(year,month,init_stock,tag)
+        print(f'获取日期{yearMonth}的初始库存，数据量{len(init_stock)}条')
+        alpha = 0.99
+        Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,tag,alpha)
+        print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条')
         result=insert_into_adam_stock_month_limit_pre(Threshold)
+        print(f'插入阈值数据结果{result}')
         result=insert_into_adam_plan_month_ias_pre(Order)
+        print(f'插入补货量数据结果{result}')
+        update_adam_pre_conc_stat(int(preConcId),'03')
         
         return jsonify(result)
     
     except Exception as e:
+        update_adam_pre_conc_stat(int(preConcId),'04')
         return jsonify({
             "success": False,
             "error": str(e)
@@ -102,42 +112,46 @@ def GetMonthThresholdAndOrder():
 # 周度阈值
 @inventory_opti_bp.route('/generate-weekly-threshold', methods=['POST'])
 def GenerateWeeklyThresholdRoute():
+    from backend.api.data_api.fetch_data import  update_adam_pre_conc_stat
     """生成周度库存阈值并插入数据库"""
     try:
         data = request.get_json() or {}
         yearMonth = data.get('preMonth')
-        year = int(yearMonth) // 100
-        month = int(yearMonth) % 100
+        year = yearMonth[:4]
+        month = yearMonth[4:6]
         preConcId = data.get('preConcId')
 
         if not year or not month or not preConcId:
             return jsonify({"success": False, "error": "缺少必需参数"}), 400
-
-        dfThreshold,result = GenerateWeeklyThreshold(str(year), str(month))
-
+        update_adam_pre_conc_stat(int(preConcId), '02')
+        dfThreshold,result = GenerateWeeklyThreshold(year, month)
+        update_adam_pre_conc_stat(int(preConcId), '03')
         return jsonify(result)
     except Exception as e:
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
+# @inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
 def AdjustDailyDeliveryPlan():
     """
     调整日补库计划接口
     请求参数（JSON）:
         adjustDate: 调整日期，如 "2026-05-06"
     """
-    from backend.api.data_api.fetch_data import insert_into_adam_dist_scheme,insert_into_adam_dist_scheme_det
+    from backend.api.data_api.fetch_data import (
+        insert_into_adam_dist_scheme,insert_into_adam_dist_scheme_det,
+        update_adam_pre_conc_stat)
     try:
         Data = request.get_json() or {}
         AdjustDate = Data.get('adjustDate')
-
+        preConcId = Data.get('preConcId')
         if not AdjustDate:
             return jsonify({
                 "success": False,
                 "error": "缺少必需参数: adjustDate"
             }), 400
-
+        update_adam_pre_conc_stat(int(preConcId), '02')
         MainScheme, DetailScheme = AdjustDaliyDelivery(AdjustDate)
 
         # 插入配送主表
@@ -148,6 +162,7 @@ def AdjustDailyDeliveryPlan():
         TotalSuccess = MainResult.get('success_count', 0) + DetailResult.get('success_count', 0)
         TotalFailed = MainResult.get('failed_count', 0) + DetailResult.get('failed_count', 0)
 
+        update_adam_pre_conc_stat(int(preConcId), '03')
         return jsonify({
             "success": TotalFailed == 0,
             "message": f"日补库计划调整完成",
@@ -156,10 +171,82 @@ def AdjustDailyDeliveryPlan():
         })
 
     except Exception as E:
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "success": False,
             "error": str(E)
         }), 500
+
+
+@inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
+def AdjustDailyDeliveryPlanRange():
+    """
+    调整日补库计划接口
+    请求参数（JSON）:
+        dateList: 需要调整的日期列表，如 ["2026-01-01", "2026-01-02", "2026-02-03"]
+        preConcId: 预测结果表ID
+    """
+    from backend.api.data_api.fetch_data import (
+        insert_into_adam_dist_scheme, insert_into_adam_dist_scheme_det,
+        update_adam_pre_conc_stat)
+
+    try:
+        Data = request.get_json() or {}
+        date_list = Data.get('dateList')
+        preConcId = Data.get('preConcId')
+        if not date_list or not isinstance(date_list, list) or len(date_list) == 0:
+            return jsonify({
+                "success": False,
+                "error": "参数错误，必须提供非空的 dateList 日期列表"
+            }), 400
+
+        # 更新状态为处理中
+        update_adam_pre_conc_stat(int(preConcId), '02')
+
+        all_main_results = []
+        all_detail_results = []
+        total_success = 0
+        total_failed = 0
+        failed_dates = []
+
+        for date_str in date_list:
+            try:
+                MainScheme, DetailScheme = AdjustDaliyDelivery(date_str)
+                # 插入配送主表
+                main_res = insert_into_adam_dist_scheme(MainScheme)
+                # 插入配送明细表
+                detail_res = insert_into_adam_dist_scheme_det(DetailScheme)
+                all_main_results.append(main_res)
+                all_detail_results.append(detail_res)
+                total_success += main_res.get('success_count', 0) + detail_res.get('success_count', 0)
+                total_failed += main_res.get('failed_count', 0) + detail_res.get('failed_count', 0)
+            except Exception as e:
+                total_failed += 1
+                failed_dates.append(date_str)
+                # 可选择记录日志
+                continue
+
+        if total_failed == 0:
+            update_adam_pre_conc_stat(int(preConcId), '03')
+        else:
+            update_adam_pre_conc_stat(int(preConcId), '04')
+
+        return jsonify({
+            "success": total_failed == 0,
+            "message": f"日补库计划调整完成，共处理 {len(date_list)} 天，成功 {total_success} 条记录，失败 {total_failed} 条",
+            "failed_dates": failed_dates,
+            "mainResults": all_main_results,
+            "detailResults": all_detail_results
+        })
+
+    except Exception as E:
+        update_adam_pre_conc_stat(int(preConcId), '04')
+        return jsonify({
+            "success": False,
+            "error": str(E)
+        }), 500
+
+
 
 
 @inventory_opti_bp.route('/generate-daily-replenishment', methods=['POST'])

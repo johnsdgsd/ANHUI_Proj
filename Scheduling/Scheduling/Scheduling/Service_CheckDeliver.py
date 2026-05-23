@@ -20,7 +20,7 @@ def generate_safe_id():
 
 def update_pre_conc_status(preConcId, stat):
     if not preConcId: return
-    url = f"{SQL_API_URL}/gk-adam-update_pre_conc_status"
+    url = f"{SQL_API_URL}/update_pre_conc_status"
     try:
         response = requests.post(url, json={"pre_conc_id": preConcId, "stat": stat})
         response.raise_for_status()
@@ -59,7 +59,7 @@ def execute_batch(sql_id, data_list):
 
 
 
-def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
+def run_check_deliver_process(preTime, preConcId=None):
     try:
         from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
 

@@ -570,4 +570,7 @@ if __name__ == '__main__':
     # query_adam_yqm_dmd_pre_by_year('2026')
     # query_adam_glob_strategy_scheme_by_month('202405')
     # query_adam_glob_strategy_scheme_itt_by_schemeid(1)
-    query_adam_yqm_dmd_pre_by_year_month('2026','05')
+    # query_adam_yqm_dmd_pre_by_year_month('2026','05')
+    # query_adam_veri_config_all()
+    # query_adam_single_cost_config_all()
+    query_adam_glob_strategy_scheme_cost_by_schemeid(111)

@@ -8,7 +8,7 @@ def query_device_install_data_by_month_range(start_month:int,end_month: int):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query-aps-device-install-by-month-range'
+        endpoint = '/exec/gk-adam-query-aps-device-install-by-month-range'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "start_month":start_month,
@@ -37,7 +37,7 @@ def query_aps_inventory_item_cost():
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query-aps-inventory-item-cost'
+        endpoint = '/exec/gk-adam-query-aps-inventory-item-cost'
         url = f"http://{host}:{port}{endpoint}"
         
         response = requests.post(url, json={})
@@ -63,7 +63,7 @@ def query_aps_inventory_init_stock_by_month(month: int):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query-aps-inventory-init-stock-by-month'
+        endpoint = '/exec/gk-adam-query-aps-inventory-init-stock-by-month'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "month": month
@@ -106,7 +106,7 @@ def insert_into_aps_inventory_fulfill_rate(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert-into-aps-inventory-fulfill-rate'
+        endpoint = '/exec/gk-adam-insert-into-aps-inventory-fulfill-rate'
         url = f"http://{host}:{port}{endpoint}"
         
         # 将DataFrame转换为字典列表，列名转为小写
@@ -145,7 +145,7 @@ def insert_into_aps_inventory_replenish(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert-into-aps-inventory-replenish'
+        endpoint = '/exec/gk-adam-insert-into-aps-inventory-replenish'
         url = f"http://{host}:{port}{endpoint}"
         
         # 将DataFrame转换为字典列表，列名转为小写
@@ -184,7 +184,7 @@ def insert_into_aps_inventory_replenish_qty(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert-into-aps-inventory-replenish-qty'
+        endpoint = '/exec/gk-adam-insert-into-aps-inventory-replenish-qty'
         url = f"http://{host}:{port}{endpoint}"
         
         # 将DataFrame转换为字典列表，列名转为小写
@@ -225,7 +225,7 @@ def insert_into_adam_plan_day_ias_pre(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_plan_day_ias_pre'
+        endpoint = '/exec/gk-adam-insert_into_adam_plan_day_ias_pre'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -264,7 +264,7 @@ def query_aps_qua_sto_by_month(rele_month:int):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query-aps-qua-sto-by-month'
+        endpoint = '/exec/gk-adam-query-aps-qua-sto-by-month'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "rele_month":rele_month
@@ -292,7 +292,7 @@ def query_aps_unqua_sto_by_month(rele_month:int):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query-aps-unqua-sto-by-month'
+        endpoint = '/exec/gk-adam-query-aps-unqua-sto-by-month'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "rele_month":rele_month
@@ -323,7 +323,7 @@ def query_adam_dist_scheme_by_date_range(start_date:str,end_date:str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_dist_scheme_by_date_range'
+        endpoint = '/exec/gk-adam-query_adam_dist_scheme_by_date_range'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "start_date":start_date,
@@ -335,7 +335,7 @@ def query_adam_dist_scheme_by_date_range(start_date:str,end_date:str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("按照时间范围查询配送方案返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -355,7 +355,7 @@ def query_adam_dist_scheme_det_by_distschemeid(id:Number):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_dist_scheme_det_by_distschemeid'
+        endpoint = '/exec/gk-adam-query_adam_dist_scheme_det_by_distschemeid'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "id":id
@@ -366,7 +366,7 @@ def query_adam_dist_scheme_det_by_distschemeid(id:Number):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("根据配送id查询配送明细返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -386,7 +386,7 @@ def query_adam_pre_range_info():
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_pre_range_info'
+        endpoint = '/exec/gk-adam-query_adam_pre_range_info'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
         response = requests.post(url, json=json)
@@ -395,12 +395,14 @@ def query_adam_pre_range_info():
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询预测范围表返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
         else:
             df = pd.DataFrame([data])
+
+        df.rename(columns={'AVG_PRICE': 'TAX_UP'}, inplace=True)
         
         return df
     except requests.exceptions.RequestException as e:
@@ -415,7 +417,7 @@ def query_adam_qua_stock_sample_by_year_month(year:str, month:str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_qua_stock_sample_by_year_month'
+        endpoint = '/exec/gk-adam-query_adam_qua_stock_sample_by_year_month'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "year":year,
@@ -427,7 +429,7 @@ def query_adam_qua_stock_sample_by_year_month(year:str, month:str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询合格品数据返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -447,7 +449,7 @@ def query_adam_pend_stock_sample_by_year_month(year:str, month:str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_pend_stock_sample_by_year_month'
+        endpoint = '/exec/gk-adam-query_adam_pend_stock_sample_by_year_month'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "year":year,
@@ -459,7 +461,7 @@ def query_adam_pend_stock_sample_by_year_month(year:str, month:str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询待检库数据返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -479,7 +481,7 @@ def query_adam_wd_dmd_pre_by_year_month_and_pretype(year:str, month:str, pre_typ
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_wd_dmd_pre_by_year_month_and_pretype'
+        endpoint = '/exec/gk-adam-query_adam_wd_dmd_pre_by_year_month_and_pretype'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "year":year,
@@ -492,7 +494,7 @@ def query_adam_wd_dmd_pre_by_year_month_and_pretype(year:str, month:str, pre_typ
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询周/日需求预测返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -512,7 +514,7 @@ def query_adam_y_mgt_org():
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_y_mgt_org'
+        endpoint = '/exec/gk-adam-query_adam_y_mgt_org'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
         response = requests.post(url, json=json)
@@ -521,7 +523,7 @@ def query_adam_y_mgt_org():
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询组织架构信息返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -541,7 +543,7 @@ def query_adam_spec_code_config():
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_spec_code_config'
+        endpoint = '/exec/gk-adam-query_adam_spec_code_config'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
         response = requests.post(url, json=json)
@@ -550,7 +552,7 @@ def query_adam_spec_code_config():
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询规格设备码配置返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -570,7 +572,7 @@ def query_adam_del_site_conf():
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_del_site_conf'
+        endpoint = '/exec/gk-adam-query_adam_del_site_conf'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
         response = requests.post(url, json=json)
@@ -579,7 +581,7 @@ def query_adam_del_site_conf():
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询站点信息返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -599,7 +601,7 @@ def query_adam_plan_day_ias_pre_by_date(date:str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_plan_day_ias_pre_by_date'
+        endpoint = '/exec/gk-adam-query_adam_plan_day_ias_pre_by_date'
         url = f"http://{host}:{port}{endpoint}"
         json = {
             "date":date
@@ -610,7 +612,7 @@ def query_adam_plan_day_ias_pre_by_date(date:str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询日补库返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -644,7 +646,7 @@ def insert_into_adam_dist_scheme(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_dist_scheme'
+        endpoint = '/exec/gk-adam-insert_into_adam_dist_scheme'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -703,7 +705,7 @@ def insert_into_adam_dist_scheme_det(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_dist_scheme_det'
+        endpoint = '/exec/gk-adam-insert_into_adam_dist_scheme_det'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -763,7 +765,7 @@ def insert_into_adam_stock_week_limt_pre(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_stock_week_limt_pre'
+        endpoint = '/exec/gk-adam-insert_into_adam_stock_week_limt_pre'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -798,12 +800,14 @@ def insert_into_adam_stock_week_limt_pre(df: pd.DataFrame):
     except Exception as e:
         raise
 
-
 def query_adam_org_stock_sample_by_month(month: str):
+    '''
+    按年月查询库存快照
+    '''
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_org_stock_sample_by_month'
+        endpoint = '/exec/gk-adam-query_adam_org_stock_sample_by_month'
         url = f"http://{host}:{port}{endpoint}"
         
         json = {
@@ -816,7 +820,7 @@ def query_adam_org_stock_sample_by_month(month: str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询库存快照返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -835,7 +839,7 @@ def query_adam_yqm_dmd_pre_by_year(year: str):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         # endpoint 与 sql_id 完全对应
-        endpoint = '/exec/query_adam_yqm_dmd_pre_by_year'
+        endpoint = '/exec/gk-adam-query_adam_yqm_dmd_pre_by_year'
         url = f"http://{host}:{port}{endpoint}"
         
         json = {
@@ -883,7 +887,7 @@ def insert_into_adam_plan_month_ias_pre(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_plan_month_ias_pre'
+        endpoint = '/exec/gk-adam-insert_into_adam_plan_month_ias_pre'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -940,7 +944,7 @@ def insert_into_adam_stock_month_limit_pre(df: pd.DataFrame):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/insert_into_adam_stock_month_limit_pre'
+        endpoint = '/exec/gk-adam-insert_into_adam_stock_month_limit_pre'
         url = f"http://{host}:{port}{endpoint}"
 
         # 将DataFrame转换为字典列表，列名转为小写
@@ -988,7 +992,7 @@ def query_adam_glob_strategy_scheme_by_month(yearmonth: str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_glob_strategy_scheme_by_month'
+        endpoint = '/exec/gk-adam-query_adam_glob_strategy_scheme_by_month'
         url = f"http://{host}:{port}{endpoint}"
 
         json_data = {
@@ -1001,7 +1005,8 @@ def query_adam_glob_strategy_scheme_by_month(yearmonth: str):
         data = response.json()
 
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            print("查询全局策略主表返回数据为空")
+            return pd.DataFrame
 
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1028,7 +1033,7 @@ def query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id: int):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_glob_strategy_scheme_itt_by_schemeid'
+        endpoint = '/exec/gk-adam-query_adam_glob_strategy_scheme_itt_by_schemeid'
         url = f"http://{host}:{port}{endpoint}"
 
         json_data = {
@@ -1041,7 +1046,8 @@ def query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id: int):
         data = response.json()
 
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            print("查询全局方案周转明细返回数据为空")
+            return pd.DataFrame()
 
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1069,7 +1075,7 @@ def query_adam_yqm_dmd_pre_by_year_month(year: str, month: str):
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/query_adam_yqm_dmd_pre_by_year_month'
+        endpoint = '/exec/gk-adam-query_adam_yqm_dmd_pre_by_year_month'
         url = f"http://{host}:{port}{endpoint}"
         
         json_data = {
@@ -1083,7 +1089,7 @@ def query_adam_yqm_dmd_pre_by_year_month(year: str, month: str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("返回数据为空")
+            raise ValueError("查询年季月需求预测返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1096,3 +1102,623 @@ def query_adam_yqm_dmd_pre_by_year_month(year: str, month: str):
         raise
     except Exception as e:
         raise
+
+
+def query_adam_veri_config_all():
+    """查询检定线信息表全量数据
+
+    Returns:
+        pd.DataFrame: 查询结果数据集
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_veri_config_all'
+        url = f"http://{host}:{port}{endpoint}"
+        
+        response = requests.post(url, json={})
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("查询检定线配置返回数据为空")
+        
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        
+        return df
+    
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_adam_single_cost_config_all():
+    """查询单资产成本基础数据配置全量数据
+
+    Returns:
+        pd.DataFrame: 全表查询结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_single_cost_config_all'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 全量查询无需参数
+        response = requests.post(url, json={})
+        response.raise_for_status()
+
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("查询资产配置表返回数据为空")
+
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def query_adam_glob_strategy_scheme_cost_by_schemeid(scheme_id: int):
+    """根据方案标识查询全局策略方案成本明细
+
+    Args:
+        scheme_id: 方案标识
+
+    Returns:
+        pd.DataFrame: 成本明细查询结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_glob_strategy_scheme_cost_by_schemeid'
+        url = f"http://{host}:{port}{endpoint}"
+
+        json_data = {
+            "scheme_id": scheme_id
+        }
+
+        response = requests.post(url, json=json_data)
+        response.raise_for_status()
+
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            print("查询全局方案成本明细返回数据为空")
+            return pd.DataFrame()
+
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def insert_into_adam_glob_strategy_scheme_cost(df: pd.DataFrame):
+    """插入全局策略方案成本明细数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - COST_DET_ID: 方案成本明细标识
+            - SCHEME_ID: 方案标识
+            - LINK_TYPE: 环节类型
+            - COST_TYPE: 成本类型
+            - ORG_NO: 管理单位
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_STAT_COST: 预期总成本
+            - PRE_SINGLE_COST: 预期平均单只成本
+            - PRE_COST_YOY: 预期成本同比变化率
+            - PRE_COST_TR: 预期成本环比变化率
+            - INCUR_STAT_COST: 当前产生总成本
+            - INCUR_SINGLE_COST: 当前平均单只成本
+            - INCUR_COST_YOY: 当前成本同比变化率
+            - INCUR_COST_TR: 当前成本环比变化率
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_cost'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def insert_into_adam_glob_strategy_scheme_lps(df: pd.DataFrame):
+    """插入全局策略方案环节计划汇总明细数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - ITT_DET_ID: 方案周转明细标识
+            - SCHEME_ID: 方案标识
+            - LINK_TYPE: 环节类型
+            - ORG_NO: 管理单位
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_STAT_NUM: 预期计划总量
+            - INCUR_STAT_NUM: 当前已完成总量
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_lps'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def insert_into_adam_glob_strategy_scheme(df: pd.DataFrame):
+    """插入全局策略方案主表数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - SCHEME_ID: 方案标识
+            - SCHEME_NO: 方案编号
+            - SCHEME_NAME: 方案名称
+            - SCHEME_FOCUS: 方案侧重(01成本优先,02库存周转优先,03均衡分布)
+            - EXEC_YM: 方案执行年月
+            - PRE_STAT_COST: 预期综合总成本
+            - PRE_SINGLE_COST: 预期平均单只成本
+            - COST_YOY: 成本同比变化率%
+            - COST_TR: 成本环比变化率%
+            - PRE_ITR: 预期库存运行比%
+            - ITR_YOY: 运行比同比变化率%
+            - ITR_TR: 运行比环比变化率%
+            - PRE_ITT: 预期库存周转次数
+            - ITT_YOY: 周转同比变化率%
+            - ITT_TR: 周转环比变化率%
+            - MADE_DATE: 方案生成时间
+            - COM_INDEX: 综合指标评价
+            - SCHEME_DESC: 方案说明
+            - APPR_DATE: 审批时间
+            - APPR_RSLT: 审批结果(00待审批,01审批通过,02审批不通过)
+            - APPR_REMARK: 审批意见
+            - APPR_USER: 审批人
+            - APPR_ORG: 审批单位
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def insert_into_adam_glob_strategy_scheme_itt(df: pd.DataFrame):
+    """插入全局策略方案周转明细数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - ITT_DET_ID: 方案周转明细标识
+            - SCHEME_ID: 方案标识
+            - ORG_NO: 管理单位
+            - START_STOCK_NUM: 月初库存总量
+            - END_STOCK_NUM: 月末库存总量
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_ITR: 预期库存运行比%
+            - ITR_YOY: 运行比同比变化率%
+            - ITR_TR: 运行比环比变化率%
+            - INCUR_ITR: 当前库存运行比%
+            - PRE_ITT: 预期库存周转次数
+            - ITT_YOY: 周转同比变化率%
+            - ITT_TR: 周转环比变化率%
+            - INCUR_ITT: 当前库存周转次数
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_itt'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def query_adam_stock_count_sample_all():
+    """
+    全量查询库存信息表（无参数）
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_stock_count_sample_all'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 全量查询不需要传参数
+        response = requests.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+
+        # 空数据报错（按你之前的要求）
+        if not data:
+            raise ValueError("库存信息表全量查询结果为空")
+
+        return pd.DataFrame(data)
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def update_adam_pre_conc_stat(pre_conc_id, stat):
+    """
+    根据预测结论ID更新状态
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-update_adam_pre_conc_stat_by_id'  # 对应你刚才的sql_id
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 参数：预测结论ID + 状态
+        params = {
+            "pre_conc_id": pre_conc_id,
+            "stat": stat
+        }
+
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        data = response.json()
+
+        # 可选：根据返回判断是否成功
+        return data
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+
+def insert_into_adam_allot_day_plan_pre(df: pd.DataFrame):
+    """插入调拨计划（日）表数据到数据库
+
+    Args:
+        df: DataFrame，包含以下列：
+            - allot_day_plan_pre_id: 唯一标识
+            - allot_date: 日期
+            - send_org_no: 调出单位
+            - rec_org_no: 接收单位
+            - dev_cls: 设备分类
+            - dev_categ: 设备类别
+            - dev_code: 设备码
+            - send_num: 调拨数量
+            - send_stock_num: 调出单位预计库存量
+            - rec_stock_num: 接收单位预计库存量
+            - global_scheme_id: 全局方案标识
+            - send_reason: 调拨原因
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_allot_day_plan_pre'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 将DataFrame转换为字典列表，列名转为小写
+        records = df.rename(columns=str.lower).to_dict('records')
+
+        # 逐条插入数据
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for record in records:
+            try:
+                response = requests.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    "record": record,
+                    "error": str(e)
+                })
+
+        return {
+            "success": failed_count == 0,
+            "message": f"数据插入完成，成功 {success_count} 条，失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def delete_adam_glob_strategy_scheme_cost(scheme_id):
+    """
+    根据方案ID删除方案成本明细
+    :param scheme_id: 方案ID
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete_adam_glob_strategy_scheme_cost'
+        url = f"http://{host}:{port}{endpoint}"
+
+        params = {"scheme_id": scheme_id}
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
+def delete_adam_glob_strategy_scheme_itt(scheme_id):
+    """
+    根据方案ID删除方案周转明细数据
+    :param scheme_id: 方案ID
+    :return: 接口返回结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete_adam_glob_strategy_scheme_itt'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 构造参数
+        params = {"scheme_id": scheme_id}
+
+        # 发送删除请求
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def delete_adam_glob_strategy_scheme_lps(scheme_id):
+    """
+    根据方案ID删除方案环节计划汇总明细数据
+    :param scheme_id: 方案ID
+    :return: 接口返回结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete_adam_glob_strategy_scheme_lps'
+        url = f"http://{host}:{port}{endpoint}"
+
+        params = {"scheme_id": scheme_id}
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def delete_adam_glob_strategy_scheme_by_ym(exec_ym: str):
+    """
+    根据执行年月删除全局策略方案主表数据
+    :param exec_ym: 执行年月，格式：YYYYMM
+    :return: 接口返回结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete_adam_glob_strategy_scheme_by_ym'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # 构造参数
+        params = {"exec_ym": exec_ym}
+
+        # 发送请求
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+def deleteScheme(yearMonth:str):
+    '''
+    删除当前年月所有方案
+    '''
+    global_scheme = query_adam_glob_strategy_scheme_by_month(yearMonth)
+
+    if global_scheme is None or global_scheme.empty :
+        print('数据为空无需删除')
+        return
+
+    scheme_id_list = global_scheme['SCHEME_ID'].tolist()
+
+    for id in scheme_id_list:
+        delete_adam_glob_strategy_scheme_itt(id)
+        delete_adam_glob_strategy_scheme_lps(id)
+        delete_adam_glob_strategy_scheme_cost(id)
+
+    delete_adam_glob_strategy_scheme_by_ym(yearMonth)
+    print('方案数据删除成功')
+
+
+def query_adam_run_dur_sample_by_org_no(org_no: str):
+    """
+    根据单位编码查询运行年限表数据
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_run_dur_sample_by_org_no'
+        url = f"http://{host}:{port}{endpoint}"
+
+        params = {"org_no": org_no}
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        return df
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+

@@ -11,27 +11,40 @@ import logging
 import sys
 from collections import defaultdict
 import datetime
-
+import time
 
 def LoadDelivData(date:str):
     '''
     根据当日补库计划载入配送数据
     '''
+    logging.basicConfig(
+        level=logging.INFO,  # 设置日志级别为 INFO
+        format="%(asctime)s - %(levelname)s - %(message)s",  # 设置日志格式
+        stream=sys.stdout  # 将日志输出到控制台
+    )
     from backend.api.data_api.fetch_data import (
     query_adam_spec_code_config,query_adam_del_site_conf,
     query_adam_plan_day_ias_pre_by_date
     )
     #完整的规格设备码信息
     SubTypeList = query_adam_spec_code_config()
+    logging.info(f'载入配送数据：查询到{len(SubTypeList)}条规格设备码数据')
     SubTypeNum = len(SubTypeList)
+    
     # 查询配送站点信息
     tb1 = query_adam_del_site_conf()
+    logging.info(f'载入配送数据：查询到{len(tb1)}条配送站点信息')
+    
     marketing_center = tb1[tb1['STAT_NAME'] == '营销服务中心']
+    logging.info(f'载入配送数据：识别到{len(marketing_center)}个营销服务中心')
+    
     tb1 = tb1[tb1['STAT_NAME'] != '营销服务中心']
-    #减去省中心
     LocationNum = len(tb1)
+    logging.info(f'载入配送数据：筛选出{LocationNum}个非营销服务中心站点')
+    
     # 查询当日补库计划
     tb2 = query_adam_plan_day_ias_pre_by_date(date)
+    logging.info(f'载入配送数据：查询到{len(tb2)}条当日补库计划')
     Location = tb1['ORG_NO']
     LocationInd = tb2['REC_ORG_NO']
     SubTypeInd = tb2['DEV_CODE']
@@ -190,7 +203,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
 
     # 遍历每一趟配送（每行代表一辆车一条路线）
     for RowIdx, Row in DelivPlan.iterrows():
-        SchemeId = GlobalSchemeId * 1000 + RowIdx + 1   # 主表唯一ID
+        SchemeId = int(time.time() * 1000)  # 主表唯一ID
 
         VeType = int(Row['VeType'])
         PathDis = Row['PathDis']
@@ -223,6 +236,8 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
             'UPDATE_DATE': CurrentDateStr,
             'GLOBAL_SCHEME_ID': GlobalSchemeId
         })
+
+        DetailIdSeq = SchemeId
 
         # 处理明细：遍历每个停靠点
         for StopIdx, (OrgNo, StopPieces) in enumerate(zip(PathNo, DevicePieces)):
@@ -286,6 +301,8 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
     query_adam_dist_scheme_det_by_distschemeid,insert_into_adam_plan_day_ias_pre)
     
     DistSchemeDf = query_adam_dist_scheme_by_date_range(start_date , end_date)
+    DistSchemeDf['PLAN_DIST_DATE'] = DistSchemeDf['PLAN_DIST_DATE'].str[:10]
+    print(f"当前日期格式示例：{DistSchemeDf['PLAN_DIST_DATE'].iloc[0]}")
     Dist_Scheme_ID = DistSchemeDf['DIST_SCHEME_ID'].tolist()
     
     # 提取DIST_SCHEME_ID和PLAN_DIST_DATE作为字典映射
@@ -378,7 +395,7 @@ def AdjustDaliyDelivery(date:str):
     sorted_indices= np.argsort(SaveDis, kind='stable') + 1
     sorted_indices = sorted_indices[len(DMAT)-1:]
     # 删除前 50% 的行
-    k = int(np.ceil(0.4 * len(sorted_indices)))
+    k = int(np.ceil(0.2 * len(sorted_indices)))
     start_row = len(sorted_indices) - k
     index = sorted_indices[start_row:]
     index = np.concatenate([np.arange(1, len(DMAT)), index])
@@ -436,10 +453,10 @@ def AdjustDaliyDelivery(date:str):
     logging.info("构建压缩路径‑箱数规划模型")
 
     # ===================== 1. 提取活性节点并过滤可用路径 =====================
-    active_nodes = np.where(DemandsBoxs > 0)[0]          # 0‑based 索引
+    active_nodes = np.where(DemandsBoxs > 0)[0]   # 0‑based 索引
     active_set = set(active_nodes + 1)                  # 1‑based 集合，便于判断
+    logging.info(f'只保留首尾节点都在活性集合中的路径,活性节点数量{len(active_set)}')
 
-    # 只保留首尾节点都在活性集合中的路径
     keep_idx = []
     for i in range(len(PathInfo)):
         p = PathInfo.loc[i, 'Path']
@@ -447,19 +464,20 @@ def AdjustDaliyDelivery(date:str):
             keep_idx.append(i)
     PathInfo_active = PathInfo.iloc[keep_idx].reset_index(drop=True)
 
-    # 保存原始路径编号（用于最后映射回原始计划）
+    logging.info(f'保存原始路径编号（用于最后映射回原始计划）,活性节点中的路径数量{len(PathInfo_active)}')
     orig_path_indices = [PathInfo.index[i] + 1 for i in keep_idx]   # 原始 Ind（1‑based）
 
     N_active = len(active_nodes)           # 活性网点数
     PathNum_new = len(PathInfo_active)     # 可用路径数
     demands_active = DemandsBoxs[active_nodes]   # 活性网点剩余需求
-
-    # 最小配送量映射：需求 < 20 的活性网点
+    logging.info(f'活性网点数：{N_active},可用路径数量:{PathNum_new}')
+    logging.info('最小配送量映射：需求 < 20 的活性网点')
     mindeliver_map = {}
     for pos, orig_idx in enumerate(active_nodes):
         if DemandsBoxs[orig_idx] < MinDeliverNum:
             mindeliver_map[pos] = DemandsBoxs[orig_idx]   # pos 为 0‑based（在 active_nodes 中的下标）
 
+    logging.info('2. 构建压缩模型（含空载惩罚）')
     # ===================== 2. 构建压缩模型（含空载惩罚） =====================
     prob = pulp.LpProblem("deleivplan_compact", pulp.LpMinimize)
 

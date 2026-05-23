@@ -79,7 +79,7 @@ def update_pre_conc_status(preConcId, stat):
     """辅助函数：更新预测结论表的状态"""
     if not preConcId:
         return
-    url = f"{SQL_API_URL}/gk-adam-update_pre_conc_status"
+    url = f"{SQL_API_URL}/update_pre_conc_status"
     try:
         # 传给 Java 后端的 key 依然叫 pre_conc_id，因为 DS_SQL 里配置的是 #{pre_conc_id}
         response = requests.post(url, json={"pre_conc_id": preConcId, "stat": stat})
