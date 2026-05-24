@@ -58,7 +58,7 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
     logger.info(f"有效设备码数量: {len(valid_devices)}")
 
     # 2. 获取库存数据，筛选新表、高库龄>0、有效站点和设备码
-    stock_df = query_adam_stock_count_sample_all()
+    stock_df = query_adam_stock_count_sample_all()  #TODO 这里可能也是需要按照单位层级汇总的
     logger.info(f"原始库存记录数: {len(stock_df)}")
 
     high_stock = stock_df[

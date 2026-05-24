@@ -62,6 +62,7 @@ def GenerateMutiOrderScheme(yearMonth:str):
         global_shceme_lps = GetGlobalSchemeLPS(detail,tag)
         global_scheme_cost = GetGlobalSchemeCost(detail,tag,yearMonth)
 
+        global_scheme_item['PRE_STAT_COST'] = global_scheme_item['PRE_STAT_COST'].astype(float).round(2)
         GlobalSchemeItems[tag] = global_scheme_item
         GlobalSchemeCost[tag] = global_scheme_cost
         GlobalSchemeITTs[tag] = global_scheme_itt
@@ -202,31 +203,37 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     pre_stat_cost = total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
     pre_single_cost = pre_stat_cost / (total_demand + total_inv) if (total_demand + total_inv)> 0 else 0.0
     total_turnover = detail['TURNOVER'].sum()
-    cur_itr = detail['ITR'].sum()
+    cur_itr = detail['ITR'].round(2).sum()
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
         cost_tr = (pre_stat_cost - cost_last_month) / cost_last_month * 100
+        cost_tr = round(cost_tr,2)
 
     cost_yoy = 0.0
     if cost_last_year and cost_last_year != 0:
         cost_yoy = (pre_stat_cost - cost_last_year) / cost_last_year * 100
+        cost_yoy = round(cost_yoy,2)
 
     itt_tr = 0.0
     if itt_last_month and itt_last_month != 0:
         itt_tr = (total_turnover - itt_last_month) / itt_last_month * 100
+        itt_tr = round(itt_tr,2)
 
     itt_yoy = 0.0
     if itt_last_year and itt_last_year != 0:
         itt_yoy = (total_turnover - itt_last_year) / itt_last_year * 100
+        itt_yoy = round(itt_yoy,2)
     # 计算库存运行比
     itr_tr = 0.0
     if itr_last_month and itr_last_month != 0:
         itr_tr = (cur_itr - itr_last_month) / itr_last_month * 100
+        itr_tr = round(itr_tr,2)
 
     itr_yoy = 0.0
     if itr_last_year and itr_last_year != 0:
         itr_yoy = (cur_itr - itr_last_year) / itr_last_year * 100
+        itr_yoy = round(itr_yoy,2)
 
     record = {
         'SCHEME_ID': int(scheme_no),
@@ -238,7 +245,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
         'PRE_SINGLE_COST': round(pre_single_cost, 4),
         'COST_YOY': round(cost_yoy, 2),
         'COST_TR': round(cost_tr, 2),
-        'PRE_ITR': cur_itr,
+        'PRE_ITR': round(cur_itr),
         'ITR_YOY': itr_yoy,
         'ITR_TR': itr_tr,
         'PRE_ITT': round(total_turnover, 4),
@@ -703,7 +710,7 @@ def GetRunDurDetail(detail:pd.DataFrame):
     from backend.api.data_api.fetch_data import (
         query_adam_del_site_conf,
         query_adam_spec_code_config,
-        query_adam_run_dur_sample_by_org_no)
+        query_adam_run_dur_sample_by_org_no)  # TODO 这里库存运行比数据也需要按照单位层级汇总到市县
 
     # 1. 获取有效站点（排除营销服务中心）
     site_df = query_adam_del_site_conf()
@@ -777,7 +784,7 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
         itt = df.iloc[0]['PRE_ITT']
         exec_ym = df.iloc[0].get('EXEC_YM', '')
         items.append((tag, cost, itt, exec_ym))
-        logger.info(f"方案 {tag}: 成本={cost:.2f}, 周转={itt:.4f}, 年月={exec_ym}")
+        logger.info(f"方案 {tag}: 成本={cost}, 周转={itt:.4f}, 年月={exec_ym}")
 
     # 按成本和周转排序
     items_by_cost = sorted(items, key=lambda x: x[1])          # 成本升序

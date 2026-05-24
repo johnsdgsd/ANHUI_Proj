@@ -612,7 +612,8 @@ def query_adam_plan_day_ias_pre_by_date(date:str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("查询日补库返回数据为空")
+            print("查询日补库返回数据为空")
+            return pd.DataFrame()
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1717,6 +1718,64 @@ def query_adam_run_dur_sample_by_org_no(org_no: str):
 
     except requests.exceptions.RequestException as e:
         raise
+    except Exception as e:
+        raise
+
+
+def query_adam_plan_month_ias_pre(pre_year: str, pre_month: str):
+    """
+    根据年度、月份查询月度计划预估表
+    :param pre_year: 年度，如 2025
+    :param pre_month: 月份，如 05
+    :return: 查询结果 DataFrame
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_plan_month_ias_pre_by_ym'
+        url = f"http://{host}:{port}{endpoint}"
+
+        params = {
+            "pre_year": pre_year,
+            "pre_month": pre_month
+        }
+
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        return df
+
+    except Exception as e:
+        raise
+
+def query_adam_plan_day_ias_pre_by_month(data_month: str):
+    """
+    根据年月查询日计划预估表整月数据
+    :param data_month: 格式 YYYYMM  例如 202605
+    :return: 当月所有 PRE_DATE 数据
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_plan_day_ias_pre_by_month'
+        url = f"http://{host}:{port}{endpoint}"
+
+        params = {"data_month": data_month}
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        return df
+
     except Exception as e:
         raise
 
