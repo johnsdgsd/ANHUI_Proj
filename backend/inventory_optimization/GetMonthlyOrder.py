@@ -1,6 +1,8 @@
 """
 生成月度库存阈值和补货订单
 """
+import time
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -25,7 +27,8 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
         query_adam_spec_code_config,
         )
 
-
+    # 生成初始时间戳（精确到毫秒）
+    timestamp = int(time.time()*1000)
     # 获得月度预测结果表
     df = query_adam_yqm_dmd_pre_by_year_month(year, month)
     print(f'获取月度需求预测数据成功，日期{year}{month}，数据量：{len(df)}')
@@ -86,8 +89,7 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     
     threshold_df = []
     order_df = []
-    # 生成初始时间戳（精确到毫秒）
-    timestamp = int(datetime.now().strftime('%Y%m%d%H%M%S'))
+
     stock_id = timestamp
 
     spec_df = query_adam_spec_code_config()

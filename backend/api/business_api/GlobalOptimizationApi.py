@@ -81,6 +81,7 @@ def generate_multi_scheme():
         return jsonify(response)
         
     except Exception as e:
+        logger.error("执行全局优化失败", exc_info=True)
         return jsonify({
             "code": 500,
             "message": f"生成多套方案失败: {str(e)}"

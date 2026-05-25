@@ -173,7 +173,7 @@ def run_emergency_replenishment(
         DataFrame: 紧急补库建议（未插入前的原始建议）
     """
     from backend.api.data_api.fetch_data import (
-        query_adam_stock_count_sample_all,   #TODO 这里库存信息表可能是需要按照单位层级汇总到市县
+        query_adam_stock_count_sample_all,   #TODO 这里库存信息表可能是需要按照单位层级汇总到市县---不用汇总了
         query_adam_plan_day_ias_pre_by_month,
         query_adam_plan_month_ias_pre,
         query_adam_spec_code_config,

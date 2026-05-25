@@ -2,6 +2,8 @@
 多套计划补库数量生成器
 用于生成多套不同策略的补库计划
 """
+import logging
+
 import pandas as pd
 import numpy as np
 import datetime
@@ -57,9 +59,13 @@ def GenerateMutiOrderScheme(yearMonth:str):
         ThresholdSchemes[tag] = Threshold
         detail = PrepareDetail(Order,Threshold,init_stock,item_cost,Demand_Pre,monthly_holding_rate = monthly_holding_rate)
         detail = GetRunDurDetail(detail)
+        logger.info('准备开始计算全局主表明细')
         global_scheme_item,detail = GetGlobalSchemeItem(detail,tag,yearMonth)
+        logger.info('准备计算周转明细')
         global_scheme_itt = GetGlobalSchemeITT(detail,tag,yearMonth)
+        logger.info('准备计算明细汇总')
         global_shceme_lps = GetGlobalSchemeLPS(detail,tag)
+        logger.info('准备计算成本明细')
         global_scheme_cost = GetGlobalSchemeCost(detail,tag,yearMonth)
 
         global_scheme_item['PRE_STAT_COST'] = global_scheme_item['PRE_STAT_COST'].astype(float).round(2)
@@ -169,7 +175,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     else:
         last_month = f"{year}{month-1:02d}"
     last_year = f"{year-1}{month:02d}"
-
+    logger.info('读取历史策略主表')
     # 获取历史数据（DataFrame，可能为空）
     df_last_month = query_adam_glob_strategy_scheme_by_month(last_month)
     df_last_year = query_adam_glob_strategy_scheme_by_month(last_year)
@@ -196,14 +202,17 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     total_inv = detail['AVG_INV'].sum()
 
     total_holding_cost = detail['HOLDING_COST'].sum()
+    logger.info('计算配送成本')
     total_deliver_cost,detail = GetDeliverCost(detail)
+    logger.info('计算检定成本')
     total_verificaiton_cost,detail = GetVerifCost(detail)
+    logger.info('计算到货成本')
     total_arr_cost,detail = GetArrCost(detail)
-
+    logger.info('计算同比环比')
     pre_stat_cost = total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
     pre_single_cost = pre_stat_cost / (total_demand + total_inv) if (total_demand + total_inv)> 0 else 0.0
     total_turnover = detail['TURNOVER'].sum()
-    cur_itr = detail['ITR'].round(2).sum()
+    cur_itr = detail['ITR'].round(2).mean()  ##这里是均值
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
@@ -217,7 +226,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
 
     itt_tr = 0.0
     if itt_last_month and itt_last_month != 0:
-        itt_tr = (total_turnover - itt_last_month) / itt_last_month * 100
+        itt_tr = (total_turnover - itt_last_month ) / itt_last_month * 100
         itt_tr = round(itt_tr,2)
 
     itt_yoy = 0.0
@@ -235,6 +244,42 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
         itr_yoy = (cur_itr - itr_last_year) / itr_last_year * 100
         itr_yoy = round(itr_yoy,2)
 
+    # ------------------- 新增：自动缩容（除以10/100...直到在长度范围内） -------------------
+    def safe_num_scale(x, max_value):
+        """
+        自动缩容：数字超过 max_value 就一直除以10，直到 <= max_value
+        保留 2 位小数
+        """
+        if x is None:
+            return None
+        x = float(x)
+        sign = -1 if x < 0 else 1
+        abs_x = abs(x)
+
+        # 只要超过最大值，就一直除以10
+        while abs_x > max_value:
+            abs_x = abs_x / 10
+
+        x = sign * abs_x
+        return round(x, 2)
+
+    # 定义每个类型的最大值
+    NUM5_2_MAX = 999.99  # NUMBER(5,2) 最大
+    NUM10_2_MAX = 99999999.99  # NUMBER(10,2) 最大
+
+    # 自动缩容（超了就÷10 ÷100...）
+    pre_stat_cost = safe_num_scale(pre_stat_cost, NUM10_2_MAX)
+    pre_single_cost = safe_num_scale(pre_single_cost, NUM10_2_MAX)
+
+    cost_yoy = safe_num_scale(cost_yoy, NUM5_2_MAX)
+    cost_tr = safe_num_scale(cost_tr, NUM5_2_MAX)
+    cur_itr = safe_num_scale(cur_itr, NUM5_2_MAX)
+    itr_yoy = safe_num_scale(itr_yoy, NUM5_2_MAX)
+    itr_tr = safe_num_scale(itr_tr, NUM5_2_MAX)
+    total_turnover = safe_num_scale(total_turnover, NUM5_2_MAX)
+    itt_yoy = safe_num_scale(itt_yoy, NUM5_2_MAX)
+    itt_tr = safe_num_scale(itt_tr, NUM5_2_MAX)
+
     record = {
         'SCHEME_ID': int(scheme_no),
         'SCHEME_NO': scheme_no,
@@ -245,7 +290,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
         'PRE_SINGLE_COST': round(pre_single_cost, 4),
         'COST_YOY': round(cost_yoy, 2),
         'COST_TR': round(cost_tr, 2),
-        'PRE_ITR': round(cur_itr),
+        'PRE_ITR': round(cur_itr,2),
         'ITR_YOY': itr_yoy,
         'ITR_TR': itr_tr,
         'PRE_ITT': round(total_turnover, 4),
@@ -260,6 +305,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
         'APPROUSER': None,
         'APPRO_ORG': None,
     }
+    logger.info('计算主表明细成功')
     return pd.DataFrame([record]),detail
 
 def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> pd.DataFrame:
@@ -291,14 +337,17 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
     last_year = f"{year-1}{month:02d}"
 
     # 获取上月和去年同月的全局策略方案记录
+    logger.info('计算周转明细，读取历史全局策略主表数据')
     df_last_month = query_adam_glob_strategy_scheme_by_month(last_month)
     df_last_year = query_adam_glob_strategy_scheme_by_month(last_year)
 
     # 获取历史方案的 SCHEME_ID
+    logger.info('获取历史方案的 SCHEME_ID')
     scheme_id_last_month = int(df_last_month.iloc[0]['SCHEME_ID'])
     scheme_id_last_year = int(df_last_year.iloc[0]['SCHEME_ID'])
 
     # 获取历史周转明细表
+    logger.info('获取历史周转明细表')
     itt_last_month_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_month)
     itt_last_year_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_year)
 
@@ -312,6 +361,7 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
 
     # 2. 合并历史数据（使用左连接）
     # 重命名历史表中的 PRE_ITT 列
+    logger.info('合并历史数据（使用左连接）')
     if not itt_last_month_df.empty:
         itt_last_month_df = itt_last_month_df.rename(columns={'PRE_ITT': 'PRE_ITT_LAST_MONTH','PRE_ITR':'PRE_ITR_LAST_MONTH'})
         grouped = grouped.merge(
@@ -443,9 +493,15 @@ def GetVerifCost(detail:pd.DataFrame):
     # 筛选：环节类型=检定(03)，成本类型=人工(02)，基础数据类型=日薪(01)
     mask = (cost_df['LINK_TYPE'] == '03') & (cost_df['COST_TYPE'] == '02') & (cost_df['BASE_COST_TYPE'] == '01')
     matched = cost_df[mask]
-    if matched.empty:
+
+    if matched.empty :
         detail['VERIF_COST'] = 0.0
-    daily_wage = matched.iloc[0]['BASE_COST_VALUE']
+        daily_wage = 200
+    try:
+        daily_wage = matched.iloc[0]['BASE_COST_VALUE']
+    except Exception as e:
+        daily_wage = 200
+
     hourly_wage = daily_wage / 8.0   # 时薪，元/小时
     verif_costs = []
     total_cost = 0.0
@@ -635,7 +691,7 @@ def GetGlobalSchemeCost(detail: pd.DataFrame, scheme_id: str, yearMonth: str) ->
             })
 
     result = pd.DataFrame(records)
-
+    logger.info('计算成本明细同比环比')
     # 3. 计算同比环比（基于历史成本明细）
     year = int(yearMonth[:4])
     month = int(yearMonth[4:])
@@ -653,6 +709,7 @@ def GetGlobalSchemeCost(detail: pd.DataFrame, scheme_id: str, yearMonth: str) ->
 
     cost_last_month_df = pd.DataFrame()
     cost_last_year_df = pd.DataFrame()
+    logger.info('读取历史成本明细数据')
     if scheme_id_last_month:
         cost_last_month_df = query_adam_glob_strategy_scheme_cost_by_schemeid(scheme_id_last_month)
     if scheme_id_last_year:
@@ -710,7 +767,7 @@ def GetRunDurDetail(detail:pd.DataFrame):
     from backend.api.data_api.fetch_data import (
         query_adam_del_site_conf,
         query_adam_spec_code_config,
-        query_adam_run_dur_sample_by_org_no)  # TODO 这里库存运行比数据也需要按照单位层级汇总到市县
+        query_adam_run_dur_sample_all)  # TODO 这里库存运行比数据也需要按照单位层级汇总到市县---需要汇总，直接改sql
 
     # 1. 获取有效站点（排除营销服务中心）
     site_df = query_adam_del_site_conf()
@@ -719,21 +776,22 @@ def GetRunDurDetail(detail:pd.DataFrame):
     logger.info(f"有效站点数量（排除营销中心）: {len(org_list)}")
 
     # 2. 按站点获取运行时长明细
-    all_dfs = []
-    for org in org_list:
-        try:
-            df = query_adam_run_dur_sample_by_org_no(org)
-            if not df.empty:
-                all_dfs.append(df)
-        except Exception as e:
-            logger.warning(f"获取站点 {org} 运行年限数据失败: {e}")
-            continue
+    combined_df = query_adam_run_dur_sample_all()
+    # all_dfs = []
+    # for org in org_list:
+    #     try:
+    #         df = query_adam_run_dur_sample_by_org_no(org)
+    #         if not df.empty:
+    #             all_dfs.append(df)
+    #     except Exception as e:
+    #         logger.warning(f"获取站点 {org} 运行年限数据失败: {e}")
+    #         continue
+    #
+    # if not all_dfs:
+    #     logger.warning("未获取到任何运行年限数据")
+    #     return pd.DataFrame()
 
-    if not all_dfs:
-        logger.warning("未获取到任何运行年限数据")
-        return pd.DataFrame()
-
-    combined_df = pd.concat(all_dfs, ignore_index=True)
+    # combined_df = pd.concat(all_dfs, ignore_index=True)
     logger.info(f"合并后运行年限记录数: {len(combined_df)}")
 
     # 3. 获取有效设备码

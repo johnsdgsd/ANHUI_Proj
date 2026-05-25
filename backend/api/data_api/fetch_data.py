@@ -803,16 +803,27 @@ def insert_into_adam_stock_week_limt_pre(df: pd.DataFrame):
 
 def query_adam_org_stock_sample_by_month(month: str):
     '''
-    按年月查询库存快照
+    按年月查询库存快照,属于预测当月，查询上月
     '''
     try:
+        # ===================== 【核心修改：自动计算上月】 =====================
+        from datetime import datetime
+        # 把传入的 YYYYMM 转成日期，再减一个月，得到上月
+        current_date = datetime.strptime(month, "%Y%m")
+        # 计算上个月
+        if current_date.month == 1:
+            last_month = f"{current_date.year - 1}12"
+        else:
+            last_month = f"{current_date.year}{current_date.month - 1:02d}"
+        # ====================================================================
+        print(f'准备查询{last_month}的库存快照')
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         endpoint = '/exec/gk-adam-query_adam_org_stock_sample_by_month'
         url = f"http://{host}:{port}{endpoint}"
         
         json = {
-            "month": month  # 对应SQL里的 #{month}
+            "month": last_month  # 对应SQL里的 #{month}
         }
         
         response = requests.post(url, json=json)
@@ -821,7 +832,8 @@ def query_adam_org_stock_sample_by_month(month: str):
         data = response.json()
         
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("查询库存快照返回数据为空")
+            print()
+            raise ValueError(f"查询{last_month}库存快照返回数据为空")
         
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1007,7 +1019,7 @@ def query_adam_glob_strategy_scheme_by_month(yearmonth: str):
 
         if isinstance(data, list) and len(data) == 0:
             print("查询全局策略主表返回数据为空")
-            return pd.DataFrame
+            return pd.DataFrame()
 
         if isinstance(data, list):
             df = pd.DataFrame(data)
@@ -1721,6 +1733,34 @@ def query_adam_run_dur_sample_by_org_no(org_no: str):
     except Exception as e:
         raise
 
+def query_adam_run_dur_sample_all():
+    """
+    查询运行年限表按照单位汇总后的所有数据
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_run_dur_sample_all'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # params = {"org_no": org_no}
+        params= {}
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        return df
+
+    except requests.exceptions.RequestException as e:
+        print('获取运行年限数据失败')
+        raise
+    except Exception as e:
+        print('获取运行年限数据失败')
+        raise
 
 def query_adam_plan_month_ias_pre(pre_year: str, pre_month: str):
     """
@@ -1751,6 +1791,7 @@ def query_adam_plan_month_ias_pre(pre_year: str, pre_month: str):
         return df
 
     except Exception as e:
+
         raise
 
 def query_adam_plan_day_ias_pre_by_month(data_month: str):
@@ -1778,6 +1819,5 @@ def query_adam_plan_day_ias_pre_by_month(data_month: str):
 
     except Exception as e:
         raise
-
 
 

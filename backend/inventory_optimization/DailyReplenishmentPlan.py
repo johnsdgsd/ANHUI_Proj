@@ -348,7 +348,8 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
         by=['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE'],
         ascending=[True, True, True]
     ).reset_index(drop=True)
-    DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(10001,10001+len(DaliyReplPlan))
+    timestamp = int(time.time()*1000)
+    DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(timestamp,timestamp+len(DaliyReplPlan))
     DaliyReplPlan['EST_STOCK_NUM'] = None
     # 添加状态和类型列
     DaliyReplPlan['DAILY_PLAN_STATUS'] = '01'
