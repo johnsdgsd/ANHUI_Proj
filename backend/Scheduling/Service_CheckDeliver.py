@@ -62,7 +62,6 @@ def execute_batch(sql_id, data_list):
 def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
     try:
         from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
-
         update_pre_conc_status(preConcId, '02')
 
         start_dt = datetime.strptime(preTime, '%Y-%m-%d')
@@ -79,7 +78,6 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         else:
             logging.info(f">>> [月初全局排程启动] 起点: {preTime}。")
 
-        # 【核心修改点】：接收透传过来的 global_scheme_id
         Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id = LoadDeliChcekData(
             target_month, sim_start_date_str)
 
@@ -123,22 +121,13 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
             else:
                 safe_batch_id = int(float(row['BATCH_PLAN_ARR_ID'])) if pd.notnull(
                     row.get('BATCH_PLAN_ARR_ID')) and str(row.get('BATCH_PLAN_ARR_ID')).strip() != '' else None
-
                 detect_db_list.append({
-                    "day_detect_plan_pre_id": generate_safe_id(),
-                    "detect_plan_no": f"CDP-{target_month}-{idx}",
-                    "arr_batch_no": row.get('ARR_BATCH_NO'),
-                    "batch_plan_arr_id": safe_batch_id,
-                    "dev_code": safe_dev_code,
-                    "dev_cls": str(row['DEV_CLS']),
-                    "dev_categ": str(row['DEV_CATEG']),
-                    "detect_plan_num": int(row['DETECT_PLAN_NUM']),
-                    "detect_bgn_date": safe_bgn_date,
-                    "detect_end_date": safe_end_date,
-                    "plan_stat": "01",
-                    "cmp_type": "01",
-                    "veri_type": str(row.get('VERI_TYPE', '01')),
-                    "global_scheme_id": global_scheme_id  # 【透传】
+                    "day_detect_plan_pre_id": generate_safe_id(), "detect_plan_no": f"CDP-{target_month}-{idx}",
+                    "arr_batch_no": row.get('ARR_BATCH_NO'), "batch_plan_arr_id": safe_batch_id,
+                    "dev_code": safe_dev_code, "dev_cls": str(row['DEV_CLS']), "dev_categ": str(row['DEV_CATEG']),
+                    "detect_plan_num": int(row['DETECT_PLAN_NUM']), "detect_bgn_date": safe_bgn_date,
+                    "detect_end_date": safe_end_date, "plan_stat": "01", "cmp_type": "01",
+                    "veri_type": str(row.get('VERI_TYPE', '01')), "global_scheme_id": global_scheme_id
                 })
 
         if not is_mid_month and not df_detect.empty:
@@ -149,13 +138,9 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                 month_detect_db_list.append({
                     "month_detect_plan_pre_id": generate_safe_id(),
                     "detect_plan_no": f"MDP-{target_month}-{safe_dev_code}",
-                    "pre_year": str(start_dt.year),
-                    "pre_month": f"{start_dt.month:02d}",
-                    "dev_code": safe_dev_code,
-                    "dev_cls": str(row['DEV_CLS']),
-                    "dev_categ": str(row['DEV_CATEG']),
-                    "detect_plan_num": int(row['DETECT_PLAN_NUM']),
-                    "global_scheme_id": global_scheme_id  # 【透传】
+                    "pre_year": str(start_dt.year), "pre_month": f"{start_dt.month:02d}", "dev_code": safe_dev_code,
+                    "dev_cls": str(row['DEV_CLS']), "dev_categ": str(row['DEV_CATEG']),
+                    "detect_plan_num": int(row['DETECT_PLAN_NUM']), "global_scheme_id": global_scheme_id
                 })
 
         dist_scheme_db_list = []
@@ -164,67 +149,45 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
             scheme_id = generate_safe_id()
             master = plan['master']
             dist_scheme_db_list.append({
-                "dist_scheme_id": scheme_id,
-                "car_type": master['CAR_TYPE'],
-                "plan_dist_date": master['PLAN_DIST_DATE'],
-                "load_rate": master['LOAD_RATE'],
-                "global_scheme_id": global_scheme_id  # 【透传】
+                "dist_scheme_id": scheme_id, "car_type": master['CAR_TYPE'], "plan_dist_date": master['PLAN_DIST_DATE'],
+                "load_rate": master['LOAD_RATE'], "global_scheme_id": global_scheme_id
             })
-            details = plan['details']
-
-            for d in details:
+            for d in plan['details']:
                 unit_price = master.get('UNIT_PRICE', 0.0695)
                 real_box_num = int(d.get('PLAN_BOX_NUM', 0))
                 dist_exp = round(real_box_num * d.get('DIST_SEGMENT', 0.0) * unit_price, 2)
-
                 dist_detail_db_list.append({
-                    "dist_scheme_det_id": generate_safe_id(),
-                    "dist_scheme_id": scheme_id,
+                    "dist_scheme_det_id": generate_safe_id(), "dist_scheme_id": scheme_id,
                     "rec_org_no": d['REC_ORG_NO'],
-                    "dev_code": str(d['DEV_CODE']).replace('.0', '').strip(),
-                    "dev_cls": str(d['DEV_CLS']),
-                    "dev_categ": str(d['DEV_CATEG']),
-                    "dist_seq": d['DIST_SEQ'],
-                    "load_seq": d['LOAD_SEQ'],
-                    "plan_dist_num": int(d['PLAN_DIST_NUM']),
-                    "plan_box_num": real_box_num,
-                    "dist_exp": dist_exp,
-                    "est_tot_dist_mist": round(d.get('DIST_SEGMENT', 0.0), 2),
-                    "global_scheme_id": global_scheme_id  # 【透传】
+                    "dev_code": str(d['DEV_CODE']).replace('.0', '').strip(), "dev_cls": str(d['DEV_CLS']),
+                    "dev_categ": str(d['DEV_CATEG']), "dist_seq": d['DIST_SEQ'], "load_seq": d['LOAD_SEQ'],
+                    "plan_dist_num": int(d['PLAN_DIST_NUM']), "plan_box_num": real_box_num, "dist_exp": dist_exp,
+                    "est_tot_dist_mist": round(d.get('DIST_SEGMENT', 0.0), 2), "global_scheme_id": global_scheme_id
                 })
 
         work_arrange_db_list = []
         if not df_work_arrange.empty:
             for _, row in df_work_arrange.iterrows():
                 work_arrange_db_list.append({
-                    "work_arrange_pre_id": generate_safe_id(),
-                    "veri_categ": str(row['VERI_CATEG']),
-                    "work_date": str(row['WORK_DATE']),
-                    "work_flag": str(row['WORK_FLAG']),
-                    "detect_dur": str(row['DETECT_DUR']),
-                    "capacity_num": int(row['CAPACITY_NUM']),
-                    "global_scheme_id": global_scheme_id  # 【透传】
+                    "work_arrange_pre_id": generate_safe_id(), "veri_categ": str(row['VERI_CATEG']),
+                    "work_date": str(row['WORK_DATE']), "work_flag": str(row['WORK_FLAG']),
+                    "detect_dur": str(row['DETECT_DUR']), "capacity_num": int(row['CAPACITY_NUM']),
+                    "global_scheme_id": global_scheme_id
                 })
 
         logging.info("================ 开始回写数据库 ================")
-
         if is_mid_month:
-            logging.info(f"【月中重排触发】：更新 {len(detect_update_list)} 条旧检定计划起止时间。不再写入月计划。")
             execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
         else:
-            logging.info(
-                f"【月初排程触发】：全新插入 {len(detect_db_list)} 条日检定计划和 {len(month_detect_db_list)} 条月计划...")
             execute_batch("gk-adam-insert_detect_plan", detect_db_list)
             execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
 
-        logging.info(f"清理当月 ({target_month}) 的历史未配送方案及明细...")
         execute_batch("gk-adam-delete_undelivered_scheme_det", [{"target_month": target_month}])
         execute_batch("gk-adam-delete_undelivered_scheme", [{"target_month": target_month}])
 
         execute_batch("gk-adam-insert_dist_scheme", dist_scheme_db_list)
         execute_batch("gk-adam-insert_dist_scheme_det", dist_detail_db_list)
 
-        logging.info(f"清理 {sim_start_date_str} 起至月底的工作安排记录...")
         execute_batch("gk-adam-delete_work_arrange_by_date",
                       [{"start_date": sim_start_date_str, "target_month": target_month}])
         execute_batch("gk-adam-insert_work_arrange_pre", work_arrange_db_list)

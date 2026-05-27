@@ -33,10 +33,10 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     df = query_adam_yqm_dmd_pre_by_year_month(year, month)
     print(f'获取月度需求预测数据成功，日期{year}{month}，数据量：{len(df)}')
     # 按单位、设备码分组，汇总预测数量（将所有业务类型的数据相加）
-    df_grouped = df.groupby(
-        ['PRE_YEAR', 'PRE_MONTH', 'ORG_NO', 'DEV_CODE'],
-        as_index=False
-    )['PRE_NUM'].sum()
+    df_grouped = df#.groupby(
+    #     ['PRE_YEAR', 'PRE_MONTH', 'ORG_NO', 'DEV_CODE'],
+    #     as_index=False
+    # )['PRE_NUM'].sum()
     
     # 重命名列名
     df_grouped = df_grouped.rename(columns={'PRE_NUM': '预测数量'})

@@ -198,38 +198,37 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
     MainRows = []
     DetailRows = []
 
-    # 用于明细ID递增
-    DetailIdSeq = 1
+    # 基础时间戳（毫秒，13位）
+    base_ts = int(time.time() * 1000)
+    main_seq = 0
+    det_seq = 0
 
-    # 遍历每一趟配送（每行代表一辆车一条路线）
     for RowIdx, Row in DelivPlan.iterrows():
-        SchemeId = int(time.time() * 1000)  # 主表唯一ID
+        main_seq += 1
+        scheme_id = base_ts * 1000 + main_seq  # 主表ID
 
         VeType = int(Row['VeType'])
         PathDis = Row['PathDis']
         Price = Row['Price']
         DeNum = Row['DeNum']
         PathNo = Row['PathNo']
-        DevicePieces = Row['DevicePieces']   # 列表，长度等于停靠点数，每个元素是各设备码件数数组
+        DevicePieces = Row['DevicePieces']
 
-        # 计算总箱数、总件数（用于分摊费用）
         TotalBoxes = sum(DeNum)
         TotalPieces = 0
         for StopPieces in DevicePieces:
             TotalPieces += sum(StopPieces)
 
-        # 装载率 = 实际箱数 / 车辆容量
         if VeType >= 1 and VeType <= len(VeCap):
-            LoadRate = f"{TotalBoxes / VeCap[VeType-1] * 100:.1f}%"
+            LoadRate = f"{TotalBoxes / VeCap[VeType - 1] * 100:.1f}%"
         else:
             LoadRate = "0%"
 
-        # 主表记录
         MainRows.append({
-            'DIST_SCHEME_ID': SchemeId,
-            'CAR_TYPE': f"0{VeType}",          # 可替换为实际车型代码
+            'DIST_SCHEME_ID': scheme_id,
+            'CAR_TYPE': f"0{VeType}",
             'PLAN_DIST_DATE': PlanDate,
-            'DIST_FLAG': 'Y',                     # 默认配送
+            'DIST_FLAG': 'Y',
             'LATE_FLAG': 'N',
             'LOAD_RATE': LoadRate,
             'CREATE_DATE': CurrentDateStr,
@@ -237,30 +236,29 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
             'GLOBAL_SCHEME_ID': GlobalSchemeId
         })
 
-        DetailIdSeq = SchemeId
-
-        # 处理明细：遍历每个停靠点
+        # 处理明细
         for StopIdx, (OrgNo, StopPieces) in enumerate(zip(PathNo, DevicePieces)):
             DistSeq = StopIdx + 1
-            LoadSeq = len(PathNo) -  StopIdx   # 假设装车顺序与配送顺序相同，可改为逆序： len(PathNo) + 1 - DistSeq
+            LoadSeq = len(PathNo) - StopIdx
             for DevIdx, Qty in enumerate(StopPieces):
                 if Qty == 0:
                     continue
+                det_seq += 1
+                det_id = base_ts * 1000 + det_seq  # 明细ID
                 DevCode = SubTypeList.iloc[DevIdx]['DEV_CODE']
                 DevCls = SubTypeList.iloc[DevIdx].get('DEV_CLS', '')
                 DevCateg = SubTypeList.iloc[DevIdx].get('DEV_CATEG', '')
 
-                # 费用和里程分摊：按件数比例
                 if TotalPieces > 0:
                     Ratio = Qty / TotalPieces
                 else:
                     Ratio = 0
-                EstDist = PathDis * Ratio          # 分摊里程（可根据业务调整）
-                DistExp = Price * Ratio            # 分摊费用
+                EstDist = PathDis * Ratio
+                DistExp = Price * Ratio
 
                 DetailRows.append({
-                    'DIST_SCHEME_DET_ID': DetailIdSeq,
-                    'DIST_SCHEME_ID': SchemeId,
+                    'DIST_SCHEME_DET_ID': det_id,
+                    'DIST_SCHEME_ID': scheme_id,
                     'REC_ORG_NO': str(OrgNo),
                     'DEV_CODE': DevCode,
                     'DEV_CLS': DevCls,
@@ -268,11 +266,10 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
                     'DIST_SEQ': DistSeq,
                     'LOAD_SEQ': LoadSeq,
                     'PLAN_DIST_NUM': int(Qty),
-                    'EST_TOT_DIST_MIST':"" ,#round(EstDist, 4)
+                    'EST_TOT_DIST_MIST': "",
                     'DIST_EXP': round(DistExp, 4),
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
-                DetailIdSeq += 1
 
     MainDf = pd.DataFrame(MainRows)
     DetailDf = pd.DataFrame(DetailRows)

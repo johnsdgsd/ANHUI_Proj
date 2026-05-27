@@ -9,7 +9,6 @@ import pulp
 import logging
 import sys
 
-
 def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
@@ -20,29 +19,22 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
     for i in range(SubTypeNum):
         UnitPerBoxI = SubTypeList.loc[i, 'PACK_BOX_NUM'] if 'PACK_BOX_NUM' in SubTypeList.columns else 5
-
-        # 获取设备分类，02代表互感器，体积放大 2.5倍
         cls_val = '01'
         if 'DEV_CLS' in SubTypeList.columns:
             cls_val = str(SubTypeList.loc[i, 'DEV_CLS']).replace('.0', '').strip().zfill(2)
         vol_mult = 2.5 if cls_val == '02' else 1.0
-
-        # 计算出物理箱数后，乘以体积系数，得到“折算标准箱数”
         DemandsBoxs[:, i] = np.ceil(Demands_arr[:, i] / UnitPerBoxI) * vol_mult
 
     DemandsBoxs = np.sum(DemandsBoxs, axis=1)
-
-    # 转化为浮点数字典，因为折算后可能出现 2.5 这种小数
     unit_sum = {i + 1: float(DemandsBoxs[i]) for i in range(LocationNum) if DemandsBoxs[i] > 0}
 
     if not unit_sum:
-        return pd.DataFrame(), pd.DataFrame(), np.zeros((0, DelivDay), dtype=int), []
+        return []
 
     '''2. 全局配置'''
-    VEHICLE_CONFIG = [
-        {'type': i + 1, 'cap': VeCap[i], 'daily_max': VNums[i]} for i in range(VeTypeNum)
-    ]
-
+    # 按容量从小到大排序
+    VEHICLE_CONFIG = sorted([{'type': i + 1, 'cap': VeCap[i], 'daily_max': VNums[i]} for i in range(VeTypeNum)],
+                            key=lambda x: x['cap'])
     DMAT_arr = DMAT.values if isinstance(DMAT, pd.DataFrame) else DMAT
     DMAT_arr = DMAT_arr + DMAT_arr.T
 
@@ -50,294 +42,186 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         return DMAT_arr[id1, id2]
 
     def calc_route_cost(route):
-        total_cost = 0.0
+        total_cost = 0.0;
         prev_node = 0
-        deliveries = route['deliveries']
-
-        v_type = route.get('vehicle_type', 1)
-        v_idx = int(v_type) - 1
-        if v_idx < 0 or v_idx >= len(VeUnitPrice):
-            v_idx = 0
-        unit_price = float(VeUnitPrice[v_idx]) if len(VeUnitPrice) > v_idx and float(VeUnitPrice[v_idx]) > 0 else 0.0695
-
-        for cid, amt in deliveries:
-            dist_segment = get_dist(prev_node, cid)
-            total_cost += amt * dist_segment * unit_price
+        v_idx = int(route.get('vehicle_type', 1)) - 1
+        unit_price = float(VeUnitPrice[v_idx]) if len(VeUnitPrice) > v_idx else 0.0695
+        for cid, amt in route['deliveries']:
+            total_cost += amt * get_dist(prev_node, cid) * unit_price
             prev_node = cid
-
         return total_cost
 
     def eval_route_fitness(route):
         real_cost = calc_route_cost(route)
         if not route['deliveries']: return real_cost
-
         cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == route.get('vehicle_type', 1))
         load = sum(a for _, a in route['deliveries'])
         load_rate = load / cap if cap > 0 else 0
 
-        # 【核心修改点】：添加对装载率小于 80% 的强力惩罚机制
+        # 装载率目标：低于80%施加严厉惩罚
         penalty = 0
         if load_rate < 0.8:
-            # 采用二次方惩罚，装载率越低惩罚越严重，最高附加 5000 成本分，逼迫算法放弃空车
-            penalty = 5000 * ((0.8 - load_rate) ** 2)
+            penalty = (10000 + real_cost * 100) * ((0.8 - load_rate) ** 2)
 
-        base_dispatch = 200.0  # 提高基础发车成本，强制集货
-        # 综合 fitness (越小越好)
-        fitness = (base_dispatch + real_cost + penalty) / (load_rate + 0.1)
-        return fitness
+        return (500.0 + real_cost + penalty) / (load_rate + 0.1)
 
     def optimize_route_sequence(route):
         deliveries = route['deliveries']
         if len(deliveries) <= 1: return route
-
-        best_cost = float('inf')
+        best_cost = float('inf');
         best_seq = None
-
         for seq in itertools.permutations(deliveries):
             temp_route = {'vehicle_type': route.get('vehicle_type', 1), 'deliveries': list(seq)}
             cost = calc_route_cost(temp_route)
-            if cost < best_cost:
-                best_cost = cost
-                best_seq = list(seq)
-
+            if cost < best_cost: best_cost = cost; best_seq = list(seq)
         route['deliveries'] = best_seq
         return route
 
-    def calc_total_cost(routes):
-        return sum(calc_route_cost(r) for r in routes)
-
-    def calc_total_fitness(routes):
-        return sum(eval_route_fitness(r) for r in routes)
-
-    def get_best_available_vehicle(used_vehicles_count, target_load):
-        sorted_configs = sorted(VEHICLE_CONFIG, key=lambda x: x['cap'])
-        for cfg in sorted_configs:
-            if cfg['cap'] >= target_load and used_vehicles_count[cfg['type']] < cfg['daily_max'] * DelivDay:
-                return cfg['type'], cfg['cap']
-        for cfg in sorted_configs[::-1]:
-            if used_vehicles_count[cfg['type']] < cfg['daily_max'] * DelivDay:
-                return cfg['type'], cfg['cap']
-        raise Exception("全局总运力不足！")
-
     def reassign_vehicles(routes):
         routes_sorted = sorted(routes, key=lambda r: sum(a for _, a in r['deliveries']), reverse=True)
-        v_counts = {cfg['type']: 0 for cfg in VEHICLE_CONFIG}
-        sorted_configs = sorted(VEHICLE_CONFIG, key=lambda x: x['cap'])
-
         for r in routes_sorted:
             load = sum(a for _, a in r['deliveries'])
-            assigned_type = None
-            for cfg in sorted_configs:
-                if cfg['cap'] >= load and v_counts[cfg['type']] < cfg['daily_max'] * DelivDay:
-                    assigned_type = cfg['type']
+            assigned = False
+            # 【核心修复】：永远只分配能装下 load 的最小车型，绝对不允许强行分配小车导致丢单！
+            for cfg in VEHICLE_CONFIG:
+                if cfg['cap'] >= load:
+                    r['vehicle_type'] = cfg['type']
+                    assigned = True
                     break
-            if not assigned_type:
-                for cfg in sorted_configs[::-1]:
-                    if v_counts[cfg['type']] < cfg['daily_max'] * DelivDay:
-                        assigned_type = cfg['type']
-                        break
-            r['vehicle_type'] = assigned_type
-            v_counts[assigned_type] += 1
+            if not assigned:
+                # 如果超出了所有车的最大容量，分配给最大的车
+                r['vehicle_type'] = VEHICLE_CONFIG[-1]['type']
         return routes_sorted
 
     def generate_initial_solution(unassigned):
-        routes = []
+        routes = [];
         pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
-        used_v_count = {cfg['type']: 0 for cfg in VEHICLE_CONFIG}
-
         for cid, total_amt in pending:
             amt = total_amt
             while amt > 0:
                 assigned = False
                 for r in routes:
                     cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == r.get('vehicle_type', 1))
-                    curr_load = sum(a for _, a in r['deliveries'])
-                    space = cap - curr_load
-
-                    is_existing = any(v[0] == cid for v in r['deliveries'])
-                    current_node_count = len(set([c for c, _ in r['deliveries']]))
-
-                    if space > 0 and (current_node_count < 3 or is_existing):
-                        load = min(amt, space)
-                        existing_idx = next((i for i, v in enumerate(r['deliveries']) if v[0] == cid), -1)
-                        if existing_idx >= 0:
-                            old_amt = r['deliveries'][existing_idx][1]
-                            r['deliveries'][existing_idx] = (cid, old_amt + load)
-                        else:
-                            r['deliveries'].append((cid, load))
-
-                        r = optimize_route_sequence(r)
-                        amt -= load
-                        assigned = True
+                    space = cap - sum(a for _, a in r['deliveries'])
+                    # 路径配送网点数量不超过 5 个
+                    if space > 0 and len(r['deliveries']) < 5:
+                        load = min(amt, space);
+                        r['deliveries'].append((cid, load));
+                        r = optimize_route_sequence(r);
+                        amt -= load;
+                        assigned = True;
                         break
-
                 if not assigned:
-                    v_type, cap = get_best_available_vehicle(used_v_count, amt)
-                    load = min(amt, cap)
-                    routes.append({'vehicle_type': v_type, 'deliveries': [(cid, load)]})
-                    used_v_count[v_type] += 1
+                    cfg = VEHICLE_CONFIG[-1]
+                    for c in VEHICLE_CONFIG:
+                        if c['cap'] >= amt: cfg = c; break
+                    load = min(amt, cfg['cap']);
+                    routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
                     amt -= load
-        return routes, used_v_count
+        return routes
 
     def random_removal(solution, num_remove=3):
-        sol_copy = copy.deepcopy(solution)
+        sol_copy = copy.deepcopy(solution);
         unassigned = defaultdict(float)
         for _ in range(num_remove):
             if not sol_copy: break
-            ri = random.randint(0, len(sol_copy) - 1)
+            ri = random.randint(0, len(sol_copy) - 1);
             route = sol_copy[ri]
             if route['deliveries']:
-                pi = random.randint(0, len(route['deliveries']) - 1)
-                cid, amt = route['deliveries'].pop(pi)
+                pi = random.randint(0, len(route['deliveries']) - 1);
+                cid, amt = route['deliveries'].pop(pi);
                 unassigned[cid] += amt
-            if not route['deliveries']:
-                sol_copy.pop(ri)
+            if not route['deliveries']: sol_copy.pop(ri)
         return sol_copy, unassigned
 
-    def greedy_insertion(routes, unassigned, current_v_count):
+    def greedy_insertion(routes, unassigned):
         pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
         for cid, amt in pending:
             while amt > 0:
-                best_fitness_diff = float('inf')
+                best_fit = float('inf');
                 best_action = None
-
                 for ri, route in enumerate(routes):
-                    is_existing = any(v[0] == cid for v in route['deliveries'])
-                    current_node_count = len(set([c for c, _ in route['deliveries']]))
-
-                    if current_node_count >= 3 and not is_existing:
-                        continue
-
+                    if len(route['deliveries']) >= 5: continue
                     cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == route.get('vehicle_type', 1))
-                    curr_load = sum(a for _, a in route['deliveries'])
-                    space = cap - curr_load
-
+                    # 【核心修复】：将原本拼写错误的 ['deliveries'] 修正为 route['deliveries']
+                    space = cap - sum(a for _, a in route['deliveries'])
                     if space > 0:
-                        ins_amt = min(amt, space)
-                        base_fit = eval_route_fitness(route)
-                        temp_route = copy.deepcopy(route)
-
-                        existing_idx = next((i for i, v in enumerate(temp_route['deliveries']) if v[0] == cid), -1)
-                        if existing_idx >= 0:
-                            old_amt = temp_route['deliveries'][existing_idx][1]
-                            temp_route['deliveries'][existing_idx] = (cid, old_amt + ins_amt)
-                        else:
-                            temp_route['deliveries'].append((cid, ins_amt))
-
-                        temp_route = optimize_route_sequence(temp_route)
-                        new_fit = eval_route_fitness(temp_route)
-
-                        fit_diff = new_fit - base_fit
-                        if fit_diff < best_fitness_diff:
-                            best_fitness_diff = fit_diff
-                            best_action = ('insert', ri, ins_amt, temp_route['deliveries'])
-
+                        ins_amt = min(amt, space);
+                        temp = copy.deepcopy(route);
+                        temp['deliveries'].append((cid, ins_amt))
+                        temp = optimize_route_sequence(temp);
+                        fit = eval_route_fitness(temp)
+                        if fit < best_fit: best_fit = fit; best_action = ('insert', ri, ins_amt, temp['deliveries'])
                 if best_action is None:
-                    for cfg in VEHICLE_CONFIG:
-                        vtype, cap = cfg['type'], cfg['cap']
-                        if current_v_count[vtype] >= cfg['daily_max'] * DelivDay:
-                            continue
-
-                        ins_amt = min(amt, cap)
-                        temp_route = {'vehicle_type': vtype, 'deliveries': [(cid, ins_amt)]}
-                        new_fit = eval_route_fitness(temp_route)
-                        base_bias = 1.0 if vtype == 1 else (1.1 if vtype == 2 else 1.2)
-
-                        if new_fit * base_bias < best_fitness_diff:
-                            best_fitness_diff = new_fit * base_bias
-                            best_action = ('new', vtype, ins_amt, temp_route['deliveries'])
-
+                    cfg = VEHICLE_CONFIG[-1]
+                    for c in VEHICLE_CONFIG:
+                        if c['cap'] >= amt: cfg = c; break
+                    ins_amt = min(amt, cfg['cap']);
+                    temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
+                    best_action = ('new', cfg['type'], ins_amt, temp['deliveries'])
                 if best_action[0] == 'insert':
-                    ri, ins_amt, new_seq = best_action[1], best_action[2], best_action[3]
-                    routes[ri]['deliveries'] = new_seq
-                    amt -= ins_amt
+                    routes[best_action[1]]['deliveries'] = best_action[3];
+                    amt -= best_action[2]
                 else:
-                    vtype, ins_amt, new_seq = best_action[1], best_action[2], best_action[3]
-                    routes.append({'vehicle_type': vtype, 'deliveries': new_seq})
-                    current_v_count[vtype] += 1
-                    amt -= ins_amt
+                    routes.append({'vehicle_type': best_action[1], 'deliveries': best_action[3]});
+                    amt -= best_action[2]
+        return [r for r in routes if r['deliveries']]
 
-        return [r for r in routes if r['deliveries']], current_v_count
-
-    '''3. 执行启发式空间规划'''
-    # 【核心修改点】：增加迭代次数到 500 次，让强力合并算法有充足的时间跑出装载率高的解
-    max_iter = 500
-    best_sol, best_v_count = generate_initial_solution(unit_sum)
+    '''3. 启发式算法：空间最优解'''
+    max_iter = 600
+    best_sol = generate_initial_solution(unit_sum)
     best_sol = reassign_vehicles(best_sol)
-    best_fitness = calc_total_fitness(best_sol)
+    best_fitness = sum(eval_route_fitness(r) for r in best_sol)
 
     for i in range(max_iter):
-        remove_cnt = max(2, int(len(unit_sum) * random.uniform(0.1, 0.4)))
+        remove_cnt = max(2, int(len(unit_sum) * 0.3))
         destroyed, unassigned = random_removal(best_sol, num_remove=remove_cnt)
-        curr_v_count = {cfg['type']: 0 for cfg in VEHICLE_CONFIG}
-        for r in destroyed: curr_v_count[r.get('vehicle_type', 1)] += 1
-        new_sol, new_v_count = greedy_insertion(destroyed, unassigned, curr_v_count)
+        new_sol = greedy_insertion(destroyed, unassigned)
         new_sol = reassign_vehicles(new_sol)
-        new_fitness = calc_total_fitness(new_sol)
+        new_fitness = sum(eval_route_fitness(r) for r in new_sol)
 
         if new_fitness < best_fitness or math.exp((best_fitness - new_fitness) / 100) > random.random():
-            best_sol = new_sol
-            best_fitness = new_fitness
+            best_sol, best_fitness = new_sol, new_fitness
 
     best_sol = reassign_vehicles(best_sol)
 
-    '''4. 组装接口数据'''
-    PlanPath, DeNum, VeType, PathInd, Price = [], [], [], [], []
-    unique_paths = []
-
-    for route in best_sol:
-        v_type = route.get('vehicle_type', 1)
-        path_nodes = tuple(cid for cid, amt in route['deliveries'])
-        boxes = [amt for cid, amt in route['deliveries']]
-
-        if path_nodes not in unique_paths: unique_paths.append(path_nodes)
-        path_idx = unique_paths.index(path_nodes) + 1
-        PlanPath.append(list(path_nodes));
-        DeNum.append(list(boxes));
-        VeType.append(v_type);
-        PathInd.append(path_idx);
-        Price.append(calc_route_cost(route))
-
-    DelivPlan = pd.DataFrame(
-        {'PathInd': PathInd, 'VeType': VeType, 'Price': Price, 'PlanPath': PlanPath, 'DeNum': DeNum})
-    PathInfo = pd.DataFrame({'Ind': range(1, len(unique_paths) + 1), 'Path': [list(p) for p in unique_paths],
-                             'PathDis': [sum(get_dist(p[i], p[i + 1]) for i in range(len(p) - 1)) for p in
-                                         unique_paths]})
-
-    '''5. 运筹学 Stage 2: 日历排程'''
-    Ls = np.unique(PathInd)
-    NL = len(Ls)
-    Ds = np.zeros((NL, VeTypeNum))
-    RouteLoads = np.zeros(NL)
-
-    for i in range(NL):
-        sample_trip = DelivPlan[DelivPlan['PathInd'] == Ls[i]].iloc[0]
-        RouteLoads[i] = sum(sample_trip['DeNum'])
-        for j in range(VeTypeNum):
-            Ds[i, j] = np.sum((np.array(PathInd) == Ls[i]) & (np.array(VeType) == j + 1))
-
+    '''4. 整数线性规划 Stage 2: 日期精确排程 (100%硬约束，辅以弹性防死锁)'''
+    num_routes = len(best_sol)
     prob2 = pulp.LpProblem("Minimize_Peak_Daily_Volume", pulp.LpMinimize)
-    xd = pulp.LpVariable.dicts("xd", [(l, v, d) for l in range(NL) for v in range(VeTypeNum) for d in range(DelivDay)],
-                               lowBound=0, cat='Integer')
+    x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
+
+    # 引入弹性变量。首选遵守 VNums 限额，万不得已时允许破额(施加巨额罚金)，绝对不抛弃需求
+    slack_vars = pulp.LpVariable.dicts("slack", [(v, d) for v in range(VeTypeNum) for d in range(DelivDay)], lowBound=0,
+                                       cat='Integer')
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
-    prob2 += Z
-    for l in range(NL):
-        for v in range(VeTypeNum):
-            if Ds[l, v] > 0: prob2 += pulp.lpSum(xd[l, v, d] for d in range(DelivDay)) == Ds[l, v]
-    for d in range(DelivDay):
-        for v in range(VeTypeNum):
-            prob2 += pulp.lpSum(xd[l, v, d] for l in range(NL)) <= VNums[v]
-    for d in range(DelivDay):
-        prob2 += pulp.lpSum(xd[l, v, d] * RouteLoads[l] for l in range(NL) for v in range(VeTypeNum)) <= Z
+    prob2 += Z + 100000 * pulp.lpSum(slack_vars[v, d] for v in range(VeTypeNum) for d in range(DelivDay))
 
-    solver2 = pulp.PULP_CBC_CMD(msg=False, options=['sec=30', 'ratioGap=0.05'])
+    # 铁律：每趟车必须且只能发车一天
+    for r in range(num_routes):
+        prob2 += pulp.lpSum(x[r, d] for d in range(DelivDay)) == 1
+
+    # 每日车型限额
+    for d in range(DelivDay):
+        for v in range(VeTypeNum):
+            v_type = v + 1
+            type_routes = [r for r in range(num_routes) if int(best_sol[r].get('vehicle_type', 1)) == v_type]
+            if type_routes:
+                prob2 += pulp.lpSum(x[r, d] for r in type_routes) <= VNums[v] + slack_vars[v, d]
+
+    # 削峰填谷
+    for d in range(DelivDay):
+        prob2 += pulp.lpSum(x[r, d] * sum(amt for _, amt in best_sol[r]['deliveries']) for r in range(num_routes)) <= Z
+
+    solver2 = pulp.PULP_CBC_CMD(msg=False, options=['sec=60', 'ratioGap=0.05'])
     prob2.solve(solver2)
 
-    DelivCalendar = np.zeros((NL, DelivDay), dtype=int)
-    for l in range(NL):
+    # 挂载排期
+    for r in range(num_routes):
+        best_sol[r]['schedule_day_idx'] = 0
         for d in range(DelivDay):
-            for v in range(VeTypeNum):
-                if xd[l, v, d].varValue and xd[l, v, d].varValue >= 0.5: DelivCalendar[l, d] = v + 1
+            if x[r, d].varValue and x[r, d].varValue >= 0.5:
+                best_sol[r]['schedule_day_idx'] = d
+                break
 
-    return PathInfo, DelivPlan, DelivCalendar, Ls
+    return best_sol

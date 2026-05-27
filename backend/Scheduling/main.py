@@ -97,7 +97,7 @@ def run_full_aps_process(preMonth, preConcId=None):
         update_pre_conc_status(preConcId, '02')
 
         target_dt = datetime.strptime(preMonth, '%Y%m')
-        prev_month_dt = target_dt - relativedelta(months=1)
+        prev_month_dt = target_dt - relativedelta(months=2)
         prev_year = prev_month_dt.strftime('%Y')
         prev_month = prev_month_dt.strftime('%m')
         current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

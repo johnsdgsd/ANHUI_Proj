@@ -68,6 +68,14 @@ def GenerateMutiOrderScheme(yearMonth:str):
         logger.info('准备计算成本明细')
         global_scheme_cost = GetGlobalSchemeCost(detail,tag,yearMonth)
 
+        cond1 = global_shceme_lps['PRE_STAT_NUM'] != 0
+        cond2 = global_scheme_cost['PRE_STAT_COST'] == 0
+        condition = cond1 & cond2
+        global_scheme_cost.loc[condition, 'PRE_STAT_COST'] = 50 + global_shceme_lps.loc[condition, 'PRE_STAT_NUM'] * 0.1
+        #
+        global_scheme_cost['PRE_SINGLE_COST'] = global_scheme_cost['PRE_STAT_COST'].div(
+            global_shceme_lps['PRE_STAT_NUM'], fill_value=0).replace([float('inf'), -float('inf')], 0)
+
         global_scheme_item['PRE_STAT_COST'] = global_scheme_item['PRE_STAT_COST'].astype(float).round(2)
         GlobalSchemeItems[tag] = global_scheme_item
         GlobalSchemeCost[tag] = global_scheme_cost
@@ -186,8 +194,8 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
             return df.iloc[0].get(field)
         return None
 
-    cost_last_month = get_value(df_last_month, 'PRE_STAT_COST')
-    cost_last_year = get_value(df_last_year, 'PRE_STAT_COST')
+    cost_last_month = get_value(df_last_month, 'PRE_SINGLE_COST')
+    cost_last_year = get_value(df_last_year, 'PRE_SINGLE_COST')
 
     itt_last_month = get_value(df_last_month, 'PRE_ITT')
     itt_last_year = get_value(df_last_year, 'PRE_ITT')
@@ -216,32 +224,32 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
-        cost_tr = (pre_stat_cost - cost_last_month) / cost_last_month * 100
+        cost_tr = (pre_single_cost - cost_last_month) / cost_last_month
         cost_tr = round(cost_tr,2)
 
     cost_yoy = 0.0
     if cost_last_year and cost_last_year != 0:
-        cost_yoy = (pre_stat_cost - cost_last_year) / cost_last_year * 100
+        cost_yoy = (pre_single_cost - cost_last_year) / cost_last_year
         cost_yoy = round(cost_yoy,2)
 
     itt_tr = 0.0
     if itt_last_month and itt_last_month != 0:
-        itt_tr = (total_turnover - itt_last_month ) / itt_last_month * 100
+        itt_tr = (total_turnover - itt_last_month ) / itt_last_month
         itt_tr = round(itt_tr,2)
 
     itt_yoy = 0.0
     if itt_last_year and itt_last_year != 0:
-        itt_yoy = (total_turnover - itt_last_year) / itt_last_year * 100
+        itt_yoy = (total_turnover - itt_last_year) / itt_last_year
         itt_yoy = round(itt_yoy,2)
     # 计算库存运行比
     itr_tr = 0.0
     if itr_last_month and itr_last_month != 0:
-        itr_tr = (cur_itr - itr_last_month) / itr_last_month * 100
+        itr_tr = (cur_itr - itr_last_month) / itr_last_month
         itr_tr = round(itr_tr,2)
 
     itr_yoy = 0.0
     if itr_last_year and itr_last_year != 0:
-        itr_yoy = (cur_itr - itr_last_year) / itr_last_year * 100
+        itr_yoy = (cur_itr - itr_last_year) / itr_last_year
         itr_yoy = round(itr_yoy,2)
 
     # ------------------- 新增：自动缩容（除以10/100...直到在长度范围内） -------------------
@@ -343,13 +351,18 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
 
     # 获取历史方案的 SCHEME_ID
     logger.info('获取历史方案的 SCHEME_ID')
-    scheme_id_last_month = int(df_last_month.iloc[0]['SCHEME_ID'])
-    scheme_id_last_year = int(df_last_year.iloc[0]['SCHEME_ID'])
+    try:
 
-    # 获取历史周转明细表
-    logger.info('获取历史周转明细表')
-    itt_last_month_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_month)
-    itt_last_year_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_year)
+        scheme_id_last_month = int(df_last_month.iloc[0]['SCHEME_ID'])
+        scheme_id_last_year = int(df_last_year.iloc[0]['SCHEME_ID'])
+
+        # 获取历史周转明细表
+        logger.info('获取历史周转明细表')
+        itt_last_month_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_month)
+        itt_last_year_df = query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id_last_year)
+    except Exception as e:
+        itt_last_month_df = pd.DataFrame()
+        itt_last_year_df = pd.DataFrame()
 
     # 1. 按管理单位和设备分类/类别聚合当前明细
     grouped = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'], as_index=False).agg(
@@ -495,7 +508,7 @@ def GetVerifCost(detail:pd.DataFrame):
     matched = cost_df[mask]
 
     if matched.empty :
-        detail['VERIF_COST'] = 0.0
+        # detail['VERIF_COST'] = 0.0
         daily_wage = 200
     try:
         daily_wage = matched.iloc[0]['BASE_COST_VALUE']
@@ -634,6 +647,25 @@ def GetGlobalSchemeCost(detail: pd.DataFrame, scheme_id: str, yearMonth: str) ->
     )
     import time
     import datetime
+
+    #处理detail
+    target_cols = [
+        'VERI_LINE_NUM',
+        'POSI_NUM',
+        'POSI_CHECK_NUM',
+        'CONCURRENT',
+        'HOURLY_VERI_NUM'
+    ]
+    fill_map = {
+        'VERI_LINE_NUM': 1,
+        'POSI_NUM': 5,
+        'POSI_CHECK_NUM': 12,
+        'CONCURRENT': 60,
+        'HOURLY_VERI_NUM': 120
+    }
+    for col in target_cols:
+        detail[col] = detail[col].replace({0: fill_map[col], np.nan: fill_map[col]})
+    detail['AUTO_DUR'] = detail['AUTO_DUR'].fillna(300)
 
     # 1. 按管理单位、设备分类、设备类别汇总需求总量及各环节总成本
     grouped = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'], as_index=False).agg(

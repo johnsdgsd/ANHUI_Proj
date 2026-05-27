@@ -1,4 +1,6 @@
 import datetime
+import time
+
 import pandas as pd
 from backend.inventory_optimization.item import Item
 from backend.inventory_optimization.demand_distribution import PoissonDistribution
@@ -78,7 +80,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     dev_cls_mapping = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
 
-    tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    tag = int(time.time()*1000)
     stock_id = int(tag)
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     for warehouse in local_warehouses:

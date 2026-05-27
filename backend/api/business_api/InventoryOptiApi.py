@@ -89,7 +89,7 @@ def GetMonthThresholdAndOrder():
 
         update_adam_pre_conc_stat(int(preConcId),'02')
         init_stock = query_adam_org_stock_sample_by_month(yearMonth)
-        print(f'获取日期{yearMonth}的初始库存，数据量{len(init_stock)}条')
+
         alpha = 0.99
         Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,tag,alpha)
         print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条')

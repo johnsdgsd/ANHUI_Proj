@@ -810,11 +810,11 @@ def query_adam_org_stock_sample_by_month(month: str):
         from datetime import datetime
         # 把传入的 YYYYMM 转成日期，再减一个月，得到上月
         current_date = datetime.strptime(month, "%Y%m")
-        # 计算上个月
-        if current_date.month == 1:
-            last_month = f"{current_date.year - 1}12"
+        # 计算往前推 2 个月
+        if current_date.month in (1, 2):
+            last_month = f"{current_date.year - 1}{12 + current_date.month - 2:02d}"
         else:
-            last_month = f"{current_date.year}{current_date.month - 1:02d}"
+            last_month = f"{current_date.year}{current_date.month - 2:02d}"
         # ====================================================================
         print(f'准备查询{last_month}的库存快照')
         host = API_CONFIG["database"]["host"]
@@ -823,13 +823,14 @@ def query_adam_org_stock_sample_by_month(month: str):
         url = f"http://{host}:{port}{endpoint}"
         
         json = {
-            "month": last_month  # 对应SQL里的 #{month}
+            "stock_month": last_month  # 对应SQL里的 #{month}
         }
         
         response = requests.post(url, json=json)
         response.raise_for_status()
-        
+
         data = response.json()
+        print(f'获取日期{last_month}的初始库存，数据量{len(data)}条')
         
         if isinstance(data, list) and len(data) == 0:
             print()
@@ -1090,6 +1091,8 @@ def query_adam_yqm_dmd_pre_by_year_month(year: str, month: str):
         port = API_CONFIG["database"]["port"]
         endpoint = '/exec/gk-adam-query_adam_yqm_dmd_pre_by_year_month'
         url = f"http://{host}:{port}{endpoint}"
+        print('按照年月获取年季月需求预测数据')
+        print('sql_id:gk-adam-query_adam_yqm_dmd_pre_by_year_month')
         
         json_data = {
             "year": year,
