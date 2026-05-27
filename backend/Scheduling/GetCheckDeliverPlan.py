@@ -261,7 +261,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     WorkArrangeResult = []
     for d in all_days:
         for cat, hrs in HoursUsed[d].items():
-            if hrs <= 0.01: continue
+            if hrs <= 0: continue
             w_flag = '02' if is_workday_safe(d) else '03'
             d_dur = '8h' if hrs <= 8.1 else ('12h' if hrs <= 12.1 else '24h')
             WorkArrangeResult.append({

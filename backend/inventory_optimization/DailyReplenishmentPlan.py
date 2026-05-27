@@ -262,15 +262,18 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
 
-    MainDf = pd.DataFrame(MainRows)
-    DetailDf = pd.DataFrame(DetailRows)
+    main_cols = ['DIST_SCHEME_ID', 'CAR_TYPE', 'PLAN_DIST_DATE', 'DIST_FLAG', 'LATE_FLAG',
+                 'LOAD_RATE', 'CREATE_DATE', 'UPDATE_DATE', 'GLOBAL_SCHEME_ID']
+    detail_cols = ['DIST_SCHEME_DET_ID', 'DIST_SCHEME_ID', 'REC_ORG_NO', 'DEV_CODE',
+                   'DEV_CLS', 'DEV_CATEG', 'DIST_SEQ', 'LOAD_SEQ', 'PLAN_DIST_NUM',
+                   'PLAN_BOX_NUM', 'EST_TOT_DIST_MIST', 'DIST_EXP', 'GLOBAL_SCHEME_ID']
 
-    # 调整列顺序与给定表结构一致
-    MainDf = MainDf[['DIST_SCHEME_ID', 'CAR_TYPE', 'PLAN_DIST_DATE', 'DIST_FLAG', 'LATE_FLAG',
-                     'LOAD_RATE', 'CREATE_DATE', 'UPDATE_DATE', 'GLOBAL_SCHEME_ID']]
-    DetailDf = DetailDf[['DIST_SCHEME_DET_ID', 'DIST_SCHEME_ID', 'REC_ORG_NO', 'DEV_CODE',
-                         'DEV_CLS', 'DEV_CATEG', 'DIST_SEQ', 'LOAD_SEQ', 'PLAN_DIST_NUM',
-                         'PLAN_BOX_NUM', 'EST_TOT_DIST_MIST', 'DIST_EXP', 'GLOBAL_SCHEME_ID']]
+    if not MainRows:
+        logging.warning("GenerateSchemeTables: 无配送计划，返回空表")
+        return pd.DataFrame(columns=main_cols), pd.DataFrame(columns=detail_cols)
+
+    MainDf = pd.DataFrame(MainRows)[main_cols]
+    DetailDf = pd.DataFrame(DetailRows)[detail_cols] if DetailRows else pd.DataFrame(columns=detail_cols)
     return MainDf, DetailDf
 
 
@@ -336,6 +339,13 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
         by=['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE'],
         ascending=[True, True, True]
     ).reset_index(drop=True)
+
+    # 合并相同(REC_ORG_NO, DEV_CODE, PRE_DATE)的行，PLAN_IAS_NUM求和
+    group_cols = ['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE', 'DEV_CLS', 'DEV_CATEG', 'GLOBAL_SCHEME_ID']
+    DaliyReplPlan = DaliyReplPlan.groupby(group_cols, as_index=False)['PLAN_IAS_NUM'].sum()
+    DaliyReplPlan = DaliyReplPlan[['REC_ORG_NO', 'DEV_CLS', 'DEV_CATEG', 'DEV_CODE',
+                                     'PLAN_IAS_NUM', 'PRE_DATE', 'GLOBAL_SCHEME_ID']]
+
     timestamp = int(time.time()*1000)
     DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(timestamp,timestamp+len(DaliyReplPlan))
     DaliyReplPlan['EST_STOCK_NUM'] = None
@@ -394,8 +404,8 @@ def AdjustDaliyDelivery(date:str):
     logging.info("对 SaveDis 排序并获取索引")
     sorted_indices= np.argsort(SaveDis, kind='stable') + 1
     sorted_indices = sorted_indices[len(DMAT)-1:]
-    # 删除前 50% 的行
-    k = int(np.ceil(0.2 * len(sorted_indices)))
+    # 仅保留节省距离最高的前5%路径（MaxLen=5时路径数量大，需大幅裁剪）
+    k = int(np.ceil(0.05 * len(sorted_indices)))
     start_row = len(sorted_indices) - k
     index = sorted_indices[start_row:]
     index = np.concatenate([np.arange(1, len(DMAT)), index])
@@ -568,25 +578,49 @@ def AdjustDaliyDelivery(date:str):
     logging.info("开始求解压缩路径‑箱数规划")
     solver = pulp.PULP_CBC_CMD(
         msg=True,
-        options=['ratioGap=0.01', 'sec=60']
+        options=['ratioGap=0.01', 'sec=120']
     )
     prob.solve(solver)
-    logging.info(f"求解完成，目标值：{pulp.value(prob.objective)}")
+    status_str = pulp.LpStatus[prob.status]
+    logging.info(f"求解完成，状态：{status_str}，目标值：{pulp.value(prob.objective)}")
 
     # ===================== 4. 解映射，追加到计划数组 =====================
+    logging.info(f"开始解映射: VeTypeNum={VeTypeNum}, PathNum_new={PathNum_new}, active_nodes={len(active_nodes)}, PlanInd起始={PlanInd}")
     selected = []
     for v in range(1, VeTypeNum + 1):
         for l in range(1, PathNum_new + 1):
-            if I_vl[(v, l)].value() is not None and abs(I_vl[(v, l)].value() - 1) < 0.1:
+            val = I_vl[(v, l)].value()
+            if val is not None and abs(val - 1) < 0.1:
                 selected.append((v, l))
+    logging.info(f"严格阈值选中 {len(selected)} 条路径")
 
-    for v, l in selected:
+    # 若超时未找到整数解，按 I_vl 值从高到低取最大的路径
+    if len(selected) == 0 and status_str != 'Optimal':
+        logging.warning(f"求解状态={status_str}，未找到整数解，降级使用分数解")
+        candidates = []
+        for v in range(1, VeTypeNum + 1):
+            for l in range(1, PathNum_new + 1):
+                val = I_vl[(v, l)].value()
+                if val is not None and val > 0.01:
+                    candidates.append((val, v, l))
+        candidates.sort(reverse=True)
+        # 每种车型最多用 VTypeTimes 次
+        v_used = {v: 0 for v in range(1, VeTypeNum + 1)}
+        for val, v, l in candidates:
+            if v_used[v] < VTypeTimes[v - 1]:
+                selected.append((v, l))
+                v_used[v] += 1
+        logging.info(f"降级模式选中 {len(selected)} 条路径: {selected[:10]}{'...' if len(selected) > 10 else ''}")
+
+    for idx, (v, l) in enumerate(selected):
         orig_path_idx = orig_path_indices[l - 1]          # 原始 PathInfo 编号（1‑based）
         VeTypeI = v
         PathIndI = orig_path_idx
 
+        logging.info(f"[{idx+1}/{len(selected)}] v={v}, l={l}, orig_path_idx={orig_path_idx}, PlanInd={PlanInd}")
         # 路径节点（原始 1‑based）
         path_nodes = PathInfo.loc[orig_path_idx - 1, 'Path'].copy()  # 列表
+        logging.info(f"[{idx+1}/{len(selected)}] path_nodes={path_nodes}, type={type(path_nodes)}")
         PlanPath[PlanInd - 1] = path_nodes
 
         # 计算每个节点的配送量（活性节点取整，非活性节点为 0）
@@ -594,25 +628,34 @@ def AdjustDaliyDelivery(date:str):
         for j, node in enumerate(path_nodes):
             if (node - 1) in active_nodes:
                 pos = np.where(active_nodes == node - 1)[0][0] + 1   # 新索引 1‑based
-                deliv_vec[j] = round(x_nvl[(pos, v, l)].value())
+                val = x_nvl[(pos, v, l)].value()
+                logging.info(f"[{idx+1}/{len(selected)}] node={node}, pos={pos}, x_nvl.value={val}")
+                deliv_vec[j] = round(val)
         total_boxes = np.sum(deliv_vec)
+        logging.info(f"[{idx+1}/{len(selected)}] deliv_vec={deliv_vec}, total_boxes={total_boxes}")
 
         # ---------- 价格 = 距离 × (载箱成本 + 空载惩罚) ----------
         loaded_cost = VeUnitPrice[v - 1] * total_boxes
         empty_cost = EmptyPenalty[v - 1] * (VeCap[v - 1] - total_boxes)
-        Price[PlanInd - 1] = (loaded_cost + empty_cost) * PathInfo.loc[orig_path_idx - 1, 'PathDis']
+        path_dis = PathInfo.loc[orig_path_idx - 1, 'PathDis']
+        Price[PlanInd - 1] = (loaded_cost + empty_cost) * path_dis
+        logging.info(f"[{idx+1}/{len(selected)}] loaded_cost={loaded_cost}, empty_cost={empty_cost}, path_dis={path_dis}, price={Price[PlanInd - 1]}")
 
         VeType[PlanInd - 1] = VeTypeI
         PathInd[PlanInd - 1] = PathIndI
         DeNum[PlanInd - 1] = deliv_vec
         PlanInd += 1
 
+    logging.info(f"解映射完成，共 {len(selected)} 条路径, PlanInd最终={PlanInd}")
+
     # ===================== 5. 生成最终计划 DataFrame =====================
+    logging.info(f"开始生成最终计划: DeNum长度={len(DeNum)}, PlanInd={PlanInd}")
     DeNum = DeNum[:PlanInd - 1]
     VeType = VeType[:PlanInd - 1]
     PathInd = PathInd[:PlanInd - 1]
     Price = Price[:PlanInd - 1]
     PlanPath = PlanPath[:PlanInd - 1]
+    logging.info(f"切片后: DeNum={len(DeNum)}, VeType={len(VeType)}, PathInd={len(PathInd)}, Price={len(Price)}, PlanPath={len(PlanPath)}")
 
     DelivPlan = {
         'PathInd': PathInd,
@@ -622,8 +665,10 @@ def AdjustDaliyDelivery(date:str):
         'DeNum': DeNum
     }
     DelivPlan = pd.DataFrame(DelivPlan)
+    logging.info(f"DelivPlan DataFrame: {len(DelivPlan)} 行, columns={list(DelivPlan.columns)}")
 
     #增加配送地点编号
+    logging.info("查询站点信息用于PathNo映射...")
     site_info = query_adam_del_site_conf()
     site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
     Path_no = []
@@ -633,9 +678,13 @@ def AdjustDaliyDelivery(date:str):
             p.append(site_info.loc[idx-1,'ORG_NO'])
         Path_no.append(p)
     DelivPlan['PathNo'] = Path_no
+    logging.info(f"PathNo映射完成，示例: {Path_no[0] if Path_no else '空'}")
     DelivPlan['PathDis'] = DelivPlan['PathInd'].apply(lambda i: PathInfo.loc[i-1, 'PathDis'])
+    logging.info("开始 GenerateDelivPlan...")
     DelivPlan = GenerateDelivPlan(DelivPlan,Demands,SubTypeList)
-    # DelivPlan = ExpandDeviceDetail(DelivPlan,SubTypeList)
+    logging.info(f"GenerateDelivPlan 完成, {len(DelivPlan)} 行")
 
+    logging.info("开始 GenerateSchemeTables...")
     MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap, CarTypeStrList)
+    logging.info(f"GenerateSchemeTables 完成: MainScheme={len(MainScheme)}行, DetailScheme={len(DetailScheme)}行")
     return MainScheme , DetailScheme

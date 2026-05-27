@@ -201,15 +201,15 @@ def run_emergency_replenishment(
     # 3. 获取日补库计划
     daily_plan_df = query_adam_plan_day_ias_pre_by_month(year_month)
     if daily_plan_df.empty:
-        logger.warning(f"未找到 {year_month} 的日补库计划，流程终止")
-        return {'error':f'未找到 {year_month} 的日补库计划，流程终止'}
+        logger.info(f"未找到 {year_month} 的日补库计划，无需紧急补库")
+        return {'message': f'当月无日补库计划数据，无需紧急补库', 'success': True}
     logger.info(f"日补库计划记录数: {len(daily_plan_df)}")
 
     # 4. 获取月度总需求量
     monthly_demand_df = query_adam_plan_month_ias_pre(pre_year=year_month[:4],pre_month=year_month[4:6])
     if monthly_demand_df.empty:
-        logger.warning(f"未找到 {year_month} 的月度需求量，流程终止")
-        return {'error': f'未找到 {year_month} 的月度需求量，流程终止'}
+        logger.info(f"未找到 {year_month} 的月度需求量，无需紧急补库")
+        return {'message': f'当月无月度需求数据，无需紧急补库', 'success': True}
     logger.info(f"月度需求量记录数: {len(monthly_demand_df)}")
 
     # 5. 执行紧急补库检查
@@ -225,7 +225,7 @@ def run_emergency_replenishment(
 
     if emergency_df.empty:
         logger.info("无紧急补库建议，流程结束")
-        return {'error':"无紧急补库建议，流程结束"}
+        return {'message': '当前库存充足，无需紧急补库', 'success': True}
 
     # 6. 获取设备规格映射（补充 DEV_CLS, DEV_CATEG）
     spec_df = query_adam_spec_code_config()
@@ -264,7 +264,7 @@ def run_emergency_replenishment(
 
     if not insert_records:
         logger.warning("无有效插入记录（可能因规格缺失）")
-        return {'error':"无有效插入记录（可能因规格缺失）"}
+        return {'message': '紧急补库建议生成后无有效记录可插入', 'success': False}
 
 
     insert_df = pd.DataFrame(insert_records)

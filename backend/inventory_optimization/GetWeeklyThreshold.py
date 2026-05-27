@@ -48,7 +48,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     print(f'聚合后周度预测值数据为：{len(df_grouped)}')
     # 准备初始化仓库的临时数据
     df_temp = df_grouped[['ORG_NO','ORG_NAME']].drop_duplicates()
-    print(f'去重后的数据量为:{len(df_temp)}')
+    print(f'准备初始化仓库的临时数据，数据量为:{len(df_temp)}')
     LWI = LocalWarehouseInitializer()
     LWI.load_city_mapping(df_temp)
     local_warehouses = LWI.initialize_warehouses(df_temp)
@@ -58,8 +58,11 @@ def GenerateWeeklyThreshold(year:str, month:str):
     # 按照 ORG_NO, ORG_NAME, DEV_CODE 分组
     grouped = df_grouped.groupby(['ORG_NO', 'ORG_NAME', 'DEV_CODE'])
     
+    item_count = 0
     for (org_no, org_name, dev_code), group in grouped:
         warehouse = warehouse_dict.get(str(org_no))
+        if not warehouse:
+            continue
         item = Item(
             cls=None,
             dev_code=dev_code,
@@ -76,48 +79,72 @@ def GenerateWeeklyThreshold(year:str, month:str):
             item.set_demand_distribution(week, distribution)
         # 将物资添加到仓库
         warehouse.add_item(dev_code, item)
+        item_count += 1
+    print(f"物资创建完成，共 {item_count} 个物资", flush=True)
     
     WeekSeq = df_grouped['PRE_WEEK'].unique()
     res_df = []
 
-    
+
     # 读取设备分类和类别映射
+    print("开始读取设备分类配置...", flush=True)
     spec_df = query_adam_spec_code_config()
     dev_cls_mapping = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
+    print(f"设备分类配置读取完成，共 {len(dev_cls_mapping)} 种设备", flush=True)
 
     stock_id = int(time.time() * 1000)
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
+    total_items = sum(len(w.items) for w in local_warehouses)
+    processed = 0
     for warehouse in local_warehouses:
         for item_key,item in warehouse.items.items():
-            for week_seq in WeekSeq:
-                low , mid , high = item.get_weekly_threshold(week_seq,beta,alpha)
-                # 获取设备分类和类别
-                dev_cls = dev_cls_mapping.get(item.dev_code, '').zfill(2)
-                dev_categ = dev_categ_mapping.get(item.dev_code, '').zfill(2)
-                record = {
-                    "STOCK_WEEK_LIMT_PRE_ID": stock_id,
-                    "PRE_YEAR": year,
-                    "PRE_QUARTER": df_grouped['PRE_QUARTER'].iloc[0],
-                    "PRE_MONTH": month,
-                    "PRE_WEEK": week_seq,
-                    "DEV_CLS": dev_cls,
-                    "DEV_CATEG": dev_categ,
-                    "DEV_CODE": item.dev_code,
-                    "PRE_UP": high,
-                    "PRE_DOWN": low,
-                    "BASE_LIMT": mid,
-                    "PRE_TIME": pretime,
-                    "GLOBAL_SCHEME_ID": global_scheme_id
-                }
-                res_df.append(record)
-                stock_id += 1
-    
+            try:
+                for week_seq in sorted(item.demand_distributions.keys()):
+                    low , mid , high = item.get_weekly_threshold(week_seq,beta,alpha)
+                    # 获取设备分类和类别
+                    dev_cls = dev_cls_mapping.get(item.dev_code, '').zfill(2)
+                    dev_categ = dev_categ_mapping.get(item.dev_code, '').zfill(2)
+                    record = {
+                        "STOCK_WEEK_LIMT_PRE_ID": stock_id,
+                        "PRE_YEAR": year,
+                        "PRE_QUARTER": df_grouped['PRE_QUARTER'].iloc[0],
+                        "PRE_MONTH": month,
+                        "PRE_WEEK": week_seq,
+                        "ORG_NO": warehouse.city_code,
+                        "DEV_CLS": dev_cls,
+                        "DEV_CATEG": dev_categ,
+                        "DEV_CODE": item.dev_code,
+                        "PRE_UP": high,
+                        "PRE_DOWN": low,
+                        "BASE_LIMT": mid,
+                        "PRE_TIME": pretime,
+                        "GLOBAL_SCHEME_ID": global_scheme_id
+                    }
+                    res_df.append(record)
+                    stock_id += 1
+                processed += 1
+                if processed % 200 == 0:
+                    print(f"阈值计算进度: {processed}/{total_items}", flush=True)
+            except Exception as e:
+                print(f"计算阈值失败: dev_code={item.dev_code}, error={e}", flush=True)
+                raise
+
+    print(f"阈值计算完成，共处理 {processed} 个物资", flush=True)
     WeeklyThreshold = pd.DataFrame(res_df)
-    print(f'生成周度阈值结果{len(WeeklyThreshold)}条')
-    del_res = delete_adam_stock_week_limt_pre_by_ym(year, month)
-    print(f'删除周度阈值旧数据结果{del_res}')
-    return WeeklyThreshold,insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
+    print(f'生成周度阈值结果{len(WeeklyThreshold)}条', flush=True)
+
+    # 删除旧数据（防御性处理，删除失败不影响后续插入）
+    try:
+        del_res = delete_adam_stock_week_limt_pre_by_ym(year, month)
+        print(f'删除周度阈值旧数据结果{del_res}', flush=True)
+    except Exception as e:
+        print(f'删除周度阈值旧数据失败（继续执行插入）: {e}', flush=True)
+
+    print(f"开始插入周度阈值数据，共 {len(WeeklyThreshold)} 条...", flush=True)
+    insert_result = insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
+    print(f"插入周度阈值数据结果: {insert_result}", flush=True)
+    return WeeklyThreshold, insert_result
 
     
     

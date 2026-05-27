@@ -4,6 +4,7 @@
 """
 
 import datetime
+import logging
 from flask import Blueprint, request, jsonify
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from backend.inventory_optimization.GetWeeklyThreshold import GenerateWeeklyThreshold
@@ -56,6 +57,7 @@ def optimize():
         return jsonify(result)
         
     except Exception as e:
+        logging.exception("库存优化接口异常")
         return jsonify({
             "success": False,
             "error": str(e)
@@ -95,20 +97,32 @@ def GetMonthThresholdAndOrder():
         global_scheme_id, epsilon = get_approved_scheme_config(yearMonth)
         print(f'使用审批方案: GLOBAL_SCHEME_ID={global_scheme_id}, epsilon={epsilon}')
         Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,global_scheme_id,epsilon)
-        print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条')
-        del_res = delete_adam_stock_month_limit_pre_by_ym(year, month)
-        print(f'删除月度阈值旧数据结果{del_res}')
+        print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条', flush=True)
+
+        # 删除旧数据（防御性处理，删除失败不影响后续插入）
+        try:
+            del_res = delete_adam_stock_month_limit_pre_by_ym(year, month)
+            print(f'删除月度阈值旧数据结果{del_res}', flush=True)
+        except Exception as e:
+            print(f'删除月度阈值旧数据失败（继续执行插入）: {e}', flush=True)
+
         result=insert_into_adam_stock_month_limit_pre(Threshold)
-        print(f'插入阈值数据结果{result}')
-        del_res = delete_adam_plan_month_ias_pre_by_ym(year, month)
-        print(f'删除月度补库旧数据结果{del_res}')
+        print(f'插入阈值数据结果{result}', flush=True)
+
+        try:
+            del_res = delete_adam_plan_month_ias_pre_by_ym(year, month)
+            print(f'删除月度补库旧数据结果{del_res}', flush=True)
+        except Exception as e:
+            print(f'删除月度补库旧数据失败（继续执行插入）: {e}', flush=True)
+
         result=insert_into_adam_plan_month_ias_pre(Order)
-        print(f'插入补货量数据结果{result}')
+        print(f'插入补货量数据结果{result}', flush=True)
         update_adam_pre_conc_stat(int(preConcId),'03')
         
         return jsonify(result)
     
     except Exception as e:
+        logging.exception("月度阈值接口异常")
         update_adam_pre_conc_stat(int(preConcId),'04')
         return jsonify({
             "success": False,
@@ -135,6 +149,7 @@ def GenerateWeeklyThresholdRoute():
         update_adam_pre_conc_stat(int(preConcId), '03')
         return jsonify(result)
     except Exception as e:
+        logging.exception("周度阈值接口异常")
         update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -178,6 +193,7 @@ def AdjustDailyDeliveryPlan():
         })
 
     except Exception as E:
+        logging.exception("单日配送调整接口异常")
         update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "success": False,
@@ -228,9 +244,9 @@ def AdjustDailyDeliveryPlanRange():
                 total_success += main_res.get('success_count', 0) + detail_res.get('success_count', 0)
                 total_failed += main_res.get('failed_count', 0) + detail_res.get('failed_count', 0)
             except Exception as e:
+                logging.exception(f"调整日配送失败, date={date_str}")
                 total_failed += 1
                 failed_dates.append(date_str)
-                # 可选择记录日志
                 continue
 
         if total_failed == 0:
@@ -247,6 +263,7 @@ def AdjustDailyDeliveryPlanRange():
         })
 
     except Exception as E:
+        logging.exception("批量日配送调整接口异常")
         update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "success": False,
@@ -288,6 +305,7 @@ def GenerateDailyReplenishmentPlan():
         })
 
     except Exception as E:
+        logging.exception("日度补库计划接口异常")
         return jsonify({
             "success": False,
             "error": str(E)
