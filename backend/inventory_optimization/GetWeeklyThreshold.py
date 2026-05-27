@@ -10,14 +10,20 @@ def GenerateWeeklyThreshold(year:str, month:str):
     '''
     计算周度各市县库存阈值
     '''
+    from backend.config.scheme_config import get_approved_scheme_config
+
+    year_month = year + month
+    global_scheme_id, epsilon = get_approved_scheme_config(year_month)
     beta = 0.95
-    alpha = 0.99
+    alpha = epsilon
+    print(f'使用审批方案: GLOBAL_SCHEME_ID={global_scheme_id}, epsilon={epsilon}')
 
     from backend.api.data_api.fetch_data import (
         query_adam_wd_dmd_pre_by_year_month_and_pretype,
         query_adam_del_site_conf,
         query_adam_spec_code_config,
-        insert_into_adam_stock_week_limt_pre)
+        insert_into_adam_stock_week_limt_pre,
+        delete_adam_stock_week_limt_pre_by_ym)
 
     pre_type = '04'
     #获得站点信息，去掉省中心
@@ -80,8 +86,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
     dev_cls_mapping = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
 
-    tag = int(time.time()*1000)
-    stock_id = int(tag)
+    stock_id = int(time.time() * 1000)
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     for warehouse in local_warehouses:
         for item_key,item in warehouse.items.items():
@@ -103,13 +108,15 @@ def GenerateWeeklyThreshold(year:str, month:str):
                     "PRE_DOWN": low,
                     "BASE_LIMT": mid,
                     "PRE_TIME": pretime,
-                    "GLOBAL_SCHEME_ID": tag
+                    "GLOBAL_SCHEME_ID": global_scheme_id
                 }
                 res_df.append(record)
                 stock_id += 1
     
     WeeklyThreshold = pd.DataFrame(res_df)
     print(f'生成周度阈值结果{len(WeeklyThreshold)}条')
+    del_res = delete_adam_stock_week_limt_pre_by_ym(year, month)
+    print(f'删除周度阈值旧数据结果{del_res}')
     return WeeklyThreshold,insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
 
     

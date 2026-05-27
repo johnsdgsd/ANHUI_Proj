@@ -198,13 +198,17 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         })
 
     # 【8级漏斗】
-    inspection_passes = [
-        {'max_h': 8, 'auto': True, 'wd': True}, {'max_h': 8, 'auto': False, 'wd': True},
-        {'max_h': 12, 'auto': True, 'wd': True}, {'max_h': 12, 'auto': False, 'wd': True},
-        {'max_h': 24, 'auto': True, 'wd': True}, {'max_h': 24, 'auto': False, 'wd': True},
-        {'max_h': 24, 'auto': True, 'wd': False}, {'max_h': 24, 'auto': False, 'wd': False}
-    ]
 
+    inspection_passes = [
+        {'max_h': 8, 'auto': True, 'wd': True},  # 1. 8h自动
+        {'max_h': 12, 'auto': True, 'wd': True},  # 2. 12h自动
+        {'max_h': 24, 'auto': True, 'wd': True},  # 3. 24小时自动
+        {'max_h': 24, 'auto': True, 'wd': False},  # 4. 节假日自动
+        {'max_h': 8, 'auto': False, 'wd': True},  # 5. 8h人工
+        {'max_h': 12, 'auto': False, 'wd': True},  # 6. 12h人工
+        {'max_h': 24, 'auto': False, 'wd': True},  # 7. 24h人工
+        {'max_h': 24, 'auto': False, 'wd': False}  # 8. 节假日人工
+    ]
     for p in inspection_passes:
         for lot in LotObjects:
             if lot['rem'] <= 0: continue

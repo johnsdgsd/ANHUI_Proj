@@ -1824,3 +1824,113 @@ def query_adam_plan_day_ias_pre_by_month(data_month: str):
         raise
 
 
+def query_vehicle_conf():
+    """查询车型配置信息，返回 VeCap, VNums, VeUnitPrice, VeTypeNum。
+    数据库查询为空时使用默认配置。
+
+    Returns:
+        tuple: (VeCap, VNums, VeUnitPrice, VeTypeNum)
+    """
+    import numpy as np
+
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_vehicle_conf'
+        url = f"http://{host}:{port}{endpoint}"
+
+        response = requests.post(url, json={})
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data or (isinstance(data, list) and len(data) == 0):
+            VeCap = np.array([459, 901, 1071])
+            VNums = np.array([9, 10, 6])
+            VeUnitPrice = np.array([0.0695, 0.0695, 0.0695])
+            VeTypeNum = 3
+            VeType = ['03','02','01']
+        else:
+            if isinstance(data, list):
+                df = pd.DataFrame(data)
+            else:
+                df = pd.DataFrame([data])
+
+            df.columns = [c.upper() for c in df.columns]
+            VeCap = df['VEHICLE_CAP'].astype(int).values
+            VNums = df['VEHICLE_NUM'].astype(int).values
+            VeUnitPrice = df['VEHICLE_CARRI'].astype(float).values
+            VeType = df['CAR_TYPE']
+            VeTypeNum = len(df)
+
+        return VeCap, VNums, VeUnitPrice, VeTypeNum,VeType
+
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
+def delete_adam_dist_scheme_det_by_scheme_id(scheme_id):
+    """根据配送方案ID删除配送方案明细"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_dist_scheme_det_by_scheme_id"
+        response = requests.post(url, json={"scheme_id": scheme_id})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
+def delete_adam_dist_scheme_by_id(scheme_id):
+    """根据配送方案ID删除配送方案主表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_dist_scheme_by_id"
+        response = requests.post(url, json={"scheme_id": scheme_id})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
+def delete_adam_stock_month_limit_pre_by_ym(year: str, month: str):
+    """按年月删除月度库存阈值预测表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_stock_month_limit_pre_by_ym"
+        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
+def delete_adam_plan_month_ias_pre_by_ym(year: str, month: str):
+    """按年月删除月度补库计划表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_plan_month_ias_pre_by_ym"
+        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
+def delete_adam_stock_week_limt_pre_by_ym(year: str, month: str):
+    """按年月删除周度库存阈值预测表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_stock_week_limt_pre_by_ym"
+        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise

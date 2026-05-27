@@ -46,6 +46,8 @@ def GenerateMutiOrderScheme(yearMonth:str):
     tag = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
     tag = int(tag)
 
+    tag_epsilon_map = {}  # 记录 tag -> epsilon
+
     for e in epsilons:
 
         Threshold, Order,Demand_Pre = GenerateMonthlyThresholdAndOrder(
@@ -55,6 +57,7 @@ def GenerateMutiOrderScheme(yearMonth:str):
             tag=tag,
             alpha = e
         )
+        tag_epsilon_map[tag] = e
         OrderSchemes[tag] = Order
         ThresholdSchemes[tag] = Threshold
         detail = PrepareDetail(Order,Threshold,init_stock,item_cost,Demand_Pre,monthly_holding_rate = monthly_holding_rate)
@@ -85,6 +88,11 @@ def GenerateMutiOrderScheme(yearMonth:str):
         tag +=1
 
     GlobalSchemeItems = determine_scheme_focus(GlobalSchemeItems)
+
+    # 保存 epsilon 映射供下游算法使用
+    from backend.config.scheme_config import save_scheme_epsilons
+    save_scheme_epsilons(yearMonth, tag_epsilon_map)
+
     # 统一插入数据库
     for tag in GlobalSchemeItems:
         insert_into_adam_glob_strategy_scheme(GlobalSchemeItems[tag])
@@ -121,10 +129,10 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
                          HOLDING_COST, SHORTAGE_COST,UNIT_PRICE,PRE_NUM
     """
     # 1. 汇总补货计划得到月需求（补货总量 = 需求总量）
-    Order = Order[['REC_ORG_CODE','DEV_CODE','PLAN_IAS_NUM','DEV_CLS','DEV_CATEG']]
+    Order = Order[['REC_ORG_NO','DEV_CODE','PLAN_IAS_NUM','DEV_CLS','DEV_CATEG']]
 
-    demand_agg = Order.groupby(['REC_ORG_CODE', 'DEV_CODE','DEV_CLS','DEV_CATEG'], as_index=False)['PLAN_IAS_NUM'].sum()
-    demand_agg.rename(columns={'REC_ORG_CODE': 'ORG_NO', 'PLAN_IAS_NUM': 'DEMAND'}, inplace=True)
+    demand_agg = Order.groupby(['REC_ORG_NO', 'DEV_CODE','DEV_CLS','DEV_CATEG'], as_index=False)['PLAN_IAS_NUM'].sum()
+    demand_agg.rename(columns={'REC_ORG_NO': 'ORG_NO', 'PLAN_IAS_NUM': 'DEMAND'}, inplace=True)
 
     # 2. 月初库存（直接使用传入的 init_stock，假定已为当前月份）
     init_f = init_stock[['ORG_NO', 'DEV_CODE', 'STOCK_NUM']].copy()

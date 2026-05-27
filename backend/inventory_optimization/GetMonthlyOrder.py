@@ -128,7 +128,7 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
                 'PLAN_MONTH_IAS_PRE_ID':stock_id,
                 'PRE_YEAR':year,
                 'PRE_MONTH':month,
-                'REC_ORG_CODE':warehouse.city_code,
+                'REC_ORG_NO':warehouse.city_code,
                 'DEV_CLS':dev_cls,
                 'DEV_CATEG':dev_categ,
                 'DEV_CODE':item.dev_code,

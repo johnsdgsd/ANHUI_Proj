@@ -179,6 +179,13 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         if is_mid_month:
             execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
         else:
+            del_month_params = {
+                "pre_year": str(start_dt.year),
+                "pre_month": f"{start_dt.month:02d}"
+            }
+            # 直接传递 target_month (例如 "202605")
+            execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
+            execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
             execute_batch("gk-adam-insert_detect_plan", detect_db_list)
             execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
 

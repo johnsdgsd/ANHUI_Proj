@@ -70,7 +70,6 @@ def GetMonthThresholdAndOrder():
         # 获取必需参数
         yearMonth = data.get('preMonth')
         preConcId = data.get('preConcId')
-        tag = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         
         # 参数校验
         if not all([yearMonth,preConcId]):
@@ -85,16 +84,24 @@ def GetMonthThresholdAndOrder():
             query_adam_org_stock_sample_by_month,
             insert_into_adam_stock_month_limit_pre,
             insert_into_adam_plan_month_ias_pre,
-            update_adam_pre_conc_stat)
+            update_adam_pre_conc_stat,
+            delete_adam_stock_month_limit_pre_by_ym,
+            delete_adam_plan_month_ias_pre_by_ym)
+        from backend.config.scheme_config import get_approved_scheme_config
 
         update_adam_pre_conc_stat(int(preConcId),'02')
         init_stock = query_adam_org_stock_sample_by_month(yearMonth)
 
-        alpha = 0.99
-        Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,tag,alpha)
+        global_scheme_id, epsilon = get_approved_scheme_config(yearMonth)
+        print(f'使用审批方案: GLOBAL_SCHEME_ID={global_scheme_id}, epsilon={epsilon}')
+        Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,global_scheme_id,epsilon)
         print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条')
+        del_res = delete_adam_stock_month_limit_pre_by_ym(year, month)
+        print(f'删除月度阈值旧数据结果{del_res}')
         result=insert_into_adam_stock_month_limit_pre(Threshold)
         print(f'插入阈值数据结果{result}')
+        del_res = delete_adam_plan_month_ias_pre_by_ym(year, month)
+        print(f'删除月度补库旧数据结果{del_res}')
         result=insert_into_adam_plan_month_ias_pre(Order)
         print(f'插入补货量数据结果{result}')
         update_adam_pre_conc_stat(int(preConcId),'03')

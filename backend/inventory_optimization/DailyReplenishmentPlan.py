@@ -24,7 +24,7 @@ def LoadDelivData(date:str):
     )
     from backend.api.data_api.fetch_data import (
     query_adam_spec_code_config,query_adam_del_site_conf,
-    query_adam_plan_day_ias_pre_by_date
+    query_adam_plan_day_ias_pre_by_date,query_vehicle_conf
     )
     #完整的规格设备码信息
     SubTypeList = query_adam_spec_code_config()
@@ -60,19 +60,8 @@ def LoadDelivData(date:str):
     Demands=pd.DataFrame(Demands)
     # 最多三个地点
     MaxLen = 3 if len(set(LocationInd)) >=3 else 2
-    #车辆信息
-    VehicleTb = {
-        "VeType":['大号','中号','小号'],
-        "VeCap":[1100,900,410],
-        "VNum":[12,35,34],
-        "VeUnitPrice":[0.07,0.07,0.07]
-    }
-    VehicleTb = pd.DataFrame(VehicleTb)
-
-    VeUnitPrice=VehicleTb['VeUnitPrice']#运费
-    VeCap=VehicleTb['VeCap']#容量
-    VNums=VehicleTb['VNum']#车辆数
-    VeTypeNum=VehicleTb.shape[0]#车辆种类数
+    #车辆信息（从数据库车型配置表读取）
+    VeCap, VNums, VeUnitPrice, VeTypeNum,VeType = query_vehicle_conf()
 
     #计算网点间距离
     lons = tb1['LONGITUDE']
@@ -97,7 +86,7 @@ def LoadDelivData(date:str):
     DMat.columns = range(1, numLocations+ 1)
     DMat.index = range(1, numLocations+ 1)
 
-    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen
+    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen,VeType
 
 def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
     """
@@ -179,7 +168,7 @@ def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
 
     return DelivPlan
 
-def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
+def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList):
     """
     将配送计划解析为 ADAM_DIST_SCHEME（主表）和 ADAM_DIST_SCHEME_DET（明细表）
     参数：
@@ -226,10 +215,10 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
 
         MainRows.append({
             'DIST_SCHEME_ID': scheme_id,
-            'CAR_TYPE': f"0{VeType}",
+            'CAR_TYPE': CarTypeStrList[VeType - 1],
             'PLAN_DIST_DATE': PlanDate,
-            'DIST_FLAG': 'Y',
-            'LATE_FLAG': 'N',
+            'DIST_FLAG': '01',
+            'LATE_FLAG': '01',
             'LOAD_RATE': LoadRate,
             'CREATE_DATE': CurrentDateStr,
             'UPDATE_DATE': CurrentDateStr,
@@ -256,6 +245,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
                 EstDist = PathDis * Ratio
                 DistExp = Price * Ratio
 
+                BoxCap = SubTypeList.iloc[DevIdx]['PACK_BOX_NUM']
                 DetailRows.append({
                     'DIST_SCHEME_DET_ID': det_id,
                     'DIST_SCHEME_ID': scheme_id,
@@ -266,7 +256,8 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
                     'DIST_SEQ': DistSeq,
                     'LOAD_SEQ': LoadSeq,
                     'PLAN_DIST_NUM': int(Qty),
-                    'EST_TOT_DIST_MIST': "",
+                    'PLAN_BOX_NUM': int(np.ceil(Qty / BoxCap)),
+                    'EST_TOT_DIST_MIST': round(EstDist, 4),
                     'DIST_EXP': round(DistExp, 4),
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
@@ -279,7 +270,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap):
                      'LOAD_RATE', 'CREATE_DATE', 'UPDATE_DATE', 'GLOBAL_SCHEME_ID']]
     DetailDf = DetailDf[['DIST_SCHEME_DET_ID', 'DIST_SCHEME_ID', 'REC_ORG_NO', 'DEV_CODE',
                          'DEV_CLS', 'DEV_CATEG', 'DIST_SEQ', 'LOAD_SEQ', 'PLAN_DIST_NUM',
-                         'EST_TOT_DIST_MIST', 'DIST_EXP', 'GLOBAL_SCHEME_ID']]
+                         'PLAN_BOX_NUM', 'EST_TOT_DIST_MIST', 'DIST_EXP', 'GLOBAL_SCHEME_ID']]
     return MainDf, DetailDf
 
 
@@ -359,13 +350,24 @@ def AdjustDaliyDelivery(date:str):
     """
     根据日补库计划调整日配送
     """
-    from backend.api.data_api.fetch_data import query_adam_del_site_conf
+    from backend.api.data_api.fetch_data import (query_adam_del_site_conf,
+        query_adam_dist_scheme_by_date_range,
+        delete_adam_dist_scheme_det_by_scheme_id,
+        delete_adam_dist_scheme_by_id)
     logging.basicConfig(
         level=logging.INFO,  # 设置日志级别为 INFO
         format="%(asctime)s - %(levelname)s - %(message)s",  # 设置日志格式
         stream=sys.stdout  # 将日志输出到控制台
     )
-    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen=LoadDelivData(date)
+    # 先删除当天已有配送方案
+    existing = query_adam_dist_scheme_by_date_range(date, date)
+    if not existing.empty:
+        for sid in existing['DIST_SCHEME_ID'].tolist():
+            delete_adam_dist_scheme_det_by_scheme_id(sid)
+            delete_adam_dist_scheme_by_id(sid)
+        logging.info(f"已删除当天 {len(existing)} 条旧配送方案")
+
+    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen,CarTypeStrList=LoadDelivData(date)
     EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
     SubTypeNum = len(SubTypeList)
     DemandsBoxs = np.zeros((LocationNum, SubTypeNum))
@@ -635,5 +637,5 @@ def AdjustDaliyDelivery(date:str):
     DelivPlan = GenerateDelivPlan(DelivPlan,Demands,SubTypeList)
     # DelivPlan = ExpandDeviceDetail(DelivPlan,SubTypeList)
 
-    MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap)
+    MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap, CarTypeStrList)
     return MainScheme , DetailScheme
