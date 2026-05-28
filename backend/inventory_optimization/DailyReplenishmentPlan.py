@@ -127,8 +127,6 @@ def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
     for RowIdx, Row in DelivPlan.iterrows():
         Path = Row['PlanPath']
         DeNums = Row['DeNum']
-        if not isinstance(DeNums, list):
-            DeNums = list(DeNums)
         for Pos, (Node, Box) in enumerate(zip(Path, DeNums)):
             NodeRecords[Node].append((RowIdx, int(round(Box)), Pos))
 
@@ -370,12 +368,15 @@ def AdjustDaliyDelivery(date:str):
         stream=sys.stdout  # 将日志输出到控制台
     )
     # 先删除当天已有配送方案
-    existing = query_adam_dist_scheme_by_date_range(date, date)
-    if not existing.empty:
-        for sid in existing['DIST_SCHEME_ID'].tolist():
-            delete_adam_dist_scheme_det_by_scheme_id(sid)
-            delete_adam_dist_scheme_by_id(sid)
-        logging.info(f"已删除当天 {len(existing)} 条旧配送方案")
+    try:
+        existing = query_adam_dist_scheme_by_date_range(date, date)
+        if not existing.empty:
+            for sid in existing['DIST_SCHEME_ID'].tolist():
+                delete_adam_dist_scheme_det_by_scheme_id(sid)
+                delete_adam_dist_scheme_by_id(sid)
+            logging.info(f"已删除当天 {len(existing)} 条旧配送方案")
+    except ValueError:
+        logging.info(f"当天 ({date}) 无旧配送方案，跳过删除")
 
     Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen,CarTypeStrList=LoadDelivData(date)
     EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
@@ -665,6 +666,9 @@ def AdjustDaliyDelivery(date:str):
         'DeNum': DeNum
     }
     DelivPlan = pd.DataFrame(DelivPlan)
+    # 规范化：确保 DeNum 和 PlanPath 列的元素都是 Python list（numpy 数组/标量会导致 sum() 等操作失败）
+    DelivPlan['DeNum'] = DelivPlan['DeNum'].apply(lambda x: [int(x)] if isinstance(x, (np.integer, np.floating)) else list(x))
+    DelivPlan['PlanPath'] = DelivPlan['PlanPath'].apply(lambda x: [int(x)] if isinstance(x, (np.integer, np.floating)) else list(x))
     logging.info(f"DelivPlan DataFrame: {len(DelivPlan)} 行, columns={list(DelivPlan.columns)}")
 
     #增加配送地点编号

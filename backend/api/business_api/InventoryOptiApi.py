@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify
 from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from backend.inventory_optimization.GetWeeklyThreshold import GenerateWeeklyThreshold
 from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDelivery,DailyReplenishmentPlan
+from backend.inventory_optimization.HeuristicDeliveryPlan import AdjustDaliyDeliveryV2
 from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
 # 创建蓝图
 inventory_opti_bp = Blueprint('inventory_opti', __name__, url_prefix='/inventory')
@@ -306,6 +307,80 @@ def GenerateDailyReplenishmentPlan():
 
     except Exception as E:
         logging.exception("日度补库计划接口异常")
+        return jsonify({
+            "success": False,
+            "error": str(E)
+        }), 500
+
+
+@inventory_opti_bp.route('/adjust-daily-delivery-v2', methods=['POST'])
+def AdjustDailyDeliveryPlanRangeV2():
+    """
+    调整日补库计划接口 V2（启发式算法）
+    请求参数（JSON）:
+        dateList: 需要调整的日期列表，如 ["2026-01-01", "2026-01-02"]
+        preConcId: 预测结果表ID
+        maxStops:   每车最多站点数（可选，默认 5）
+        maxIter:    迭代次数（可选，默认 600）
+    """
+    from backend.api.data_api.fetch_data import (
+        insert_into_adam_dist_scheme, insert_into_adam_dist_scheme_det,
+        update_adam_pre_conc_stat)
+
+    try:
+        Data = request.get_json() or {}
+        date_list = Data.get('dateList')
+        preConcId = Data.get('preConcId')
+        max_stops = Data.get('maxStops', 5)
+        max_iter = Data.get('maxIter', 600)
+
+        if not date_list or not isinstance(date_list, list) or len(date_list) == 0:
+            return jsonify({
+                "success": False,
+                "error": "参数错误，必须提供非空的 dateList 日期列表"
+            }), 400
+
+        update_adam_pre_conc_stat(int(preConcId), '02')
+
+        all_main_results = []
+        all_detail_results = []
+        total_success = 0
+        total_failed = 0
+        failed_dates = []
+
+        for date_str in date_list:
+            try:
+                MainScheme, DetailScheme = AdjustDaliyDeliveryV2(
+                    date_str, max_stops=max_stops, max_iter=max_iter
+                )
+                main_res = insert_into_adam_dist_scheme(MainScheme)
+                detail_res = insert_into_adam_dist_scheme_det(DetailScheme)
+                all_main_results.append(main_res)
+                all_detail_results.append(detail_res)
+                total_success += main_res.get('success_count', 0) + detail_res.get('success_count', 0)
+                total_failed += main_res.get('failed_count', 0) + detail_res.get('failed_count', 0)
+            except Exception as e:
+                logging.exception(f"调整日配送V2失败, date={date_str}")
+                total_failed += 1
+                failed_dates.append(date_str)
+                continue
+
+        if total_failed == 0:
+            update_adam_pre_conc_stat(int(preConcId), '03')
+        else:
+            update_adam_pre_conc_stat(int(preConcId), '04')
+
+        return jsonify({
+            "success": total_failed == 0,
+            "message": f"日补库计划调整V2完成，共处理 {len(date_list)} 天，成功 {total_success} 条记录，失败 {total_failed} 条",
+            "failed_dates": failed_dates,
+            "mainResults": all_main_results,
+            "detailResults": all_detail_results
+        })
+
+    except Exception as E:
+        logging.exception("批量日配送调整V2接口异常")
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "success": False,
             "error": str(E)

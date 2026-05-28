@@ -227,7 +227,7 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     logger.info('计算同比环比')
     pre_stat_cost = total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
     pre_single_cost = pre_stat_cost / (total_demand + total_inv) if (total_demand + total_inv)> 0 else 0.0
-    total_turnover = detail['TURNOVER'].sum()
+    total_turnover = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'])['TURNOVER'].sum().mean()
     cur_itr = detail['ITR'].round(2).mean()  ##这里是均值
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
@@ -377,7 +377,7 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
         START_STOCK_NUM=('I0', 'sum'),
         END_STOCK_NUM=('I_END', 'sum'),
         PRE_ITT=('TURNOVER', 'sum'),
-        PRE_ITR = ('ITR','sum')
+        PRE_ITR = ('ITR','mean')
     )
 
     # 2. 合并历史数据（使用左连接）
