@@ -72,17 +72,17 @@ def GetCenterToLocalDis() -> dict:
     from backend.api.data_api.fetch_data import query_adam_del_site_conf
     # 查询所有配送站点配置（假设表中有 ORG_NO, LONGITUDE, LATITUDE, STAT_NAME）
     tb1 = query_adam_del_site_conf()
-    
+
     # 获取营销服务中心（省中心）的经纬度
     marketing_center = tb1[tb1['STAT_NAME'] == '营销服务中心']
     if marketing_center.empty:
         raise ValueError("未找到营销服务中心站点")
     center_lon = marketing_center.iloc[0]['LONGITUDE']
     center_lat = marketing_center.iloc[0]['LATITUDE']
-    
+
     # 筛选其他站点（地市）
     other_sites = tb1[tb1['STAT_NAME'] != '营销服务中心'].copy()
-    
+
     distances = {}
     for _, row in other_sites.iterrows():
         org_no = row['ORG_NO']
@@ -92,5 +92,5 @@ def GetCenterToLocalDis() -> dict:
         dist = geodesic((center_lat, center_lon), (lat, lon)).km
         # 应用系数 1.15（如原代码所示）
         distances[org_no] = dist * 1.15
-    
+
     return distances

@@ -1934,3 +1934,16 @@ def delete_adam_stock_week_limt_pre_by_ym(year: str, month: str):
         return response.json()
     except Exception as e:
         raise
+
+
+def delete_adam_plan_day_ias_pre_by_month(year_month: str):
+    """按年月删除日补库计划表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_plan_day_ias_pre_by_month"
+        response = requests.post(url, json={"year_month": year_month})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise

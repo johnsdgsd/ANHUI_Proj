@@ -195,13 +195,10 @@ def _greedy_insertion(routes, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, V
 
 
 def _build_delivery_plan(best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
-                          CarTypeStrList, date, DMAT_arr, site_info):
+                          CarTypeStrList, date, DMAT_arr, org_labels):
     """将启发式解转换为 DelivPlan DataFrame，再生成主表和明细表"""
-    node_to_org = site_info.reset_index(drop=True)
-    # site_info 索引从 0 开始，网点编号从 1 开始
-    org_lookup = {}
-    for i, row in node_to_org.iterrows():
-        org_lookup[i + 1] = row['ORG_NO']
+    # org_labels = ["中心", org1, org2, ...] — 来自 DMAT 列标签，与 DMAT_arr 行列顺序一致
+    org_lookup = {i: org_labels[i] for i in range(1, len(org_labels))}
 
     records = []
     for idx, route in enumerate(best_sol):
@@ -213,27 +210,41 @@ def _build_delivery_plan(best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
 
         # 计算路径总距离：省中心→第一站→...→最后一站
         total_dist = DMAT_arr[0, node_ids[0]]
+        seg_dists = [total_dist]  # 第一站的分段距离
         for j in range(len(node_ids) - 1):
-            total_dist += DMAT_arr[node_ids[j], node_ids[j + 1]]
+            seg = DMAT_arr[node_ids[j], node_ids[j + 1]]
+            total_dist += seg
+            seg_dists.append(seg)
 
+
+        # debug: segment distances (node_ids 映射为 ORG_NO)
+        seg_orgs = "->".join(str(org_lookup.get(n, n)) for n in node_ids)
+        seg_km = ",".join(f"{d:.1f}" for d in seg_dists)
+        logging.info(f"[V2 seg] depo->" + seg_orgs + f", seg_km=[" + seg_km + f"], total={total_dist:.1f}km")
         records.append({
             'PathInd': 1,
             'VeType': v_type,
             'Price': 0.0,  # 后补
             'PlanPath': node_ids,
             'DeNum': amounts,
+            'SegDis': seg_dists,
             'PathDis': total_dist
         })
 
     DelivPlan = pd.DataFrame(records)
 
-    # 计算价格
+    # 计算价格：里程逐站累进
     for i, row in DelivPlan.iterrows():
-        total_boxes = sum(row['DeNum'])
+        DeNum = row['DeNum']
+        PlanPath = row['PlanPath']
+        total_boxes = sum(DeNum)
         v_idx = int(row['VeType']) - 1
-        loaded_cost = VeUnitPrice[v_idx] * total_boxes
-        empty_cost = VeUnitPrice[v_idx] * 0.5 * (VeCap[v_idx] - total_boxes)
-        DelivPlan.at[i, 'Price'] = (loaded_cost + empty_cost) * row['PathDis']
+        # loaded_cost = Σ (到达该站的里程 × 该站箱数 × 单价)
+        loaded_cost = DMAT_arr[0, PlanPath[0]] * DeNum[0] * VeUnitPrice[v_idx]
+        for j in range(1, len(PlanPath)):
+            loaded_cost += DMAT_arr[PlanPath[j-1], PlanPath[j]] * DeNum[j] * VeUnitPrice[v_idx]
+        empty_cost = VeUnitPrice[v_idx] * 0.5 * (VeCap[v_idx] - total_boxes) * row['PathDis']
+        DelivPlan.at[i, 'Price'] = loaded_cost + empty_cost
 
     # PathNo 映射
     Path_no = []
@@ -243,6 +254,16 @@ def _build_delivery_plan(best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
     DelivPlan['PathNo'] = Path_no
 
     DelivPlan = GenerateDelivPlan(DelivPlan, Demands, SubTypeList)
+
+    # 校验：日补库需求总量 vs 配送计划总量
+    total_demand_pieces_v2 = Demands.values.sum()
+    total_deliv_pieces_v2 = sum(
+        sum(sp) for _, row in DelivPlan.iterrows() for sp in row['DevicePieces']
+    )
+    total_deliv_boxes_v2 = sum(sum(row['DeNum']) for _, row in DelivPlan.iterrows())
+    logging.info(f"[V2校验] 日补库需求总件数: {int(total_demand_pieces_v2)}, 配送计划总件数: {int(total_deliv_pieces_v2)}, 差异: {int(total_demand_pieces_v2 - total_deliv_pieces_v2)}")
+    logging.info(f"[V2校验] 配送计划总箱数: {int(total_deliv_boxes_v2)}")
+
     MainScheme, DetailScheme = GenerateSchemeTables(
         DelivPlan, date, SubTypeList, VeCap, CarTypeStrList
     )
@@ -280,7 +301,6 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     """V2 算法实现体"""
 
     from backend.api.data_api.fetch_data import (
-        query_adam_del_site_conf,
         query_adam_dist_scheme_by_date_range,
         delete_adam_dist_scheme_det_by_scheme_id,
         delete_adam_dist_scheme_by_id
@@ -303,6 +323,7 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     t_start = time.time()
 
     Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, _, CarTypeStrList = LoadDelivData(date)
+    org_labels = DMAT.columns.tolist()  # ["中心", org1, org2, ...]
     SubTypeNum = len(SubTypeList)
     logging.info(f"数据载入完成: {LocationNum} 个配送站点, {SubTypeNum} 种设备, {VeTypeNum} 种车型")
     logging.info(f"车型容量: {[int(c) for c in VeCap]}, 各车型数量: {[int(n) for n in VNums]}")
@@ -332,9 +353,8 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
         logging.warning("无配送需求，返回空方案")
         return pd.DataFrame(columns=empty_cols['main']), pd.DataFrame(columns=empty_cols['detail'])
 
-    # 距离矩阵
-    DMAT_arr = DMAT.values if isinstance(DMAT, pd.DataFrame) else DMAT
-    DMAT_arr = DMAT_arr + DMAT_arr.T
+    # 距离矩阵（LoadDelivData 已构建对称矩阵）
+    DMAT_arr = DMAT.values
 
     # 车型配置（按容量升序）
     VEHICLE_CONFIG = sorted(
@@ -419,13 +439,10 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     # ---- 4. 输出 ----
     logging.info("-" * 40)
     logging.info("构建输出表...")
-    site_info = query_adam_del_site_conf()
-    site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
-    logging.info(f"站点信息: {len(site_info)} 个配送站点")
 
     MainScheme, DetailScheme = _build_delivery_plan(
         best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
-        CarTypeStrList, date, DMAT_arr, site_info
+        CarTypeStrList, date, DMAT_arr, org_labels
     )
 
     t_end = time.time()

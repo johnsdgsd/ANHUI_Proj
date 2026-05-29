@@ -202,7 +202,7 @@ def AdjustDailyDeliveryPlan():
         }), 500
 
 
-@inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
+@inventory_opti_bp.route('/adjust-daily-delivery-v2', methods=['POST'])
 def AdjustDailyDeliveryPlanRange():
     """
     调整日补库计划接口
@@ -313,7 +313,7 @@ def GenerateDailyReplenishmentPlan():
         }), 500
 
 
-@inventory_opti_bp.route('/adjust-daily-delivery-v2', methods=['POST'])
+@inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
 def AdjustDailyDeliveryPlanRangeV2():
     """
     调整日补库计划接口 V2（启发式算法）

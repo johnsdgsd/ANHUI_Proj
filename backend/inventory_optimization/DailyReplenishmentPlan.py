@@ -28,6 +28,12 @@ def LoadDelivData(date:str):
     )
     #完整的规格设备码信息
     SubTypeList = query_adam_spec_code_config()
+    # 互感器(DEV_CLS='02')按体积折算，装箱数/2
+    mask_hgq = SubTypeList['DEV_CLS'] == '02'
+    n_hgq = mask_hgq.sum()
+    if n_hgq > 0:
+        SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] = (SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] / 2).astype(int)
+        logging.info(f'互感器体积折算: {n_hgq} 种规格的 PACK_BOX_NUM 已 /2')
     logging.info(f'载入配送数据：查询到{len(SubTypeList)}条规格设备码数据')
     SubTypeNum = len(SubTypeList)
     
@@ -38,13 +44,27 @@ def LoadDelivData(date:str):
     marketing_center = tb1[tb1['STAT_NAME'] == '营销服务中心']
     logging.info(f'载入配送数据：识别到{len(marketing_center)}个营销服务中心')
     
-    tb1 = tb1[tb1['STAT_NAME'] != '营销服务中心']
+    tb1 = tb1[tb1['STAT_NAME'] != '营销服务中心'].sort_values('ORG_NO').reset_index(drop=True)
     LocationNum = len(tb1)
     logging.info(f'载入配送数据：筛选出{LocationNum}个非营销服务中心站点')
     
     # 查询当日补库计划
     tb2 = query_adam_plan_day_ias_pre_by_date(date)
     logging.info(f'载入配送数据：查询到{len(tb2)}条当日补库计划')
+    if not tb2.empty and 'REPLE_TASK_TYPE' in tb2.columns:
+        type_counts = tb2['REPLE_TASK_TYPE'].value_counts().to_dict()
+        logging.info(f'日补库计划分类: 总数={len(tb2)}, '
+                     f'01(临时补库)= {type_counts.get("01", 0)}, '
+                     f'02(紧急补库)= {type_counts.get("02", 0)}, '
+                     f'03(日常补库)= {type_counts.get("03", 0)}')
+    if tb2.empty:
+        logging.warning(f'当日 ({date}) 无补库计划，返回空需求')
+        VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf()
+        Demands = pd.DataFrame(np.zeros((LocationNum, SubTypeNum)))
+        labels = ["中心"] + list(tb1['ORG_NO'])
+        DMat = pd.DataFrame(np.zeros((LocationNum + 1, LocationNum + 1)), index=labels, columns=labels)
+        return Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMat, 2, VeType
+
     Location = tb1['ORG_NO']
     LocationInd = tb2['REC_ORG_NO']
     SubTypeInd = tb2['DEV_CODE']
@@ -76,15 +96,15 @@ def LoadDelivData(date:str):
     lats = lats .sort_index().reset_index(drop=True)
     #构建距离矩阵
     numLocations = len(lons)
-    DMat = np.zeros((numLocations, numLocations))
+    DMat_np = np.zeros((numLocations, numLocations))
     for i in range(numLocations):
         for j in range(i+1, numLocations):
             # 使用 geopy 的 geodesic 方法计算两点间的距离（单位为公里）
             distance = geodesic((lats[i], lons[i]), (lats[j], lons[j])).km
-            DMat[i][j] = 1.15 * distance
-    DMat=pd.DataFrame(DMat)
-    DMat.columns = range(1, numLocations+ 1)
-    DMat.index = range(1, numLocations+ 1)
+            DMat_np[i][j] = 1.15 * distance
+    DMat_np = DMat_np + DMat_np.T
+    labels = ["中心"] + list(tb1['ORG_NO'])
+    DMat = pd.DataFrame(DMat_np, index=labels, columns=labels)
 
     return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen,VeType
 
@@ -200,6 +220,7 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
         DeNum = Row['DeNum']
         PathNo = Row['PathNo']
         DevicePieces = Row['DevicePieces']
+        SegDis = Row.get('SegDis', DeNum)  # 每站分段里程，兜底用箱数做近似
 
         TotalBoxes = sum(DeNum)
         TotalPieces = 0
@@ -223,10 +244,12 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
             'GLOBAL_SCHEME_ID': GlobalSchemeId
         })
 
-        # 处理明细
+        # 处理明细：同一站点共享分段里程
         for StopIdx, (OrgNo, StopPieces) in enumerate(zip(PathNo, DevicePieces)):
             DistSeq = StopIdx + 1
             LoadSeq = len(PathNo) - StopIdx
+            stop_est_dist = SegDis[StopIdx] if StopIdx < len(SegDis) else 0
+            stop_pieces = sum(StopPieces)
             for DevIdx, Qty in enumerate(StopPieces):
                 if Qty == 0:
                     continue
@@ -236,14 +259,13 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
                 DevCls = SubTypeList.iloc[DevIdx].get('DEV_CLS', '')
                 DevCateg = SubTypeList.iloc[DevIdx].get('DEV_CATEG', '')
 
-                if TotalPieces > 0:
-                    Ratio = Qty / TotalPieces
-                else:
-                    Ratio = 0
-                EstDist = PathDis * Ratio
-                DistExp = Price * Ratio
+                dev_ratio = Qty / stop_pieces if stop_pieces > 0 else 0
+                DistExp = Price * (DeNum[StopIdx] / TotalBoxes if TotalBoxes > 0 else 0) * dev_ratio
 
                 BoxCap = SubTypeList.iloc[DevIdx]['PACK_BOX_NUM']
+                plan_box_num = int(np.ceil(Qty / BoxCap))
+                if DevCls == '02':
+                    plan_box_num = max(1, int(np.ceil(plan_box_num / 2)))
                 DetailRows.append({
                     'DIST_SCHEME_DET_ID': det_id,
                     'DIST_SCHEME_ID': scheme_id,
@@ -254,8 +276,8 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
                     'DIST_SEQ': DistSeq,
                     'LOAD_SEQ': LoadSeq,
                     'PLAN_DIST_NUM': int(Qty),
-                    'PLAN_BOX_NUM': int(np.ceil(Qty / BoxCap)),
-                    'EST_TOT_DIST_MIST': round(EstDist, 4),
+                    'PLAN_BOX_NUM': plan_box_num,
+                    'EST_TOT_DIST_MIST': round(stop_est_dist, 4),
                     'DIST_EXP': round(DistExp, 4),
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
@@ -287,8 +309,14 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
         DaliyReplPlan :日度补库计划
     """
     from backend.api.data_api.fetch_data import (query_adam_dist_scheme_by_date_range,
-    query_adam_dist_scheme_det_by_distschemeid,insert_into_adam_plan_day_ias_pre)
-    
+    query_adam_dist_scheme_det_by_distschemeid,insert_into_adam_plan_day_ias_pre,
+    delete_adam_plan_day_ias_pre_by_month)
+
+    year_month = start_date[:4] + start_date[5:7]
+    logging.info(f"[日补库] 删除 {year_month} 旧数据...")
+    del_res = delete_adam_plan_day_ias_pre_by_month(year_month)
+    logging.info(f"[日补库] 删除结果: {del_res}")
+
     DistSchemeDf = query_adam_dist_scheme_by_date_range(start_date , end_date)
     DistSchemeDf['PLAN_DIST_DATE'] = DistSchemeDf['PLAN_DIST_DATE'].str[:10]
     print(f"当前日期格式示例：{DistSchemeDf['PLAN_DIST_DATE'].iloc[0]}")
@@ -358,7 +386,7 @@ def AdjustDaliyDelivery(date:str):
     """
     根据日补库计划调整日配送
     """
-    from backend.api.data_api.fetch_data import (query_adam_del_site_conf,
+    from backend.api.data_api.fetch_data import (
         query_adam_dist_scheme_by_date_range,
         delete_adam_dist_scheme_det_by_scheme_id,
         delete_adam_dist_scheme_by_id)
@@ -379,6 +407,7 @@ def AdjustDaliyDelivery(date:str):
         logging.info(f"当天 ({date}) 无旧配送方案，跳过删除")
 
     Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen,CarTypeStrList=LoadDelivData(date)
+    org_labels = DMAT.columns.tolist()  # ["中心", org1, org2, ...]
     EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
     SubTypeNum = len(SubTypeList)
     DemandsBoxs = np.zeros((LocationNum, SubTypeNum))
@@ -390,7 +419,6 @@ def AdjustDaliyDelivery(date:str):
     MinDeliverNum=20 #最小装箱数
     logging.info("计算路径数")
     DMAT = DMAT.values
-    DMAT= DMAT + DMAT.T
 
     PathInfo, _ = GetPathDis(DMAT, MaxLen)
     PathInfo=pd.DataFrame(PathInfo)
@@ -671,15 +699,10 @@ def AdjustDaliyDelivery(date:str):
     DelivPlan['PlanPath'] = DelivPlan['PlanPath'].apply(lambda x: [int(x)] if isinstance(x, (np.integer, np.floating)) else list(x))
     logging.info(f"DelivPlan DataFrame: {len(DelivPlan)} 行, columns={list(DelivPlan.columns)}")
 
-    #增加配送地点编号
-    logging.info("查询站点信息用于PathNo映射...")
-    site_info = query_adam_del_site_conf()
-    site_info = site_info[site_info['STAT_NAME'] != '营销服务中心']
+    # PathNo 映射：PlanPath 整数索引 (1-based) → DMAT 列标签中的 ORG_NO
     Path_no = []
     for planpath in DelivPlan['PlanPath']:
-        p = []
-        for idx in planpath:
-            p.append(site_info.loc[idx-1,'ORG_NO'])
+        p = [org_labels[idx] for idx in planpath]
         Path_no.append(p)
     DelivPlan['PathNo'] = Path_no
     logging.info(f"PathNo映射完成，示例: {Path_no[0] if Path_no else '空'}")
@@ -687,6 +710,26 @@ def AdjustDaliyDelivery(date:str):
     logging.info("开始 GenerateDelivPlan...")
     DelivPlan = GenerateDelivPlan(DelivPlan,Demands,SubTypeList)
     logging.info(f"GenerateDelivPlan 完成, {len(DelivPlan)} 行")
+
+    # 计算每站分段里程
+    seg_dis_list = []
+    for _, row in DelivPlan.iterrows():
+        planpath = row['PlanPath']
+        segs = [DMAT[0, planpath[0]]]
+        for j in range(1, len(planpath)):
+            segs.append(DMAT[planpath[j-1], planpath[j]])
+        seg_dis_list.append(segs)
+    DelivPlan['SegDis'] = seg_dis_list
+
+    # 校验：日补库需求总量 vs 配送计划总量
+    total_demand_pieces = Demands.values.sum()
+    total_deliv_pieces = 0
+    for _, row in DelivPlan.iterrows():
+        for stop_pieces in row['DevicePieces']:
+            total_deliv_pieces += sum(stop_pieces)
+    total_deliv_boxes = sum(sum(d) if hasattr(d, '__iter__') else d for d in DelivPlan['DeNum'])
+    logging.info(f"[校验] 日补库需求总件数: {int(total_demand_pieces)}, 配送计划总件数: {int(total_deliv_pieces)}, 差异: {int(total_demand_pieces - total_deliv_pieces)}")
+    logging.info(f"[校验] 配送计划总箱数: {int(total_deliv_boxes)}")
 
     logging.info("开始 GenerateSchemeTables...")
     MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap, CarTypeStrList)
