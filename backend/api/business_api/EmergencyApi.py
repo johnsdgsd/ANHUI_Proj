@@ -3,7 +3,7 @@
 提供紧急补库方案生成、查询等功能
 """
 from flask import Blueprint, request, jsonify
-from backend.EmergReplenish.EmergReplenish import run_emergency_replenishment
+from backend.EmergReplenish.EmergReplenishV2 import run_emergency_replenishment_v2
 from backend.global_optimization.logger import logger
 from datetime import datetime
 
@@ -17,7 +17,7 @@ def generate_emergency_scheme():
     生成紧急补库方案
     """
     try:
-        res = run_emergency_replenishment()
+        res = run_emergency_replenishment_v2()
         return jsonify(res)
 
     except Exception as e:

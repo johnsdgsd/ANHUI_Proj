@@ -16,6 +16,7 @@ def generate_multi_scheme_async():
     """
     生成多套方案
     """
+    from backend.api.data_api.fetch_data import update_adam_pre_conc_stat
     try:
         data = request.get_json() or {}
         preMonth = data.get('preMonth')
@@ -30,10 +31,11 @@ def generate_multi_scheme_async():
         # 使用线程异步执行方案生成
         # 注意：args参数需要是元组，单个参数后面要加逗号
         try:
-
+            update_adam_pre_conc_stat(int(preConcId), '02')
             thread = threading.Thread(target=GenerateMutiOrderScheme, args=(preMonth,))
             # 启动线程
             thread.start()
+            update_adam_pre_conc_stat(int(preConcId), '04')
         except Exception as e:
             response = {
                 "code": 500,
@@ -49,6 +51,7 @@ def generate_multi_scheme_async():
         return jsonify(response)
         
     except Exception as e:
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "code": 500,
             "message": f"生成多套方案失败: {str(e)}"
@@ -59,6 +62,7 @@ def generate_multi_scheme():
     """
     生成多套方案，同步执行
     """
+    from  backend.api.data_api.fetch_data import update_adam_pre_conc_stat
     try:
         data = request.get_json() or {}
         preMonth = data.get('preMonth')
@@ -71,17 +75,20 @@ def generate_multi_scheme():
             }), 400
 
         # 同步执行
+        update_adam_pre_conc_stat(int(preConcId), '02')
         res = GenerateMutiOrderScheme(preMonth)
         # 立即返回响应
         response = {
             "code": 200,
             "message": "方案生成成功"
         }
+        update_adam_pre_conc_stat(int(preConcId), '03')
         
         return jsonify(response)
         
     except Exception as e:
         logger.error("执行全局优化失败", exc_info=True)
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "code": 500,
             "message": f"生成多套方案失败: {str(e)}"

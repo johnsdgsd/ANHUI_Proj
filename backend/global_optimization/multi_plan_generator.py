@@ -884,57 +884,29 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
         items.append((tag, cost, itt, exec_ym))
         logger.info(f"方案 {tag}: 成本={cost}, 周转={itt:.4f}, 年月={exec_ym}")
 
-    # 按成本和周转排序
-    items_by_cost = sorted(items, key=lambda x: x[1])          # 成本升序
-    items_by_itt = sorted(items, key=lambda x: x[2], reverse=True)  # 周转降序
-
-    min_cost_tag = items_by_cost[0][0]
-    max_itt_tag = items_by_itt[0][0]
+    # 按成本升序、周转降序排序
+    items_by_cost = sorted(items, key=lambda x: x[1])
+    items_by_itt = sorted(items, key=lambda x: x[2], reverse=True)
 
     focus_map = {}
 
-    if min_cost_tag == max_itt_tag:
-        # 方案A同时成本最低和周转最高 -> A为综合最优(03)
-        logger.info(f"方案 {min_cost_tag} 同时满足成本最低和周转最高，设为综合最优(03)")
-        focus_map[min_cost_tag] = '03'
-        # 剩余两个方案
-        remaining = [it for it in items if it[0] != min_cost_tag]
-        if len(remaining) == 2:
-            # 剩余中成本较低者 -> 成本优先(01)，周转较高者 -> 周转优先(02)
-            # 注意：如果剩余中成本最低和周转最高是同一个方案，则强制分配（避免重叠）
-            rem1, rem2 = remaining[0], remaining[1]
-            # 找出成本较低的方案
-            cost_lower = rem1 if rem1[1] <= rem2[1] else rem2
-            # 找出周转较高的方案
-            itt_higher = rem1 if rem1[2] >= rem2[2] else rem2
-            if cost_lower[0] == itt_higher[0]:
-                # 同一个方案在剩余中双优，则将其设为01（成本优先），另一个设为02
-                logger.warning(f"剩余方案中 {cost_lower[0]} 同时成本最低和周转最高，强制分配为成本优先(01)")
-                focus_map[cost_lower[0]] = '01'
-                other = rem1 if rem1[0] != cost_lower[0] else rem2
-                focus_map[other[0]] = '02'
-            else:
-                focus_map[cost_lower[0]] = '01'
-                focus_map[itt_higher[0]] = '02'
-        else:
-            # 防御：剩余不足两个，全部设为03（但理论上不会发生）
-            for it in remaining:
-                focus_map[it[0]] = '03'
-    else:
-        # 正常情况：成本最低和周转最高不同
-        focus_map[min_cost_tag] = '01'
-        focus_map[max_itt_tag] = '02'
-        # 剩下的方案为03
-        for it in items:
-            if it[0] not in focus_map:
-                focus_map[it[0]] = '03'
-                break
+    # 成本最低 → 01
+    cost_tag = items_by_cost[0][0]
+    focus_map[cost_tag] = '01'
+    logger.info(f"方案 {cost_tag} 成本最低，设为成本优先(01)")
 
-    # 确保所有方案都有侧重（防御）
-    for tag, _, _, _ in items:
-        if tag not in focus_map:
-            focus_map[tag] = '03'
-            logger.warning(f"方案 {tag} 未分配侧重，默认设为均衡(03)")
+    # 剩余两个中周转最高 → 02
+    remaining = [it for it in items if it[0] != cost_tag]
+    if remaining:
+        rem_by_itt = sorted(remaining, key=lambda x: x[2], reverse=True)
+        itt_tag = rem_by_itt[0][0]
+        focus_map[itt_tag] = '02'
+        logger.info(f"方案 {itt_tag} 周转最高（剩余中），设为周转优先(02)")
+        # 最后一个 → 03
+        for it in remaining:
+            if it[0] != itt_tag:
+                focus_map[it[0]] = '03'
+                logger.info(f"方案 {it[0]} 设为均衡(03)")
 
     # 修改 DataFrame
     for tag, df in scheme_items.items():

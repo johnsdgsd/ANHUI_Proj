@@ -67,7 +67,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         return str(val).replace('.0', '').strip() if str(val) not in ('nan', 'None', '') else None
 
     # =========================================================================
-    # 阶段一：先生成配送方案 (100%覆盖需求，永不丢单)
+    # 阶段一：先生成配送方案
     # =========================================================================
     logging.info(">>> [阶段一] 生成精确到每一辆车的配送路线与日历分配...")
     work_days_list = [d for d in all_days if is_workday_safe(d)]
@@ -103,39 +103,39 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             org_no = locations.loc[loc_1based, 'ORG_NO']
 
             for sub_idx in range(SubTypeNum):
-                # 加入 + 0.0001 容差，防止 vol_needed = 0.99999 被卡死
                 if Sim_Demands[loc_1based - 1, sub_idx] > 0 and vol_needed > 0.0001:
                     dev_code_str = SubTypeList.loc[sub_idx, 'DEV_CODE_NO']
                     unit_arr = TypeList.loc[TypeList['DEV_CODE_NO'] == dev_code_str, 'UnitPerBox'].values
                     unit_per_box = unit_arr[0] if len(unit_arr) > 0 else 5
                     vol_mult = 2.5 if get_cls(dev_code_str) == '02' else 1.0
 
-                    # 【核心修复】：完全信任 de_nums，移除之前的超载强制截断，精准拆箱
-                    max_boxes_for_node = max(0, math.floor((vol_needed + 0.0001) / vol_mult))
-                    max_allowable_qty = max_boxes_for_node * unit_per_box
+                    remaining_cap = max_cap_boxes - total_vol_used
+                    max_boxes_phys = math.floor((remaining_cap + 0.0001) / vol_mult)
+                    max_boxes_quota = math.ceil((vol_needed - 0.0001) / vol_mult)
 
-                    qty_needed = min(Sim_Demands[loc_1based - 1, sub_idx], max_allowable_qty)
+                    allowable_boxes = max(0, min(max_boxes_quota, max_boxes_phys))
+                    qty_needed = min(Sim_Demands[loc_1based - 1, sub_idx], allowable_boxes * unit_per_box)
 
                     if qty_needed > 0:
                         used_boxes = math.ceil(qty_needed / unit_per_box)
                         vol_used = used_boxes * vol_mult
 
-                        total_vol_used += vol_used
-                        vol_needed -= vol_used
+                        if total_vol_used + vol_used <= max_cap_boxes + 0.0001:
+                            total_vol_used += vol_used
+                            vol_needed -= vol_used
+                            Sim_Demands[loc_1based - 1, sub_idx] -= qty_needed
 
-                        details_data.append({
-                            'REC_ORG_NO': org_no, 'DEV_CODE': dev_code_str,
-                            'DEV_CLS': get_cls(dev_code_str), 'DEV_CATEG': get_cat(dev_code_str),
-                            'PLAN_DIST_NUM': qty_needed, 'PLAN_BOX_NUM': used_boxes,
-                            'VOL_BOX_NUM': float(vol_used), 'DIST_SEQ': step_idx + 1,
-                            'LOAD_SEQ': len(path_nodes) - step_idx,
-                            'DIST_SEGMENT': float(dist_segment)
-                        })
-                        Sim_Demands[loc_1based - 1, sub_idx] -= qty_needed
-                        Total_Delivery_Needed[sub_idx] += qty_needed
+                            details_data.append({
+                                'REC_ORG_NO': org_no, 'DEV_CODE': dev_code_str,
+                                'DEV_CLS': get_cls(dev_code_str), 'DEV_CATEG': get_cat(dev_code_str),
+                                'PLAN_DIST_NUM': qty_needed, 'PLAN_BOX_NUM': used_boxes,
+                                'VOL_BOX_NUM': float(vol_used), 'DIST_SEQ': step_idx + 1,
+                                'LOAD_SEQ': len(path_nodes) - step_idx,
+                                'DIST_SEGMENT': float(dist_segment)
+                            })
+                            Total_Delivery_Needed[sub_idx] += qty_needed
 
         if details_data:
-            # 强制封顶，杜绝 100.4% 的情况
             actual_load_rate = min(1.0, total_vol_used / max_cap_boxes) if max_cap_boxes > 0 else 0
             unit_price = float(VeUnitPrice[int(ve_type) - 1]) if len(VeUnitPrice) >= int(ve_type) and float(
                 VeUnitPrice[int(ve_type) - 1]) > 0 else 0.0695
@@ -146,69 +146,104 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                            'UNIT_PRICE': unit_price}
             GlobalDelivPlan.append({'master': master_data, 'details': details_data})
 
-    # 日志输出：诊断是否有真漏单（在上述修复后，此处应当绝对不会触发）
-    # for sub_idx in range(SubTypeNum):
-    #     for loc_idx in range(LocationNum):
-    #         if Sim_Demands[loc_idx, sub_idx] > 0:
-    #             logging.error(
-    #                 f"【严重警告】网点 {locations.iloc[loc_idx + 1]['ORG_NO']} 仍有 {Sim_Demands[loc_idx, sub_idx]} 件需求未被配送分配！")
-
     # =========================================================================
-    # 阶段二：反向拉动检定需求 (配送要多少缺口，就恰好检定多少)
+    # 阶段二：严格执行：待检与非后5天强制排满，遵守次日开工铁律
     # =========================================================================
-    logging.info(">>> [阶段二] 配送完成！正在计算缺口反推检定产线...")
+    logging.info(">>> [阶段二] 正在计算缺口与当月到货清库存计划...")
 
     Inspect_Target = np.zeros(SubTypeNum)
     for sub_idx in range(SubTypeNum):
         Inspect_Target[sub_idx] = max(0, Total_Delivery_Needed[sub_idx] - InitQuaStock[sub_idx])
 
     DevCatToLines = defaultdict(list)
+    line_idx = 0
     if not DeviceCaps.empty:
         for _, row in DeviceCaps.iterrows():
+            line_idx += 1  # 物理线ID，防止产能重叠！
             veri_cat = str(row['VERI_CATEG']).strip().zfill(2)
             veri_type = str(row['VERI_TYPE']).strip().zfill(2)
-            cap = int(pd.to_numeric(row['VDRILINE_NUM'], errors='coerce') or 0) * \
-                  int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1) * \
-                  int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
+
+            v_num = int(pd.to_numeric(row['VDRILINE_NUM'], errors='coerce') or 0)
+            p_num = int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1)
+            pc_num = int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
+            cap = v_num * p_num * pc_num
+            if cap <= 0: cap = 200
+
             dev_categ_str = str(row.get('DEV_CATEG', '')).strip()
             for dc in dev_categ_str.replace('，', ',').split(','):
                 if dc.strip():
-                    DevCatToLines[dc.strip()].append({'veri_cat': veri_cat, 'veri_type': veri_type, 'batch_cap': cap})
+                    DevCatToLines[dc.strip()].append({
+                        'line_id': f"L_{line_idx}",
+                        'veri_cat': veri_cat,
+                        'veri_type': veri_type,
+                        'batch_cap': cap
+                    })
 
+    # 独立跟踪每条物理线的耗时
     HoursUsed = {d: defaultdict(float) for d in all_days}
+    QtyUsed = {d: defaultdict(int) for d in all_days}
+    CatMaxHrs = {d: defaultdict(float) for d in all_days}
 
     LotObjects = []
+
     for idx, row in LotList.iterrows():
         dev_code_str = row['DEV_CODE_NO']
         sub_idx = DevCodeToIndex.get(dev_code_str)
-        if sub_idx is None or Inspect_Target[sub_idx] <= 0: continue
-
-        rem = int(row['RemNum'])
-        take = min(rem, Inspect_Target[sub_idx])
-        Inspect_Target[sub_idx] -= take
+        if sub_idx is None:
+            continue
 
         arr_dt_pd = pd.to_datetime(row['PLAN_DATE'])
         arr_dt = datetime(arr_dt_pd.year, arr_dt_pd.month, arr_dt_pd.day) if not pd.isna(arr_dt_pd) else sim_start_dt
 
+        rem = int(row['RemNum'])
+        if rem <= 0:
+            continue
+
+        # 识别是否为“待检库存”
+        is_realtime = (str(row.get('SOURCE_TYPE', '')).upper() == 'REALTIME')
+        days_to_end = (month_end_dt - arr_dt).days
+
+        need_for_delivery = 0
+        if Inspect_Target[sub_idx] > 0:
+            need_for_delivery = min(rem, Inspect_Target[sub_idx])
+
+        # 【核心意志】：完全遵从您的三段式规则
+        if is_realtime:
+            # 1. 待检库存，无条件全部检定
+            take = rem
+        elif days_to_end >= 5:
+            # 2. 除了后五天的到货，全部检定
+            take = rem
+        else:
+            # 3. 后五天的到货，只检定满足配送缺口的部分
+            take = need_for_delivery
+
+        if take <= 0:
+            continue
+
+        if Inspect_Target[sub_idx] > 0:
+            Inspect_Target[sub_idx] -= need_for_delivery
+
         LotObjects.append({
             'idx': idx, 'row': row,
             'orig_take': take, 'rem': take,
+            # 【恢复物理铁律】：绝对遵循到货第二天才能检定！
             'earliest': max(arr_dt + timedelta(days=1), sim_start_dt),
             'bgn': None, 'end': None, 'veri_type_used': None
         })
 
-    # 【8级漏斗】
-
+    # 【8级漏斗：极致压榨产线】
     inspection_passes = [
-        {'max_h': 8, 'auto': True, 'wd': True},  # 1. 8h自动
-        {'max_h': 12, 'auto': True, 'wd': True},  # 2. 12h自动
-        {'max_h': 24, 'auto': True, 'wd': True},  # 3. 24小时自动
-        {'max_h': 24, 'auto': True, 'wd': False},  # 4. 节假日自动
-        {'max_h': 8, 'auto': False, 'wd': True},  # 5. 8h人工
-        {'max_h': 12, 'auto': False, 'wd': True},  # 6. 12h人工
-        {'max_h': 24, 'auto': False, 'wd': True},  # 7. 24h人工
-        {'max_h': 24, 'auto': False, 'wd': False}  # 8. 节假日人工
+        {'max_h': 8, 'auto': True, 'wd': True},
+        {'max_h': 12, 'auto': True, 'wd': True},
+        {'max_h': 24, 'auto': True, 'wd': True},
+        {'max_h': 24, 'auto': True, 'wd': False},
+        {'max_h': 8, 'auto': False, 'wd': True},
+        {'max_h': 12, 'auto': False, 'wd': True},
+        {'max_h': 24, 'auto': False, 'wd': True},
+        {'max_h': 24, 'auto': False, 'wd': False}
     ]
+
     for p in inspection_passes:
         for lot in LotObjects:
             if lot['rem'] <= 0: continue
@@ -229,12 +264,18 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                     if p['wd'] and not is_wd: continue
                     if not p['wd'] and is_wd: continue
 
-                    avail_h = p['max_h'] - HoursUsed[d][line['veri_cat']]
+                    # 精确到具体物理产线的空闲时间，杜绝互抢时间！
+                    avail_h = p['max_h'] - HoursUsed[d][line['line_id']]
                     if avail_h > 0:
                         do_qty = min(lot['rem'], math.floor(avail_h * pph))
                         if do_qty > 0:
                             lot['rem'] -= do_qty
-                            HoursUsed[d][line['veri_cat']] += do_qty / pph
+                            used_h = do_qty / pph
+                            HoursUsed[d][line['line_id']] += used_h
+                            QtyUsed[d][line['veri_cat']] += do_qty
+                            CatMaxHrs[d][line['veri_cat']] = max(CatMaxHrs[d][line['veri_cat']],
+                                                                 HoursUsed[d][line['line_id']])
+
                             if not lot['bgn'] or d < lot['bgn']: lot['bgn'] = d
                             if not lot['end'] or d > lot['end']: lot['end'] = d
                             lot['veri_type_used'] = line['veri_type']
@@ -243,6 +284,10 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
     DetectPlanResult = []
     for lot in LotObjects:
+        if lot['rem'] > 0:
+            logging.warning(
+                f"⚠️ [产能告急] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} (设备 {lot['row']['DEV_CODE_NO']}) 仍有 {lot['rem']} 只未能在本月排产，这部分是被物理产能极限卡住顺延至下月的！")
+
         if lot['bgn'] is None: continue
         actual_detected_num = lot['orig_take'] - lot['rem']
 
@@ -260,13 +305,16 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
     WorkArrangeResult = []
     for d in all_days:
-        for cat, hrs in HoursUsed[d].items():
-            if hrs <= 0: continue
+        for cat, qty in QtyUsed[d].items():
+            if qty <= 0: continue
+
+            hrs = CatMaxHrs[d][cat]
             w_flag = '02' if is_workday_safe(d) else '03'
             d_dur = '8h' if hrs <= 8.1 else ('12h' if hrs <= 12.1 else '24h')
             WorkArrangeResult.append({
                 'VERI_CATEG': cat, 'WORK_DATE': d.strftime('%Y-%m-%d'), 'WORK_FLAG': w_flag,
-                'DETECT_DUR': d_dur, 'CAPACITY_NUM': math.floor(hrs * 2500)
+                'DETECT_DUR': d_dur,
+                'CAPACITY_NUM': int(qty)
             })
 
     return pd.DataFrame(DetectPlanResult), GlobalDelivPlan, pd.DataFrame(WorkArrangeResult)

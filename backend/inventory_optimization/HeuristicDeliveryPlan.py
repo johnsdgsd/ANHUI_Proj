@@ -270,6 +270,128 @@ def _build_delivery_plan(best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
     return MainScheme, DetailScheme
 
 
+def _merge_scheme_tables(MainDf, DetailDf, VeCap, CarTypeStrList, max_stops, DMAT_arr, org_labels):
+    """归并低满载率配送方案（基于重算后的真实装载率）"""
+    if len(MainDf) <= 1:
+        logging.info("无需归并")
+        return MainDf, DetailDf
+
+    org_to_idx = {str(org): i for i, org in enumerate(org_labels)}
+    car_type_to_idx = {ct: i for i, ct in enumerate(CarTypeStrList)}
+
+    main_rows = MainDf.to_dict('records')
+    detail_groups = {}
+    for _, row in DetailDf.iterrows():
+        sid = row['DIST_SCHEME_ID']
+        detail_groups.setdefault(sid, []).append(row.to_dict())
+
+    total_merged = 0
+
+    while True:
+        best_pair = None
+        best_combined_rate = -1.0
+
+        for i in range(len(main_rows)):
+            for j in range(i + 1, len(main_rows)):
+                if main_rows[i]['CAR_TYPE'] != main_rows[j]['CAR_TYPE']:
+                    continue
+                ri = float(str(main_rows[i]['LOAD_RATE']).rstrip('%'))
+                rj = float(str(main_rows[j]['LOAD_RATE']).rstrip('%'))
+                if ri + rj >= 100:
+                    continue
+
+                sid_i = main_rows[i]['DIST_SCHEME_ID']
+                sid_j = main_rows[j]['DIST_SCHEME_ID']
+                stops_i = {str(d['REC_ORG_NO']) for d in detail_groups.get(sid_i, [])}
+                stops_j = {str(d['REC_ORG_NO']) for d in detail_groups.get(sid_j, [])}
+                if len(stops_i | stops_j) > max_stops:
+                    continue
+
+                if ri + rj > best_combined_rate:
+                    best_combined_rate = ri + rj
+                    best_pair = (i, j)
+
+        if best_pair is None:
+            break
+
+        i, j = best_pair
+        sid_i = main_rows[i]['DIST_SCHEME_ID']
+        sid_j = main_rows[j]['DIST_SCHEME_ID']
+        car_type = main_rows[i]['CAR_TYPE']
+        rate_i = float(str(main_rows[i]['LOAD_RATE']).rstrip('%'))
+        rate_j = float(str(main_rows[j]['LOAD_RATE']).rstrip('%'))
+
+        # 合并明细行
+        combined_details = detail_groups.pop(sid_i, []) + detail_groups.pop(sid_j, [])
+
+        # 按站点汇总箱数，确定最优访问顺序
+        stop_boxes = defaultdict(float)
+        for d in combined_details:
+            stop_boxes[str(d['REC_ORG_NO'])] += float(d['PLAN_BOX_NUM'])
+
+        unique_stops = list(stop_boxes.keys())
+        best_order = unique_stops
+        best_path_dist = float('inf')
+        for perm in itertools.permutations(unique_stops):
+            dist = DMAT_arr[0, org_to_idx[perm[0]]]
+            for k in range(len(perm) - 1):
+                dist += DMAT_arr[org_to_idx[perm[k]], org_to_idx[perm[k + 1]]]
+            if dist < best_path_dist:
+                best_path_dist = dist
+                best_order = list(perm)
+
+        # 重建明细行（保留原始 DIST_SCHEME_DET_ID，DIST_SCHEME_ID 沿用 sid_i）
+        total_merged += 1
+        new_details = []
+        for pos, org in enumerate(best_order):
+            dist_seq = pos + 1
+            load_seq = len(best_order) - pos
+            org_details = [d for d in combined_details if str(d['REC_ORG_NO']) == org]
+            for d in org_details:
+                nd = d.copy()
+                nd['DIST_SCHEME_ID'] = sid_i
+                nd['DIST_SEQ'] = dist_seq
+                nd['LOAD_SEQ'] = load_seq
+                # 重新计算分段里程
+                if pos == 0:
+                    nd['EST_TOT_DIST_MIST'] = round(DMAT_arr[0, org_to_idx[org]], 4)
+                else:
+                    prev_org = best_order[pos - 1]
+                    nd['EST_TOT_DIST_MIST'] = round(DMAT_arr[org_to_idx[prev_org], org_to_idx[org]], 4)
+                new_details.append(nd)
+
+        # 计算新装载率（互感器 ×2.5）
+        real_boxes = 0.0
+        for d in new_details:
+            boxes = float(d['PLAN_BOX_NUM'])
+            if d.get('DEV_CLS') == '02':
+                boxes *= 2.5
+            real_boxes += boxes
+        ve_idx = car_type_to_idx.get(car_type, -1)
+        ve_cap = VeCap[ve_idx] if 0 <= ve_idx < len(VeCap) else 1
+        new_load_rate = f"{min(real_boxes / ve_cap * 100, 100.0):.1f}%"
+
+        # 更新主表行（保留 sid_i，更新装载率，移除 sid_j）
+        main_rows[i]['LOAD_RATE'] = new_load_rate
+        main_rows[i]['UPDATE_DATE'] = datetime.datetime.now().strftime('%Y-%m-%d')
+        main_rows = [r for idx, r in enumerate(main_rows) if idx != j]
+        detail_groups[sid_i] = new_details
+
+        logging.info(f"[归并] {car_type}: 合并2条方案, "
+                     f"原满载率={rate_i:.1f}%+{rate_j:.1f}%→{new_load_rate}, 站点数={len(best_order)}")
+
+    if total_merged > 0:
+        # 重建 DataFrame
+        all_details = [d for details in detail_groups.values() for d in details]
+        new_MainDf = pd.DataFrame(main_rows)
+        new_DetailDf = pd.DataFrame(all_details) if all_details else pd.DataFrame(columns=DetailDf.columns)
+        logging.info(f"[归并] 共归并 {total_merged} 对方案, 最终 {len(new_MainDf)} 条主表记录")
+        return new_MainDf, new_DetailDf
+    else:
+        logging.info("无需归并")
+        return MainDf, DetailDf
+
+
 # ==================== 主入口 ====================
 
 def AdjustDaliyDeliveryV2(date: str, max_stops: int = 5, max_iter: int = 600):
@@ -306,14 +428,16 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
         delete_adam_dist_scheme_by_id
     )
 
-    # 删除当天已有配送方案
+    # 删除当天未确认(DIST_FLAG!='02')的配送方案，保留已确认的
     try:
         existing = query_adam_dist_scheme_by_date_range(date, date)
         if not existing.empty:
-            for sid in existing['DIST_SCHEME_ID'].tolist():
+            unconfirmed = existing[existing['DIST_FLAG'] != '02']
+            for sid in unconfirmed['DIST_SCHEME_ID'].tolist():
                 delete_adam_dist_scheme_det_by_scheme_id(sid)
                 delete_adam_dist_scheme_by_id(sid)
-            logging.info(f"已删除当天 {len(existing)} 条旧配送方案")
+            kept = len(existing) - len(unconfirmed)
+            logging.info(f"已删除 {len(unconfirmed)} 条未确认方案" + (f"，保留 {kept} 条已确认方案" if kept > 0 else ""))
     except ValueError:
         logging.info(f"当天 ({date}) 无旧配送方案，跳过删除")
 
@@ -351,6 +475,9 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     }
     if not unit_sum:
         logging.warning("无配送需求，返回空方案")
+        return pd.DataFrame(columns=empty_cols['main']), pd.DataFrame(columns=empty_cols['detail'])
+    if sum(VNums) == 0:
+        logging.warning("无可用车辆（全部被已确认方案占用），返回空方案")
         return pd.DataFrame(columns=empty_cols['main']), pd.DataFrame(columns=empty_cols['detail'])
 
     # 距离矩阵（LoadDelivData 已构建对称矩阵）
@@ -443,6 +570,13 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     MainScheme, DetailScheme = _build_delivery_plan(
         best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
         CarTypeStrList, date, DMAT_arr, org_labels
+    )
+
+    # ---- 5. 归并低满载率方案（基于重算后的真实装载率） ----
+    logging.info("-" * 40)
+    logging.info("归并低满载率方案...")
+    MainScheme, DetailScheme = _merge_scheme_tables(
+        MainScheme, DetailScheme, VeCap, CarTypeStrList, max_stops, DMAT_arr, org_labels
     )
 
     t_end = time.time()

@@ -3,6 +3,8 @@ import requests
 import pandas as pd
 from backend.config.config import API_CONFIG
 
+session = requests.Session()
+
 
 def query_device_install_data_by_month_range(start_month:int,end_month: int):
     try:
@@ -14,7 +16,7 @@ def query_device_install_data_by_month_range(start_month:int,end_month: int):
             "start_month":start_month,
             "end_month":end_month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -40,7 +42,7 @@ def query_aps_inventory_item_cost():
         endpoint = '/exec/gk-adam-query-aps-inventory-item-cost'
         url = f"http://{host}:{port}{endpoint}"
         
-        response = requests.post(url, json={})
+        response = session.post(url, json={})
         response.raise_for_status()
         
         data = response.json()
@@ -68,7 +70,7 @@ def query_aps_inventory_init_stock_by_month(month: int):
         json = {
             "month": month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -113,7 +115,7 @@ def insert_into_aps_inventory_fulfill_rate(df: pd.DataFrame):
         records = df.rename(columns=str.lower).to_dict('records')
         
         for record in records:
-            response = requests.post(url, json=record)
+            response = session.post(url, json=record)
             response.raise_for_status()
         
         return {
@@ -152,7 +154,7 @@ def insert_into_aps_inventory_replenish(df: pd.DataFrame):
         records = df.rename(columns=str.lower).to_dict('records')
         
         for record in records:
-            response = requests.post(url, json=record)
+            response = session.post(url, json=record)
             response.raise_for_status()
         
         return {
@@ -191,7 +193,7 @@ def insert_into_aps_inventory_replenish_qty(df: pd.DataFrame):
         records = df.rename(columns=str.lower).to_dict('records')
         
         for record in records:
-            response = requests.post(url, json=record)
+            response = session.post(url, json=record)
             response.raise_for_status()
         
         return {
@@ -238,7 +240,7 @@ def insert_into_adam_plan_day_ias_pre(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -269,7 +271,7 @@ def query_aps_qua_sto_by_month(rele_month:int):
         json = {
             "rele_month":rele_month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -297,7 +299,7 @@ def query_aps_unqua_sto_by_month(rele_month:int):
         json = {
             "rele_month":rele_month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -329,7 +331,7 @@ def query_adam_dist_scheme_by_date_range(start_date:str,end_date:str):
             "start_date":start_date,
             "end_date":end_date
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -360,7 +362,7 @@ def query_adam_dist_scheme_det_by_distschemeid(id:Number):
         json = {
             "id":id
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -389,7 +391,7 @@ def query_adam_pre_range_info():
         endpoint = '/exec/gk-adam-query_adam_pre_range_info'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -423,7 +425,7 @@ def query_adam_qua_stock_sample_by_year_month(year:str, month:str):
             "year":year,
             "month":month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -455,7 +457,7 @@ def query_adam_pend_stock_sample_by_year_month(year:str, month:str):
             "year":year,
             "month":month
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -488,7 +490,7 @@ def query_adam_wd_dmd_pre_by_year_month_and_pretype(year:str, month:str, pre_typ
             "month":month,
             "pre_type":pre_type
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -517,7 +519,7 @@ def query_adam_y_mgt_org():
         endpoint = '/exec/gk-adam-query_adam_y_mgt_org'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -546,7 +548,7 @@ def query_adam_spec_code_config():
         endpoint = '/exec/gk-adam-query_adam_spec_code_config'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -575,7 +577,7 @@ def query_adam_del_site_conf():
         endpoint = '/exec/gk-adam-query_adam_del_site_conf'
         url = f"http://{host}:{port}{endpoint}"
         json = {}
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -606,7 +608,7 @@ def query_adam_plan_day_ias_pre_by_date(date:str):
         json = {
             "date":date
         }
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -660,7 +662,7 @@ def insert_into_adam_dist_scheme(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -719,7 +721,7 @@ def insert_into_adam_dist_scheme_det(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -779,7 +781,7 @@ def insert_into_adam_stock_week_limt_pre(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -826,7 +828,7 @@ def query_adam_org_stock_sample_by_month(month: str):
             "stock_month": last_month  # 对应SQL里的 #{month}
         }
         
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
 
         data = response.json()
@@ -860,7 +862,7 @@ def query_adam_yqm_dmd_pre_by_year(year: str):
             "year": year  # 仅按年份查询
         }
         
-        response = requests.post(url, json=json)
+        response = session.post(url, json=json)
         response.raise_for_status()
         
         data = response.json()
@@ -914,7 +916,7 @@ def insert_into_adam_plan_month_ias_pre(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -971,7 +973,7 @@ def insert_into_adam_stock_month_limit_pre(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1013,7 +1015,7 @@ def query_adam_glob_strategy_scheme_by_month(yearmonth: str):
             "month": yearmonth
         }
 
-        response = requests.post(url, json=json_data)
+        response = session.post(url, json=json_data)
         response.raise_for_status()
 
         data = response.json()
@@ -1054,7 +1056,7 @@ def query_adam_glob_strategy_scheme_itt_by_schemeid(scheme_id: int):
             "scheme_id": scheme_id
         }
 
-        response = requests.post(url, json=json_data)
+        response = session.post(url, json=json_data)
         response.raise_for_status()
 
         data = response.json()
@@ -1099,7 +1101,7 @@ def query_adam_yqm_dmd_pre_by_year_month(year: str, month: str):
             "month": month
         }
         
-        response = requests.post(url, json=json_data)
+        response = session.post(url, json=json_data)
         response.raise_for_status()
         
         data = response.json()
@@ -1132,7 +1134,7 @@ def query_adam_veri_config_all():
         endpoint = '/exec/gk-adam-query_adam_veri_config_all'
         url = f"http://{host}:{port}{endpoint}"
         
-        response = requests.post(url, json={})
+        response = session.post(url, json={})
         response.raise_for_status()
         
         data = response.json()
@@ -1166,7 +1168,7 @@ def query_adam_single_cost_config_all():
         url = f"http://{host}:{port}{endpoint}"
 
         # 全量查询无需参数
-        response = requests.post(url, json={})
+        response = session.post(url, json={})
         response.raise_for_status()
 
         data = response.json()
@@ -1205,7 +1207,7 @@ def query_adam_glob_strategy_scheme_cost_by_schemeid(scheme_id: int):
             "scheme_id": scheme_id
         }
 
-        response = requests.post(url, json=json_data)
+        response = session.post(url, json=json_data)
         response.raise_for_status()
 
         data = response.json()
@@ -1267,7 +1269,7 @@ def insert_into_adam_glob_strategy_scheme_cost(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1324,7 +1326,7 @@ def insert_into_adam_glob_strategy_scheme_lps(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1394,7 +1396,7 @@ def insert_into_adam_glob_strategy_scheme(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1458,7 +1460,7 @@ def insert_into_adam_glob_strategy_scheme_itt(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1491,7 +1493,7 @@ def query_adam_stock_count_sample_all():
         url = f"http://{host}:{port}{endpoint}"
 
         # 全量查询不需要传参数
-        response = requests.post(url, json={})
+        response = session.post(url, json={})
         response.raise_for_status()
         data = response.json()
 
@@ -1522,7 +1524,7 @@ def update_adam_pre_conc_stat(pre_conc_id, stat):
             "stat": stat
         }
 
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         data = response.json()
 
@@ -1573,7 +1575,7 @@ def insert_into_adam_allot_day_plan_pre(df: pd.DataFrame):
 
         for record in records:
             try:
-                response = requests.post(url, json=record)
+                response = session.post(url, json=record)
                 response.raise_for_status()
                 success_count += 1
             except Exception as e:
@@ -1607,7 +1609,7 @@ def delete_adam_glob_strategy_scheme_cost(scheme_id):
         url = f"http://{host}:{port}{endpoint}"
 
         params = {"scheme_id": scheme_id}
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1630,7 +1632,7 @@ def delete_adam_glob_strategy_scheme_itt(scheme_id):
         params = {"scheme_id": scheme_id}
 
         # 发送删除请求
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
 
         return response.json()
@@ -1653,7 +1655,7 @@ def delete_adam_glob_strategy_scheme_lps(scheme_id):
         url = f"http://{host}:{port}{endpoint}"
 
         params = {"scheme_id": scheme_id}
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
 
         return response.json()
@@ -1679,7 +1681,7 @@ def delete_adam_glob_strategy_scheme_by_ym(exec_ym: str):
         params = {"exec_ym": exec_ym}
 
         # 发送请求
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
 
         return response.json()
@@ -1721,7 +1723,7 @@ def query_adam_run_dur_sample_by_org_no(org_no: str):
         url = f"http://{host}:{port}{endpoint}"
 
         params = {"org_no": org_no}
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         data = response.json()
 
@@ -1748,7 +1750,7 @@ def query_adam_run_dur_sample_all():
 
         # params = {"org_no": org_no}
         params= {}
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         data = response.json()
 
@@ -1783,7 +1785,7 @@ def query_adam_plan_month_ias_pre(pre_year: str, pre_month: str):
             "pre_month": pre_month
         }
 
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         data = response.json()
 
@@ -1810,7 +1812,7 @@ def query_adam_plan_day_ias_pre_by_month(data_month: str):
         url = f"http://{host}:{port}{endpoint}"
 
         params = {"data_month": data_month}
-        response = requests.post(url, json=params)
+        response = session.post(url, json=params)
         response.raise_for_status()
         data = response.json()
 
@@ -1839,7 +1841,7 @@ def query_vehicle_conf():
         endpoint = '/exec/gk-adam-query_vehicle_conf'
         url = f"http://{host}:{port}{endpoint}"
 
-        response = requests.post(url, json={})
+        response = session.post(url, json={})
         response.raise_for_status()
 
         data = response.json()
@@ -1849,7 +1851,7 @@ def query_vehicle_conf():
             VNums = np.array([9, 10, 6])
             VeUnitPrice = np.array([0.0695, 0.0695, 0.0695])
             VeTypeNum = 3
-            VeType = ['03','02','01']
+            VeType = ['01','02','03']
         else:
             if isinstance(data, list):
                 df = pd.DataFrame(data)
@@ -1877,7 +1879,7 @@ def delete_adam_dist_scheme_det_by_scheme_id(scheme_id):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_dist_scheme_det_by_scheme_id"
-        response = requests.post(url, json={"scheme_id": scheme_id})
+        response = session.post(url, json={"scheme_id": scheme_id})
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1890,7 +1892,7 @@ def delete_adam_dist_scheme_by_id(scheme_id):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_dist_scheme_by_id"
-        response = requests.post(url, json={"scheme_id": scheme_id})
+        response = session.post(url, json={"scheme_id": scheme_id})
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1903,7 +1905,7 @@ def delete_adam_stock_month_limit_pre_by_ym(year: str, month: str):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_stock_month_limit_pre_by_ym"
-        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response = session.post(url, json={"pre_year": year, "pre_month": month})
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1916,7 +1918,7 @@ def delete_adam_plan_month_ias_pre_by_ym(year: str, month: str):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_plan_month_ias_pre_by_ym"
-        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response = session.post(url, json={"pre_year": year, "pre_month": month})
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1929,7 +1931,7 @@ def delete_adam_stock_week_limt_pre_by_ym(year: str, month: str):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_stock_week_limt_pre_by_ym"
-        response = requests.post(url, json={"pre_year": year, "pre_month": month})
+        response = session.post(url, json={"pre_year": year, "pre_month": month})
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -1942,7 +1944,7 @@ def delete_adam_plan_day_ias_pre_by_month(year_month: str):
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
         url = f"http://{host}:{port}/exec/gk-adam-delete_adam_plan_day_ias_pre_by_month"
-        response = requests.post(url, json={"year_month": year_month})
+        response = session.post(url, json={"year_month": year_month})
         response.raise_for_status()
         return response.json()
     except Exception as e:

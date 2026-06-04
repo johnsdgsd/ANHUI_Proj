@@ -28,12 +28,13 @@ def LoadDelivData(date:str):
     )
     #完整的规格设备码信息
     SubTypeList = query_adam_spec_code_config()
-    # 互感器(DEV_CLS='02')按体积折算，装箱数/2
+    # 互感器(DEV_CLS='02')按3倍体积折算，保留原始装箱数用于最终输出
+    SubTypeList['PACK_BOX_NUM_ORIG'] = SubTypeList['PACK_BOX_NUM']
     mask_hgq = SubTypeList['DEV_CLS'] == '02'
     n_hgq = mask_hgq.sum()
     if n_hgq > 0:
-        SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] = (SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] / 2).astype(int)
-        logging.info(f'互感器体积折算: {n_hgq} 种规格的 PACK_BOX_NUM 已 /2')
+        SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] = (SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] / 3).round().astype(int)
+        logging.info(f'互感器体积折算(/3): {n_hgq} 种规格')
     logging.info(f'载入配送数据：查询到{len(SubTypeList)}条规格设备码数据')
     SubTypeNum = len(SubTypeList)
     
@@ -82,6 +83,33 @@ def LoadDelivData(date:str):
     MaxLen = 3 if len(set(LocationInd)) >=3 else 2
     #车辆信息（从数据库车型配置表读取）
     VeCap, VNums, VeUnitPrice, VeTypeNum,VeType = query_vehicle_conf()
+
+    # 扣除已确认配送计划(DIST_FLAG='02')的需求和车辆
+    from backend.api.data_api.fetch_data import (
+        query_adam_dist_scheme_by_date_range,
+        query_adam_dist_scheme_det_by_distschemeid)
+    try:
+        existing_schemes = query_adam_dist_scheme_by_date_range(date, date)
+        confirmed = existing_schemes[existing_schemes['DIST_FLAG'] == '02']
+        if not confirmed.empty and not tb2.empty:
+            org_to_idx = {org: i for i, org in enumerate(Location)}
+            dev_to_idx = {dev: j for j, dev in enumerate(SubType)}
+            for _, crow in confirmed.iterrows():
+                ct = crow['CAR_TYPE']
+                for vi in range(VeTypeNum):
+                    if VeType[vi] == ct and VNums[vi] > 0:
+                        VNums[vi] -= 1
+                        break
+                sid = crow['DIST_SCHEME_ID']
+                dets = query_adam_dist_scheme_det_by_distschemeid(sid)
+                for _, drow in dets.iterrows():
+                    oi = org_to_idx.get(drow['REC_ORG_NO'])
+                    di = dev_to_idx.get(drow['DEV_CODE'])
+                    if oi is not None and di is not None:
+                        Demands.iloc[oi, di] = max(0, Demands.iloc[oi, di] - drow['PLAN_DIST_NUM'])
+            logging.info(f'扣除已确认方案: {len(confirmed)} 条, 剩余可用车辆 {[int(n) for n in VNums]}')
+    except ValueError:
+        pass
 
     #计算网点间距离
     lons = tb1['LONGITUDE']
@@ -262,10 +290,9 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
                 dev_ratio = Qty / stop_pieces if stop_pieces > 0 else 0
                 DistExp = Price * (DeNum[StopIdx] / TotalBoxes if TotalBoxes > 0 else 0) * dev_ratio
 
-                BoxCap = SubTypeList.iloc[DevIdx]['PACK_BOX_NUM']
+                box_cap_col = 'PACK_BOX_NUM_ORIG' if DevCls == '02' else 'PACK_BOX_NUM'
+                BoxCap = SubTypeList.iloc[DevIdx][box_cap_col]
                 plan_box_num = int(np.ceil(Qty / BoxCap))
-                if DevCls == '02':
-                    plan_box_num = max(1, int(np.ceil(plan_box_num / 2)))
                 DetailRows.append({
                     'DIST_SCHEME_DET_ID': det_id,
                     'DIST_SCHEME_ID': scheme_id,
@@ -294,6 +321,23 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
 
     MainDf = pd.DataFrame(MainRows)[main_cols]
     DetailDf = pd.DataFrame(DetailRows)[detail_cols] if DetailRows else pd.DataFrame(columns=detail_cols)
+
+    # 重算装载率：互感器箱数 ×2.5 计算真实体积装载率
+    if not DetailDf.empty:
+        detail_box = DetailDf.copy()
+        detail_box['PLAN_BOX_NUM'] = detail_box['PLAN_BOX_NUM'].astype(float)
+        mask_hgq_detail = detail_box['DEV_CLS'] == '02'
+        detail_box.loc[mask_hgq_detail, 'PLAN_BOX_NUM'] *= 2.5
+        real_boxes = detail_box.groupby('DIST_SCHEME_ID')['PLAN_BOX_NUM'].sum()
+        car_type_to_idx = {ct: i for i, ct in enumerate(CarTypeStrList)}
+        for i, row in MainDf.iterrows():
+            sid = row['DIST_SCHEME_ID']
+            if sid in real_boxes.index:
+                ve_idx = car_type_to_idx.get(row['CAR_TYPE'], -1)
+                if 0 <= ve_idx < len(VeCap):
+                    rate = real_boxes[sid] / VeCap[ve_idx] * 100
+                    MainDf.at[i, 'LOAD_RATE'] = f"{rate:.1f}%"
+
     return MainDf, DetailDf
 
 
@@ -395,14 +439,16 @@ def AdjustDaliyDelivery(date:str):
         format="%(asctime)s - %(levelname)s - %(message)s",  # 设置日志格式
         stream=sys.stdout  # 将日志输出到控制台
     )
-    # 先删除当天已有配送方案
+    # 删除当天未确认(DIST_FLAG!='02')的配送方案，保留已确认的
     try:
         existing = query_adam_dist_scheme_by_date_range(date, date)
         if not existing.empty:
-            for sid in existing['DIST_SCHEME_ID'].tolist():
+            unconfirmed = existing[existing['DIST_FLAG'] != '02']
+            for sid in unconfirmed['DIST_SCHEME_ID'].tolist():
                 delete_adam_dist_scheme_det_by_scheme_id(sid)
                 delete_adam_dist_scheme_by_id(sid)
-            logging.info(f"已删除当天 {len(existing)} 条旧配送方案")
+            kept = len(existing) - len(unconfirmed)
+            logging.info(f"已删除 {len(unconfirmed)} 条未确认方案" + (f"，保留 {kept} 条已确认方案" if kept > 0 else ""))
     except ValueError:
         logging.info(f"当天 ({date}) 无旧配送方案，跳过删除")
 
@@ -417,6 +463,9 @@ def AdjustDaliyDelivery(date:str):
 
     DemandsBoxs = np.sum(DemandsBoxs, axis=1)  # 将 DemandsBoxs 按行求和
     MinDeliverNum=20 #最小装箱数
+    if np.sum(DemandsBoxs) > 0 and np.sum(VNums) == 0:
+        logging.warning("有配送需求但无可用车辆（全部被已确认方案占用），返回空方案")
+        return pd.DataFrame(), pd.DataFrame()
     logging.info("计算路径数")
     DMAT = DMAT.values
 

@@ -3,19 +3,18 @@
 用于生成库存调拨方案，平衡各仓库库存水平
 """
 import pandas as pd
+import time
 from datetime import datetime
 from itertools import product
 from backend.global_optimization.logger import logger
 from backend.api.data_api.fetch_data import (
     query_adam_stock_count_sample_all,
     query_adam_del_site_conf,
-    query_adam_spec_code_config
+    query_adam_spec_code_config,
+    insert_into_adam_allot_day_plan_pre
 )
 from geopy.distance import geodesic
 import logging
-import pandas as pd
-from datetime import datetime
-from backend.api.data_api.fetch_data import insert_into_adam_allot_day_plan_pre
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -67,12 +66,29 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
         (stock_df['MGT_ORG_CODE'].isin(valid_orgs)) &
         (stock_df['DEV_CODE_NO'].isin(valid_devices))
     ].copy()
-    high_stock = high_stock[['MGT_ORG_CODE', 'DEV_CODE_NO', 'HIGH_NUM']]
-    high_stock.rename(columns={'MGT_ORG_CODE': 'ORG_NO', 'HIGH_NUM': 'HIGH_QTY'}, inplace=True)
+    high_stock = high_stock[['MGT_ORG_CODE', 'DEV_CODE_NO', 'HIGH_NUM', 'STOCK_NUM']]
+    high_stock.rename(columns={'MGT_ORG_CODE': 'ORG_NO', 'HIGH_NUM': 'HIGH_QTY', 'STOCK_NUM': 'SRC_STOCK_NUM'}, inplace=True)
+    # 检查是否存在同单位同设备多条记录
+    dup_mask = high_stock.duplicated(subset=['ORG_NO', 'DEV_CODE_NO'], keep=False)
+    dup_count = dup_mask.sum()
+    if dup_count > 0:
+        logger.warning(f"发现 {dup_count} 条重复(单位,设备码)记录，明细:\n{high_stock[dup_mask].to_string()}")
+    # 检查原始数据：高库龄 > 库存的异常记录
+    abnormal = high_stock[high_stock['HIGH_QTY'] > high_stock['SRC_STOCK_NUM']]
+    if not abnormal.empty:
+        logger.warning(f"发现 {len(abnormal)} 条 HIGH_NUM > STOCK_NUM 的异常记录:\n{abnormal.to_string()}")
+    # 按单位-设备码汇总，确保 STOCK >= HIGH
+    high_stock = high_stock.groupby(['ORG_NO', 'DEV_CODE_NO'], as_index=False).sum()
+
+    # 构建新表库存字典（调拨仅针对新表）：按 (ORG_NO, DEV_CODE_NO) 汇总 STOCK_NUM
+    stock_new = stock_df[stock_df['OLD_NEW_FLAG'] == '01']
+    stock_lookup = stock_new.groupby(['MGT_ORG_CODE', 'DEV_CODE_NO'])['STOCK_NUM'].sum().to_dict()
 
     if high_stock.empty:
         logger.info("未发现需要调拨的高库龄设备")
-        return pd.DataFrame(columns=['SRC_ORG_CODE', 'TGT_ORG_CODE', 'DEV_CODE_NO', 'TRANSFER_NUM', 'CREATE_TIME'])
+        return pd.DataFrame(columns=['SRC_ORG_CODE', 'TGT_ORG_CODE', 'DEV_CODE_NO',
+                                        'TRANSFER_NUM', 'CREATE_TIME',
+                                        'SEND_STOCK_NUM', 'REC_STOCK_NUM', 'GLOBAL_SCHEME_ID'])
 
     logger.info(f"筛选后高库龄记录数: {len(high_stock)}")
     src_orgs = high_stock['ORG_NO'].nunique()
@@ -87,7 +103,7 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
         columns=['ORG_NO', 'DEV_CODE_NO']
     )
     all_combinations = all_combinations.merge(
-        high_stock[['ORG_NO', 'DEV_CODE_NO', 'HIGH_QTY']],
+        high_stock[['ORG_NO', 'DEV_CODE_NO', 'HIGH_QTY', 'SRC_STOCK_NUM']],
         on=['ORG_NO', 'DEV_CODE_NO'],
         how='left'
     )
@@ -95,6 +111,7 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
     all_combinations['HIGH_QTY'] = all_combinations['HIGH_QTY'].fillna(0)
 
     # 4. 按设备码生成调拨计划
+    global_scheme_id = int(time.time())
     transfer_records = []
     device_groups = list(all_combinations.groupby('DEV_CODE_NO'))
     total_devices = len(device_groups)
@@ -102,7 +119,7 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
 
     for idx, (dev_code, group) in enumerate(device_groups, 1):
         # 调出方：有高库龄的单位及其数量
-        src_rows = group[group['HAS_HIGH']][['ORG_NO', 'HIGH_QTY']].to_dict('records')
+        src_rows = group[group['HAS_HIGH']][['ORG_NO', 'HIGH_QTY', 'SRC_STOCK_NUM']].to_dict('records')
         # 调入方：无高库龄的单位列表
         tgt_orgs = group[~group['HAS_HIGH']]['ORG_NO'].tolist()
 
@@ -132,7 +149,10 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
                 'TGT_ORG_CODE': target_org,
                 'DEV_CODE_NO': dev_code,
                 'TRANSFER_NUM': qty,
-                'CREATE_TIME': datetime.now()
+                'CREATE_TIME': datetime.now(),
+                'SEND_STOCK_NUM': int(src['SRC_STOCK_NUM']) - qty,
+                'REC_STOCK_NUM': int(stock_lookup.get((target_org, dev_code), 0)) + qty,
+                'GLOBAL_SCHEME_ID': global_scheme_id
             })
 
         if idx % 20 == 0 or idx == total_devices:
@@ -140,9 +160,14 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
 
     if not transfer_records:
         logger.info("未生成有效调拨计划（可能所有设备码均无可调入单位）")
-        return pd.DataFrame(columns=['SRC_ORG_CODE', 'TGT_ORG_CODE', 'DEV_CODE_NO', 'TRANSFER_NUM', 'CREATE_TIME'])
+        return pd.DataFrame(columns=['SRC_ORG_CODE', 'TGT_ORG_CODE', 'DEV_CODE_NO',
+                                        'TRANSFER_NUM', 'CREATE_TIME',
+                                        'SEND_STOCK_NUM', 'REC_STOCK_NUM', 'GLOBAL_SCHEME_ID'])
 
     transfer_df = pd.DataFrame(transfer_records)
+    neg_mask = transfer_df['SEND_STOCK_NUM'] < 0
+    if neg_mask.any():
+        logger.warning(f"发现 {neg_mask.sum()} 条 SEND_STOCK_NUM 为负的记录:\n{transfer_df[neg_mask].to_string()}")
     total_qty = transfer_df['TRANSFER_NUM'].sum()
     distinct_src = transfer_df['SRC_ORG_CODE'].nunique()
     distinct_tgt = transfer_df['TGT_ORG_CODE'].nunique()
@@ -203,7 +228,7 @@ def build_priority_dict_from_distance() -> dict:
     return priority_dict
 
 
-def format_transfer_plan_for_db(transfer_df: pd.DataFrame, global_scheme_id: int = None) -> pd.DataFrame:
+def format_transfer_plan_for_db(transfer_df: pd.DataFrame) -> pd.DataFrame:
     """
     将 GetTransferScheme 生成的调拨计划转换为目标表 ADAM_ALLOT_DAY_PLAN_PRE 的结构。
 
@@ -252,9 +277,7 @@ def format_transfer_plan_for_db(transfer_df: pd.DataFrame, global_scheme_id: int
     transfer_df['REC_ORG_NO'] = transfer_df['TGT_ORG_CODE']
     transfer_df['DEV_CODE'] = transfer_df['DEV_CODE_NO']
     transfer_df['SEND_NUM'] = transfer_df['TRANSFER_NUM']
-    transfer_df['SEND_STOCK_NUM'] = None
-    transfer_df['REC_STOCK_NUM'] = None
-    transfer_df['GLOBAL_SCHEME_ID'] = global_scheme_id
+    transfer_df['GLOBAL_SCHEME_ID'] = transfer_df['GLOBAL_SCHEME_ID'].astype(int)
     transfer_df['SEND_REASON'] = '高库龄'
 
     # 6. 选择目标列并排序
