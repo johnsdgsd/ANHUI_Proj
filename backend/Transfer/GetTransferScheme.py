@@ -23,6 +23,9 @@ def GetTransferSchemeAndInsert():
     priority_dict = build_priority_dict_from_distance()
     tb = GetTransferScheme(priority_dict)
     scheme = format_transfer_plan_for_db(tb)
+    if not scheme.empty:
+        from backend.api.data_api.fetch_data import query_pk_next
+        scheme['ALLOT_DAY_PLAN_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_ALLOT_DAY_PLAN_PRE", len(scheme))]
     res = insert_into_adam_allot_day_plan_pre(scheme)
     return res
 

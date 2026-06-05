@@ -293,6 +293,8 @@ def run_emergency_replenishment_v2(
         return {'message': '紧急补库建议生成后无有效记录可插入', 'success': False}
 
     insert_df = pd.DataFrame(insert_records)
+    from backend.api.data_api.fetch_data import query_pk_next
+    insert_df['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_DAY_IAS_PRE_EMERGENCY", len(insert_df))]
     logger.info(f"[V2] 准备插入 {len(insert_df)} 条紧急补库记录")
     logger.info(f"[V2] 表结构：{insert_df.columns}")
 

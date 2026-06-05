@@ -107,6 +107,8 @@ def GetMonthThresholdAndOrder():
         except Exception as e:
             print(f'删除月度阈值旧数据失败（继续执行插入）: {e}', flush=True)
 
+        from backend.api.data_api.fetch_data import query_pk_next
+        Threshold['STOCK_MONTH_LIMIT_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_STOCK_MONTH_LIMIT_PRE", len(Threshold))]
         result=insert_into_adam_stock_month_limit_pre(Threshold)
         print(f'插入阈值数据结果{result}', flush=True)
 
@@ -116,6 +118,7 @@ def GetMonthThresholdAndOrder():
         except Exception as e:
             print(f'删除月度补库旧数据失败（继续执行插入）: {e}', flush=True)
 
+        Order['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_MONTH_IAS_PRE", len(Order))]
         result=insert_into_adam_plan_month_ias_pre(Order)
         print(f'插入补货量数据结果{result}', flush=True)
         update_adam_pre_conc_stat(int(preConcId),'03')

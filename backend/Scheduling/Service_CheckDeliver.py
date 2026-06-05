@@ -157,13 +157,17 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
             df_month_summary = df_detect.groupby(['DEV_CODE', 'DEV_CLS', 'DEV_CATEG'])[
                 'DETECT_PLAN_NUM'].sum().reset_index()
 
+            # =========================================================================
+            # 【核心修正】：加入精确到秒的时间戳，保证无论跑多少遍，编号绝对唯一！
+            # 规则: 34 + YY + 17 + MMDD + HHMMSS + 4位序号
+            # =========================================================================
             now_dt = datetime.now()
-            month_plan_prefix = f"34{now_dt.strftime('%y')}17{now_dt.strftime('%m')}{now_dt.strftime('%d')}"
+            month_plan_prefix = f"34{now_dt.strftime('%y')}17{now_dt.strftime('%m%d%H%M%S')}"
             month_plan_seq = 1
 
             for _, row in df_month_summary.iterrows():
                 safe_dev_code = str(row['DEV_CODE']).replace('.0', '').strip()
-                full_month_plan_no = f"{month_plan_prefix}{month_plan_seq:06d}"
+                full_month_plan_no = f"{month_plan_prefix}{month_plan_seq:04d}"
 
                 month_detect_db_list.append({
                     "month_detect_plan_pre_id": generate_safe_id(),

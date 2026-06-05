@@ -417,12 +417,13 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
                                      'PLAN_IAS_NUM', 'PRE_DATE', 'GLOBAL_SCHEME_ID']]
 
     timestamp = int(time.time()*1000)
-    DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = range(timestamp,timestamp+len(DaliyReplPlan))
     DaliyReplPlan['EST_STOCK_NUM'] = None
     # 添加状态和类型列
     DaliyReplPlan['DAILY_PLAN_STATUS'] = '01'
     DaliyReplPlan['REPLE_TASK_TYPE'] = '03'
     DaliyReplPlan['TASK_SOURCE'] = '03'
+    from backend.api.data_api.fetch_data import query_pk_next
+    DaliyReplPlan['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_DAY_IAS_PRE", len(DaliyReplPlan))]
     return DaliyReplPlan,insert_into_adam_plan_day_ias_pre(DaliyReplPlan)
 
 

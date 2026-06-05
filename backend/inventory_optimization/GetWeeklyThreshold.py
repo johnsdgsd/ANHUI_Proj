@@ -141,6 +141,8 @@ def GenerateWeeklyThreshold(year:str, month:str):
     except Exception as e:
         print(f'删除周度阈值旧数据失败（继续执行插入）: {e}', flush=True)
 
+    from backend.api.data_api.fetch_data import query_pk_next
+    WeeklyThreshold['STOCK_WEEK_LIMT_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_STOCK_WEEK_LIMT_PRE", len(WeeklyThreshold))]
     print(f"开始插入周度阈值数据，共 {len(WeeklyThreshold)} 条...", flush=True)
     insert_result = insert_into_adam_stock_week_limt_pre(WeeklyThreshold)
     print(f"插入周度阈值数据结果: {insert_result}", flush=True)

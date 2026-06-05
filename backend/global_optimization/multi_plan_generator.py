@@ -89,9 +89,28 @@ def GenerateMutiOrderScheme(yearMonth:str):
 
     GlobalSchemeItems = determine_scheme_focus(GlobalSchemeItems)
 
-    # 保存 epsilon 映射供下游算法使用
+    from backend.api.data_api.fetch_data import query_pk_next
+
+    new_tag_epsilon_map = {}
+    for tag in GlobalSchemeItems:
+        Item = GlobalSchemeItems[tag]
+        Cost = GlobalSchemeCost[tag]
+        Itt = GlobalSchemeITTs[tag]
+        Lps = GlobalSchemeLPS[tag]
+
+        new_id = int(query_pk_next("SEQ_ADAM_GLOB_STRATEGY_SCHEME", 1)[0])
+        new_tag_epsilon_map[new_id] = tag_epsilon_map[tag]
+        Item['SCHEME_ID'] = new_id
+        Itt['SCHEME_ID'] = new_id
+        Itt['ITT_DET_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_GLOB_STRATEGY_SCHEME_ITT", len(Itt))]
+        Lps['SCHEME_ID'] = new_id
+        Lps['ITT_DET_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_GLOB_STRATEGY_SCHEME_LPS", len(Lps))]
+        Cost['SCHEME_ID'] = new_id
+        Cost['COST_DET_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_GLOB_STRATEGY_SCHEME_COST", len(Cost))]
+
+    # 保存 epsilon 映射供下游算法使用（使用替换后的标准ID）
     from backend.config.scheme_config import save_scheme_epsilons
-    save_scheme_epsilons(yearMonth, tag_epsilon_map)
+    save_scheme_epsilons(yearMonth, new_tag_epsilon_map)
 
     # 统一插入数据库
     for tag in GlobalSchemeItems:

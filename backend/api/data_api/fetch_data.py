@@ -1949,3 +1949,27 @@ def delete_adam_plan_day_ias_pre_by_month(year_month: str):
         return response.json()
     except Exception as e:
         raise
+
+
+def query_pk_next(pkCode: str, num: int) -> list:
+    """
+    查询 PK 下一批数据
+    :param pkCode: PK 编码（字符串）
+    :param num:    查询数量（数字）
+    :return:       id 字符串列表
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/pk/next"
+
+        response = session.post(url, json={"pkCode": pkCode, "num": num})
+        response.raise_for_status()
+        data = response.json()
+
+        if not isinstance(data, list):
+            data = []
+        return data
+
+    except Exception as e:
+        raise
