@@ -71,27 +71,43 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         target_end_dt = datetime(start_dt.year, start_dt.month, last_day)
         total_sim_days = (target_end_dt - start_dt).days + 1
 
-        is_mid_month = start_dt.day != 1
+        current_month_str = datetime.now().strftime('%Y%m')
+        is_mid_month = (target_month <= current_month_str)
 
         if is_mid_month:
-            logging.info(f">>> [月中滚动重排启动] 起点: {preTime}。将提取未完工计划进行续排...")
+            logging.info(f">>> [当月滚动重排启动] 目标月份: {target_month}。将提取真实到货时间并追加旧主键...")
         else:
-            logging.info(f">>> [月初全局排程启动] 起点: {preTime}。")
+            logging.info(f">>> [下月全局初始排程启动] 目标月份: {target_month}。将执行先删后增...")
 
         Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id = LoadDeliChcekData(
             target_month, sim_start_date_str)
 
         if is_mid_month:
             pending_detect_df = fetch_data("gk-adam-query_pending_detect_plans", {"target_month": target_month})
+
+            # =========================================================================
+            # 【终极融合逻辑】：抛弃旧表里被污染的假日期，只提取它的主键ID (DAY_DETECT_PLAN_PRE_ID)
+            # =========================================================================
+            old_plan_map = {}
             if not pending_detect_df.empty:
                 pending_detect_df.columns = [c.upper() for c in pending_detect_df.columns]
-                pending_detect_df['PLAN_DATE'] = pd.to_datetime(pending_detect_df['PLAN_DATE'])
-                pending_detect_df['REMNUM'] = pending_detect_df['REMNUM'].astype(int)
-                pending_detect_df.rename(columns={'REMNUM': 'RemNum'}, inplace=True)
-                LotList = pending_detect_df.sort_values(by=['PLAN_DATE', 'ARR_BATCH_NO']).reset_index(drop=True)
+                for _, r in pending_detect_df.iterrows():
+                    pid = str(r.get('BATCH_PLAN_ARR_ID', '')).strip()
+                    if pid and pid not in ('nan', 'None', '<NA>', '0.0', '0'):
+                        old_plan_map[pid] = r.get('DAY_DETECT_PLAN_PRE_ID')
+
+            # 此时的 LotList 拥有从物理库存表里查出来的 100% 真实到达时间
+            if not LotList.empty:
+                LotList['DAY_DETECT_PLAN_PRE_ID'] = None
+                for idx, row in LotList.iterrows():
+                    pid = str(row.get('BATCH_PLAN_ARR_ID', '')).strip()
+                    # 如果这个真实的批次之前被排过，我们就把旧主键像“盖章”一样印在它身上
+                    if pid in old_plan_map:
+                        LotList.at[idx, 'DAY_DETECT_PLAN_PRE_ID'] = old_plan_map[pid]
+
+                LotList = LotList.sort_values(by=['PLAN_DATE']).reset_index(drop=True)
             else:
-                logging.warning("月中无未完成检定计划(01/02/03)，本次重排无需安排检定。")
-                LotList = pd.DataFrame()
+                logging.warning("当月无待检及未来到货数据。")
 
         if LotList.empty and not is_mid_month:
             logging.warning("无待检及未来到货数据，排程结束。")
@@ -112,7 +128,9 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
             safe_bgn_date = str(row['DETECT_BGN_DATE']).strip()[:10]
             safe_end_date = str(row['DETECT_END_DATE']).strip()[:10]
 
-            if is_mid_month and 'DAY_DETECT_PLAN_PRE_ID' in row and pd.notnull(row['DAY_DETECT_PLAN_PRE_ID']):
+            if is_mid_month and 'DAY_DETECT_PLAN_PRE_ID' in row and pd.notnull(row['DAY_DETECT_PLAN_PRE_ID']) and str(
+                    row['DAY_DETECT_PLAN_PRE_ID']).strip() not in ('', 'nan'):
+
                 detect_update_list.append({
                     "day_detect_plan_pre_id": int(float(row['DAY_DETECT_PLAN_PRE_ID'])),
                     "detect_bgn_date": safe_bgn_date,
@@ -120,28 +138,41 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                 })
             else:
                 safe_batch_id = int(float(row['BATCH_PLAN_ARR_ID'])) if pd.notnull(
-                    row.get('BATCH_PLAN_ARR_ID')) and str(row.get('BATCH_PLAN_ARR_ID')).strip() != '' else None
+                    row.get('BATCH_PLAN_ARR_ID')) and str(row.get('BATCH_PLAN_ARR_ID')).strip() not in (
+                                                                            '', 'nan', '<NA>') else None
+
+                safe_arr_no = str(row.get('ARR_BATCH_NO')) if pd.notnull(row.get('ARR_BATCH_NO')) and str(
+                    row.get('ARR_BATCH_NO')).strip() not in ('', 'nan', '<NA>') else None
+
                 detect_db_list.append({
                     "day_detect_plan_pre_id": generate_safe_id(), "detect_plan_no": f"CDP-{target_month}-{idx}",
-                    "arr_batch_no": row.get('ARR_BATCH_NO'), "batch_plan_arr_id": safe_batch_id,
+                    "arr_batch_no": safe_arr_no, "batch_plan_arr_id": safe_batch_id,
                     "dev_code": safe_dev_code, "dev_cls": str(row['DEV_CLS']), "dev_categ": str(row['DEV_CATEG']),
                     "detect_plan_num": int(row['DETECT_PLAN_NUM']), "detect_bgn_date": safe_bgn_date,
                     "detect_end_date": safe_end_date, "plan_stat": "01", "cmp_type": "01",
                     "veri_type": str(row.get('VERI_TYPE', '01')), "global_scheme_id": global_scheme_id
                 })
 
-        if not is_mid_month and not df_detect.empty:
+        if not df_detect.empty:
             df_month_summary = df_detect.groupby(['DEV_CODE', 'DEV_CLS', 'DEV_CATEG'])[
                 'DETECT_PLAN_NUM'].sum().reset_index()
+
+            now_dt = datetime.now()
+            month_plan_prefix = f"34{now_dt.strftime('%y')}17{now_dt.strftime('%m')}{now_dt.strftime('%d')}"
+            month_plan_seq = 1
+
             for _, row in df_month_summary.iterrows():
                 safe_dev_code = str(row['DEV_CODE']).replace('.0', '').strip()
+                full_month_plan_no = f"{month_plan_prefix}{month_plan_seq:06d}"
+
                 month_detect_db_list.append({
                     "month_detect_plan_pre_id": generate_safe_id(),
-                    "detect_plan_no": f"MDP-{target_month}-{safe_dev_code}",
+                    "detect_plan_no": full_month_plan_no,
                     "pre_year": str(start_dt.year), "pre_month": f"{start_dt.month:02d}", "dev_code": safe_dev_code,
                     "dev_cls": str(row['DEV_CLS']), "dev_categ": str(row['DEV_CATEG']),
                     "detect_plan_num": int(row['DETECT_PLAN_NUM']), "global_scheme_id": global_scheme_id
                 })
+                month_plan_seq += 1
 
         dist_scheme_db_list = []
         dist_detail_db_list = []
@@ -176,28 +207,38 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                 })
 
         logging.info("================ 开始回写数据库 ================")
+
+        del_month_params = {
+            "pre_year": str(start_dt.year),
+            "pre_month": f"{start_dt.month:02d}"
+        }
+
         if is_mid_month:
-            execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
+            if detect_update_list:
+                execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
+            if detect_db_list:
+                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
         else:
-            del_month_params = {
-                "pre_year": str(start_dt.year),
-                "pre_month": f"{start_dt.month:02d}"
-            }
-            # 直接传递 target_month (例如 "202605")
             execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
-            execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
-            execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+            if detect_db_list:
+                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+
+        execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
+        if month_detect_db_list:
             execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
 
         execute_batch("gk-adam-delete_undelivered_scheme_det", [{"target_month": target_month}])
         execute_batch("gk-adam-delete_undelivered_scheme", [{"target_month": target_month}])
 
-        execute_batch("gk-adam-insert_dist_scheme", dist_scheme_db_list)
-        execute_batch("gk-adam-insert_dist_scheme_det", dist_detail_db_list)
+        if dist_scheme_db_list:
+            execute_batch("gk-adam-insert_dist_scheme", dist_scheme_db_list)
+        if dist_detail_db_list:
+            execute_batch("gk-adam-insert_dist_scheme_det", dist_detail_db_list)
 
         execute_batch("gk-adam-delete_work_arrange_by_date",
                       [{"start_date": sim_start_date_str, "target_month": target_month}])
-        execute_batch("gk-adam-insert_work_arrange_pre", work_arrange_db_list)
+        if work_arrange_db_list:
+            execute_batch("gk-adam-insert_work_arrange_pre", work_arrange_db_list)
 
         logging.info(f">>> [成功] {target_month} 检定与配送联动排程完毕，数据已落库。")
         DailyReplenishmentPlan(start_date, end_date)

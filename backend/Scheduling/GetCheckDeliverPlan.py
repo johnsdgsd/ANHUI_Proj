@@ -15,6 +15,7 @@ except ImportError:
 from backend.Scheduling.GetDelivPlan import GetDelivPlan
 
 
+
 def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap,
                         VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, record_start_date_str,
                         locations):
@@ -81,6 +82,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     Sim_Demands = Demands.copy()
 
     Total_Delivery_Needed = np.zeros(SubTypeNum)
+    Last_Delivery_Date = {}
     DevCodeToIndex = {SubTypeList.loc[i, 'DEV_CODE_NO']: i for i in range(SubTypeNum)}
 
     for trip in ScheduledRoutes:
@@ -135,6 +137,9 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                             })
                             Total_Delivery_Needed[sub_idx] += qty_needed
 
+                            if sub_idx not in Last_Delivery_Date or current_date > Last_Delivery_Date[sub_idx]:
+                                Last_Delivery_Date[sub_idx] = current_date
+
         if details_data:
             actual_load_rate = min(1.0, total_vol_used / max_cap_boxes) if max_cap_boxes > 0 else 0
             unit_price = float(VeUnitPrice[int(ve_type) - 1]) if len(VeUnitPrice) >= int(ve_type) and float(
@@ -147,7 +152,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             GlobalDelivPlan.append({'master': master_data, 'details': details_data})
 
     # =========================================================================
-    # 阶段二：严格执行：待检与非后5天强制排满，遵守次日开工铁律
+    # 阶段二：计算缺口与当月排产计划
     # =========================================================================
     logging.info(">>> [阶段二] 正在计算缺口与当月到货清库存计划...")
 
@@ -159,7 +164,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     line_idx = 0
     if not DeviceCaps.empty:
         for _, row in DeviceCaps.iterrows():
-            line_idx += 1  # 物理线ID，防止产能重叠！
+            line_idx += 1
             veri_cat = str(row['VERI_CATEG']).strip().zfill(2)
             veri_type = str(row['VERI_TYPE']).strip().zfill(2)
 
@@ -179,7 +184,6 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                         'batch_cap': cap
                     })
 
-    # 独立跟踪每条物理线的耗时
     HoursUsed = {d: defaultdict(float) for d in all_days}
     QtyUsed = {d: defaultdict(int) for d in all_days}
     CatMaxHrs = {d: defaultdict(float) for d in all_days}
@@ -199,36 +203,32 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         if rem <= 0:
             continue
 
-        # 识别是否为“待检库存”
         is_realtime = (str(row.get('SOURCE_TYPE', '')).upper() == 'REALTIME')
         days_to_end = (month_end_dt - arr_dt).days
 
-        need_for_delivery = 0
-        if Inspect_Target[sub_idx] > 0:
-            need_for_delivery = min(rem, Inspect_Target[sub_idx])
+        # 卸载掉补丁：因为到货时间已经是100%绝对真实的，直接遵循“次日开工”的物理铁律即可！
+        earliest_bgn = max(arr_dt + timedelta(days=1), sim_start_dt)
 
-        # 【核心意志】：完全遵从您的三段式规则
+        last_dist_date = Last_Delivery_Date.get(sub_idx, sim_start_dt)
+        is_actually_needed = (Inspect_Target[sub_idx] > 0) and (earliest_bgn <= last_dist_date)
+
         if is_realtime:
-            # 1. 待检库存，无条件全部检定
             take = rem
         elif days_to_end >= 5:
-            # 2. 除了后五天的到货，全部检定
             take = rem
         else:
-            # 3. 后五天的到货，只检定满足配送缺口的部分
-            take = need_for_delivery
+            take = rem if is_actually_needed else 0
 
         if take <= 0:
             continue
 
-        if Inspect_Target[sub_idx] > 0:
-            Inspect_Target[sub_idx] -= need_for_delivery
+        if Inspect_Target[sub_idx] > 0 and is_actually_needed:
+            Inspect_Target[sub_idx] -= take
 
         LotObjects.append({
             'idx': idx, 'row': row,
             'orig_take': take, 'rem': take,
-            # 【恢复物理铁律】：绝对遵循到货第二天才能检定！
-            'earliest': max(arr_dt + timedelta(days=1), sim_start_dt),
+            'earliest': earliest_bgn,
             'bgn': None, 'end': None, 'veri_type_used': None
         })
 
@@ -264,7 +264,6 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                     if p['wd'] and not is_wd: continue
                     if not p['wd'] and is_wd: continue
 
-                    # 精确到具体物理产线的空闲时间，杜绝互抢时间！
                     avail_h = p['max_h'] - HoursUsed[d][line['line_id']]
                     if avail_h > 0:
                         do_qty = min(lot['rem'], math.floor(avail_h * pph))
@@ -286,7 +285,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     for lot in LotObjects:
         if lot['rem'] > 0:
             logging.warning(
-                f"⚠️ [产能告急] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} (设备 {lot['row']['DEV_CODE_NO']}) 仍有 {lot['rem']} 只未能在本月排产，这部分是被物理产能极限卡住顺延至下月的！")
+                f"⚠️ [产能告急] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} (设备 {lot['row']['DEV_CODE_NO']}) 仍有 {lot['rem']} 只未能在本月排产，顺延至下月！")
 
         if lot['bgn'] is None: continue
         actual_detected_num = lot['orig_take'] - lot['rem']

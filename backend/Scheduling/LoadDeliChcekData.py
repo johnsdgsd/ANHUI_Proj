@@ -96,7 +96,28 @@ def LoadDeliChcekData(target_month, start_date_str):
         LotList.columns = [c.upper() for c in LotList.columns]
         LotList['PLAN_DATE'] = pd.to_datetime(LotList['PLAN_DATE'])
         LotList['RemNum'] = LotList['PLAN_ARR_NUM'].astype(int)
+
+        # 1. 优先按日期和数据源排序，确保 REALTIME (现存待检) 排在 FUTURE (计划到货) 的前面
         LotList = LotList.sort_values(by=['PLAN_DATE', 'SOURCE_TYPE'], ascending=[True, False]).reset_index(drop=True)
+
+        # 2. 【核心新增：基于 BATCH_PLAN_ARR_ID 强制去重】
+        if 'BATCH_PLAN_ARR_ID' in LotList.columns:
+            # 暴力清洗空值，统一转为空字符串
+            LotList['BATCH_PLAN_ARR_ID'] = LotList['BATCH_PLAN_ARR_ID'].fillna('').astype(str).str.strip()
+            LotList['BATCH_PLAN_ARR_ID'] = LotList['BATCH_PLAN_ARR_ID'].replace(
+                {'nan': '', 'None': '', '<NA>': '', '0.0': '', '0': ''})
+
+            # 分离出有 ID 和 无 ID 的批次
+            mask_has_id = LotList['BATCH_PLAN_ARR_ID'] != ''
+
+            # 对有 ID 的批次执行去重：因为刚才排序过了，这里只会保留 REALTIME 的那条记录！
+            lot_with_id = LotList[mask_has_id].drop_duplicates(subset=['BATCH_PLAN_ARR_ID'], keep='first')
+            lot_no_id = LotList[~mask_has_id]
+
+            # 重新拼装（此时重叠的 FUTURE 数据已经被抹除）
+            LotList = pd.concat([lot_with_id, lot_no_id], ignore_index=True)
+            LotList = LotList.sort_values(by=['PLAN_DATE', 'SOURCE_TYPE'], ascending=[True, False]).reset_index(
+                drop=True)
 
     # ================= 4. 读取产线产能及距离矩阵 =================
     DeviceCaps = fetch_data("gk-adam-query_check_line")
