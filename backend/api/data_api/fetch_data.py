@@ -1951,6 +1951,19 @@ def delete_adam_plan_day_ias_pre_by_month(year_month: str):
         raise
 
 
+def delete_adam_allot_day_plan_pre_by_date(allot_date: str):
+    """按日期删除调拨计划表"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        url = f"http://{host}:{port}/exec/gk-adam-delete_adam_allot_day_plan_pre_by_date"
+        response = session.post(url, json={"allot_date": allot_date})
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise
+
+
 def query_pk_next(pkCode: str, num: int) -> list:
     """
     查询 PK 下一批数据

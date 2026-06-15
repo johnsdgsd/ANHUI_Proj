@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import datetime
 from backend.global_optimization.logger import logger
-from backend.inventory_optimization.RunOptimize import run_optimization_from_api
 from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
 import time
 
@@ -157,30 +156,28 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
     init_f = init_stock[['ORG_NO', 'DEV_CODE', 'STOCK_NUM']].copy()
     init_f.rename(columns={'STOCK_NUM': 'I0'}, inplace=True)
 
-    # 3. 月末阈值
-    thresh_f = Threshold[['ORG_NO', 'DEV_CODE', 'BASE_LIMIT']].copy()
-    thresh_f.rename(columns={'BASE_LIMIT': 'I_END'}, inplace=True)
     price_f = price_df[['DEV_CODE', 'TAX_UP']].copy()
     price_f.rename(columns={'TAX_UP': 'UNIT_PRICE'}, inplace=True)
 
-    # 4. 左连接（以需求表为准）
+    # 3. 左连接（以需求表为准）
     detail = demand_agg.merge(init_f, on=['ORG_NO', 'DEV_CODE'], how='left')
-    detail = detail.merge(thresh_f, on=['ORG_NO', 'DEV_CODE'], how='left')
     detail = detail.merge(price_f, on=['DEV_CODE'], how='left')
-    # 5. 填充缺失值（若无月初或月末库存，则填0）
+    # 4. 填充缺失值
     detail['I0'] = detail['I0'].fillna(0)
-    detail['I_END'] = detail['I_END'].fillna(0)
     detail['UNIT_PRICE'] = detail['UNIT_PRICE'].fillna(0)
-    # 6. 计算日均库存
-    detail['AVG_INV'] = (detail['I0'] + detail['I_END']) / 2.0
 
     # 增加需求预测结果
     if PreNum is not None and not PreNum.empty:
         pre_num_sub = PreNum[['ORG_NO', 'DEV_CODE', 'PRE_NUM']].copy()
         detail = detail.merge(pre_num_sub, on=['ORG_NO', 'DEV_CODE'], how='left')
-        detail['PRE_NUM'] = detail['PRE_NUM'].fillna(0)  # 若无预测则填0
+        detail['PRE_NUM'] = detail['PRE_NUM'].fillna(0)
     else:
         detail['PRE_NUM'] = 0
+
+    # 5. 月末库存 = 月初库存 - 当月需求 + 当月补货量
+    detail['I_END'] = (detail['I0'] - detail['PRE_NUM'] + detail['DEMAND']).clip(lower=0)
+    # 6. 日均库存
+    detail['AVG_INV'] = (detail['I0'] + detail['I_END']) / 2.0
 
     # 月周转次数
     detail['TURNOVER'] = detail.apply(
@@ -247,36 +244,36 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     pre_stat_cost = total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
     pre_single_cost = pre_stat_cost / (total_demand + total_inv) if (total_demand + total_inv)> 0 else 0.0
     total_turnover = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'])['TURNOVER'].sum().mean()
-    cur_itr = detail['ITR'].round(2).mean()  ##这里是均值
+    cur_itr = detail['ITR'].mean().round(4) * 100  ##这里是均值, 转为百分比
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
-        cost_tr = (pre_single_cost - cost_last_month) / cost_last_month
+        cost_tr = (pre_single_cost - cost_last_month) / cost_last_month * 100
         cost_tr = round(cost_tr,2)
 
     cost_yoy = 0.0
     if cost_last_year and cost_last_year != 0:
-        cost_yoy = (pre_single_cost - cost_last_year) / cost_last_year
+        cost_yoy = (pre_single_cost - cost_last_year) / cost_last_year * 100
         cost_yoy = round(cost_yoy,2)
 
     itt_tr = 0.0
     if itt_last_month and itt_last_month != 0:
-        itt_tr = (total_turnover - itt_last_month ) / itt_last_month
+        itt_tr = (total_turnover - itt_last_month ) / itt_last_month * 100
         itt_tr = round(itt_tr,2)
 
     itt_yoy = 0.0
     if itt_last_year and itt_last_year != 0:
-        itt_yoy = (total_turnover - itt_last_year) / itt_last_year
+        itt_yoy = (total_turnover - itt_last_year) / itt_last_year * 100
         itt_yoy = round(itt_yoy,2)
     # 计算库存运行比
     itr_tr = 0.0
     if itr_last_month and itr_last_month != 0:
-        itr_tr = (cur_itr - itr_last_month) / itr_last_month
+        itr_tr = (cur_itr - itr_last_month) / itr_last_month * 100
         itr_tr = round(itr_tr,2)
 
     itr_yoy = 0.0
     if itr_last_year and itr_last_year != 0:
-        itr_yoy = (cur_itr - itr_last_year) / itr_last_year
+        itr_yoy = (cur_itr - itr_last_year) / itr_last_year * 100
         itr_yoy = round(itr_yoy,2)
 
     # ------------------- 新增：自动缩容（除以10/100...直到在长度范围内） -------------------
@@ -398,6 +395,7 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
         PRE_ITT=('TURNOVER', 'sum'),
         PRE_ITR = ('ITR','mean')
     )
+    grouped['PRE_ITR'] = grouped['PRE_ITR'] * 100  # 转为百分比
 
     # 2. 合并历史数据（使用左连接）
     # 重命名历史表中的 PRE_ITT 列
@@ -429,17 +427,27 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
     grouped['PRE_ITT_LAST_YEAR'] = grouped['PRE_ITT_LAST_YEAR'].fillna(0)
     grouped['PRE_ITR_LAST_MONTH'] = grouped['PRE_ITR_LAST_MONTH'].fillna(0)
     grouped['PRE_ITR_LAST_YEAR'] = grouped['PRE_ITR_LAST_YEAR'].fillna(0)
-    # 3. 计算同比环比（避免除零）
+    # 3. 计算同比环比（避免除零，结果转为百分比）
     def calc_rate(current, history):
-        # 历史值为0时返回0.0
         value = ((current - history) / history ).where(history != 0, 0.0)
-        return round(value,2)
+        return round(value * 100, 2)
 
     grouped['ITT_TR'] = calc_rate(grouped['PRE_ITT'], grouped['PRE_ITT_LAST_MONTH'])
     grouped['ITT_YOY'] = calc_rate(grouped['PRE_ITT'], grouped['PRE_ITT_LAST_YEAR'])
 
     grouped['ITR_TR'] = calc_rate(grouped['PRE_ITR'], grouped['PRE_ITR_LAST_MONTH'])
     grouped['ITR_YOY'] = calc_rate(grouped['PRE_ITR'], grouped['PRE_ITR_LAST_YEAR'])
+
+    # 百分比字段自动缩容: NUMBER(5,2) max=999.99
+    def scale_pct(col):
+        col = col.copy()
+        while (col.abs() > 999.99).any():
+            col = col.where(col.abs() <= 999.99, col / 10)
+        return col.round(2)
+
+    for col in ['PRE_ITR', 'ITR_YOY', 'ITR_TR', 'ITT_YOY', 'ITT_TR']:
+        grouped[col] = scale_pct(grouped[col])
+
     # 4. 生成主键
     base_ts = int(time.time() * 1000)  # 13位毫秒时间戳
     base_ts = int(str(base_ts)[:12])

@@ -16,6 +16,7 @@ from backend.Scheduling.GetDelivPlan import GetDelivPlan
 
 
 
+
 def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap,
                         VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, record_start_date_str,
                         locations):

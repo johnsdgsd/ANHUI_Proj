@@ -3,7 +3,6 @@
 用于生成库存调拨方案，平衡各仓库库存水平
 """
 import pandas as pd
-import time
 from datetime import datetime
 from itertools import product
 from backend.global_optimization.logger import logger
@@ -24,8 +23,14 @@ def GetTransferSchemeAndInsert():
     tb = GetTransferScheme(priority_dict)
     scheme = format_transfer_plan_for_db(tb)
     if not scheme.empty:
-        from backend.api.data_api.fetch_data import query_pk_next
+        from backend.api.data_api.fetch_data import query_pk_next, delete_adam_allot_day_plan_pre_by_date
         scheme['ALLOT_DAY_PLAN_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_ALLOT_DAY_PLAN_PRE", len(scheme))]
+    # 删除当天旧数据后插入
+    from datetime import datetime
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    logger.info(f"删除调拨旧数据，日期: {today_str}")
+    del_res = delete_adam_allot_day_plan_pre_by_date(today_str)
+    logger.info(f"删除调拨旧数据结果: {del_res}")
     res = insert_into_adam_allot_day_plan_pre(scheme)
     return res
 
@@ -114,7 +119,10 @@ def GetTransferScheme(priority_dict: dict) -> pd.DataFrame:
     all_combinations['HIGH_QTY'] = all_combinations['HIGH_QTY'].fillna(0)
 
     # 4. 按设备码生成调拨计划
-    global_scheme_id = int(time.time())
+    from backend.config.scheme_config import get_approved_scheme_config
+    year_month = datetime.now().strftime('%Y%m')
+    global_scheme_id, _ = get_approved_scheme_config(year_month)
+    logger.info(f"调拨使用全局方案ID: {global_scheme_id} (年月: {year_month})")
     transfer_records = []
     device_groups = list(all_combinations.groupby('DEV_CODE_NO'))
     total_devices = len(device_groups)
