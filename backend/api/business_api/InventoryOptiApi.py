@@ -334,7 +334,7 @@ def AdjustDailyDeliveryPlanRangeV2():
         Data = request.get_json() or {}
         date_list = Data.get('dateList')
         preConcId = Data.get('preConcId')
-        max_stops = Data.get('maxStops', 5)
+        max_stops = Data.get('maxStops', 3)
         max_iter = Data.get('maxIter', 600)
 
         if not date_list or not isinstance(date_list, list) or len(date_list) == 0:

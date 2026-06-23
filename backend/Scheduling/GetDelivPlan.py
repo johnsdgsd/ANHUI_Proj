@@ -9,7 +9,6 @@ import pulp
 import logging
 import sys
 
-
 def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
@@ -141,8 +140,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     space = MAX_CAP - sum(a for _, a in r['deliveries'])
                     has_cid = any(c == cid for c, _ in r['deliveries'])
 
-                    # 仅保留：网点合并不超5 的业务红线。撤销所有物理距离红线。
-                    if space > 0 and (has_cid or len(r['deliveries']) < 5):
+                    # 【修改点1】：仅保留：网点合并不超3 的业务红线
+                    if space > 0 and (has_cid or len(r['deliveries']) < 3):
                         load = min(amt, space)
                         temp_route = copy.deepcopy(r)
                         if has_cid:
@@ -190,8 +189,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 best_action = None
                 for ri, route in enumerate(routes):
                     has_cid = any(c == cid for c, _ in route['deliveries'])
-                    # 仅保留单车5网点红线
-                    if not has_cid and len(route['deliveries']) >= 5: continue
+                    # 【修改点2】：单车3网点红线，达到或超过3个则跳过不插入新网点
+                    if not has_cid and len(route['deliveries']) >= 3: continue
 
                     space = MAX_CAP - sum(a for _, a in route['deliveries'])
                     if space > 0:

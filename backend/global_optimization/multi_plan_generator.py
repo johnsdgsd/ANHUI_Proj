@@ -61,8 +61,10 @@ def GenerateMutiOrderScheme(yearMonth:str):
         ThresholdSchemes[tag] = Threshold
         detail = PrepareDetail(Order,Threshold,init_stock,item_cost,Demand_Pre,monthly_holding_rate = monthly_holding_rate)
         detail = GetRunDurDetail(detail)
+        logger.info('准备计算到货量和检定量')
+        detail, total_central_avg_inv = PrepareArrAndVerifQty(detail, yearMonth)
         logger.info('准备开始计算全局主表明细')
-        global_scheme_item,detail = GetGlobalSchemeItem(detail,tag,yearMonth)
+        global_scheme_item,detail = GetGlobalSchemeItem(detail,tag,yearMonth,total_central_avg_inv)
         logger.info('准备计算周转明细')
         global_scheme_itt = GetGlobalSchemeITT(detail,tag,yearMonth)
         logger.info('准备计算明细汇总')
@@ -185,8 +187,8 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
         axis=1
     )
     detail['TURNOVER'] = detail['TURNOVER'].round(8)
-    # 9. 持有成本 = 日均库存 * 单价 * 月持有成本率 * 30天
-    detail['HOLDING_COST'] = detail['AVG_INV'] * detail['UNIT_PRICE'] * monthly_holding_rate * 30
+    # 9. 持有成本由 GetStorageCost 计算，此处预置为0
+    detail['HOLDING_COST'] = 0.0
     # 10. 缺货成本（暂设为0，可根据业务扩展）
     detail['SHORTAGE_COST'] = 0.0
 
@@ -194,7 +196,7 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
     return detail
 
 
-def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
+def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str, total_central_avg_inv: float = 0.0):
     '''
     获得一条全局方案
     '''
@@ -233,18 +235,23 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str):
     total_demand = detail['DEMAND'].sum()
     total_inv = detail['AVG_INV'].sum()
 
-    total_holding_cost = detail['HOLDING_COST'].sum()
+    logger.info('计算仓储成本')
+    total_holding_cost, detail = GetStorageCost(detail)
     logger.info('计算配送成本')
     total_deliver_cost,detail = GetDeliverCost(detail)
     logger.info('计算检定成本')
     total_verificaiton_cost,detail = GetVerifCost(detail)
+    logger.info('计算采购成本')
+    total_procure_cost, detail = GetProcureCost(detail)
     logger.info('计算到货成本')
-    total_arr_cost,detail = GetArrCost(detail)
+    total_arr_cost, detail = GetArrCost(detail)
     logger.info('计算同比环比')
-    pre_stat_cost = total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
+    pre_stat_cost = total_procure_cost + total_arr_cost + total_verificaiton_cost + total_deliver_cost + total_holding_cost
     pre_single_cost = pre_stat_cost / (total_demand + total_inv) if (total_demand + total_inv)> 0 else 0.0
-    total_turnover = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'])['TURNOVER'].sum().mean()
-    cur_itr = detail['ITR'].mean().round(4) * 100  ##这里是均值, 转为百分比
+    total_pre_num = detail['PRE_NUM'].sum()
+    total_avg_inv = detail['AVG_INV'].sum() + total_central_avg_inv
+    total_turnover = total_pre_num / total_avg_inv if total_avg_inv > 0 else 0.0
+    cur_itr = round(detail['I_END'].sum() / detail['RUNNING_NUM'].sum(), 4) * 100 if detail['RUNNING_NUM'].sum() > 0 else 0.0
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
@@ -392,10 +399,14 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
     grouped = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'], as_index=False).agg(
         START_STOCK_NUM=('I0', 'sum'),
         END_STOCK_NUM=('I_END', 'sum'),
-        PRE_ITT=('TURNOVER', 'sum'),
-        PRE_ITR = ('ITR','mean')
+        PRE_NUM_SUM=('PRE_NUM', 'sum'),
+        AVG_INV_SUM=('AVG_INV', 'sum'),
+        I_END_SUM=('I_END', 'sum'),
+        RUNNING_SUM=('RUNNING_NUM', 'sum')
     )
-    grouped['PRE_ITR'] = grouped['PRE_ITR'] * 100  # 转为百分比
+    grouped['PRE_ITT'] = (grouped['PRE_NUM_SUM'] / grouped['AVG_INV_SUM']).fillna(0).round(4)
+    grouped['PRE_ITR'] = (grouped['I_END_SUM'] / grouped['RUNNING_SUM'] * 100).fillna(0)
+    grouped.drop(columns=['PRE_NUM_SUM', 'AVG_INV_SUM', 'I_END_SUM', 'RUNNING_SUM'], inplace=True)
 
     # 2. 合并历史数据（使用左连接）
     # 重命名历史表中的 PRE_ITT 列
@@ -473,10 +484,111 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str) -> 
     return grouped[columns]
 
 def GetArrCost(detail:pd.DataFrame):
-    
-    detail['ARR_COST'] = detail['DEMAND'] * detail['UNIT_PRICE']
-    total_arr_cost = detail['ARR_COST'].sum()
-    return total_arr_cost,detail
+    """
+    计算到货成本
+    算法: 工时 × 时薪 × 人数(1人)
+    - 工时 = 20天 × 8小时/天 = 160小时/月
+    - 时薪 = 日薪 / 8（从配置表读取, LINK_TYPE='02', COST_TYPE='02', BASE_COST_TYPE='01'）
+    - 按到货量占比分摊到各明细行
+    """
+    from backend.api.data_api.fetch_data import query_adam_single_cost_config_all
+
+    # 读取配置表中的日薪
+    cost_df = query_adam_single_cost_config_all()
+    mask = (cost_df['LINK_TYPE'] == '02') & (cost_df['COST_TYPE'] == '02') & (cost_df['BASE_COST_TYPE'] == '01')
+    matched = cost_df[mask]
+
+    if matched.empty:
+        daily_wage = 200  # 默认日薪
+    else:
+        daily_wage = float(matched.iloc[0]['BASE_COST_VALUE'])
+
+    hourly_wage = daily_wage / 8.0       # 时薪
+    work_hours = 20 * 8                   # 工时 = 160小时
+    people_count = 1                      # 人数
+
+    # 到货总成本
+    total_arr_cost = work_hours * hourly_wage * people_count
+
+    # 按到货量占比分摊到每行
+    total_arr_qty = detail['ARR_QTY'].sum()
+    if total_arr_qty > 0:
+        detail['ARR_COST'] = detail['ARR_QTY'] / total_arr_qty * total_arr_cost
+    else:
+        detail['ARR_COST'] = 0.0
+
+    detail['ARR_COST'] = detail['ARR_COST'].round(2)
+
+    return total_arr_cost, detail
+
+
+def GetProcureCost(detail: pd.DataFrame):
+    """
+    计算采购成本
+    算法: 补货量 × 含税单价
+    """
+    detail['PROCURE_COST'] = detail['DEMAND'] * detail['UNIT_PRICE']
+    total_procure_cost = detail['PROCURE_COST'].sum()
+    return total_procure_cost, detail
+
+
+def GetStorageCost(detail: pd.DataFrame):
+    """
+    计算仓储成本 = 管理费 + 资金占用
+
+    1. 管理费: 二级市(ORG_NO 长度=5) 41万/年 ÷ 12月 = 34,166.67元/月
+       其他单位 0, 按各市内部 AVG_INV 占比分摊到行
+    2. 资金占用: UNIT_PRICE × 年利率 × AVG_INV × 30
+       年利率从配置表读取: LINK_TYPE='04', COST_TYPE='04', BASE_COST_TYPE='13'
+    """
+    from backend.api.data_api.fetch_data import query_adam_single_cost_config_all
+
+    # 读取年利率配置
+    cost_df = query_adam_single_cost_config_all()
+    mask_rate = (
+        (cost_df['LINK_TYPE'] == '04') &
+        (cost_df['COST_TYPE'] == '04') &
+        (cost_df['BASE_COST_TYPE'] == '13')
+    )
+    matched_rate = cost_df[mask_rate]
+
+    if matched_rate.empty:
+        annual_rate = 0.05  # 默认年利率 5%
+    else:
+        try:
+            annual_rate = float(matched_rate.iloc[0]['BASE_COST_VALUE'])
+        except Exception:
+            annual_rate = 0.05
+
+    # 二级市管理费: 410,000 / 12 = 34,166.67 元/月
+    MONTHLY_MGMT_FEE = 410000.0 / 12.0
+
+    # 标记二级市 (ORG_NO 长度=5)
+    detail['IS_CITY'] = detail['ORG_NO'].astype(str).str.len() == 5
+
+    # 资金占用: 设备单价 × (年利率/365) × 日均库存 × 30天
+    detail['CAPITAL_COST'] = (
+        detail['UNIT_PRICE'] * (annual_rate / 365.0) * detail['AVG_INV'] * 30
+    ).round(2)
+
+    # 管理费分摊: 每个二级市内部按 AVG_INV 占比分摊月度管理费
+    detail['MGMT_COST'] = 0.0
+    city_mask = detail['IS_CITY']
+    if city_mask.any():
+        city_groups = detail.loc[city_mask].groupby('ORG_NO')
+        for org_no, group in city_groups:
+            total_avg_inv = group['AVG_INV'].sum()
+            if total_avg_inv > 0:
+                detail.loc[group.index, 'MGMT_COST'] = (
+                    group['AVG_INV'] / total_avg_inv * MONTHLY_MGMT_FEE
+                ).round(2)
+
+    # 仓储总成本 = 资金占用 + 管理费
+    detail['HOLDING_COST'] = detail['CAPITAL_COST'] + detail['MGMT_COST']
+    total_storage_cost = detail['HOLDING_COST'].sum()
+
+    return total_storage_cost, detail
+
 
 def PreparaVerifData(detail:pd.DataFrame):
     '''
@@ -538,35 +650,68 @@ def GetVerifCost(detail:pd.DataFrame):
 
     detail = PreparaVerifData(detail)
     cost_df = query_adam_single_cost_config_all()
-    # 筛选：环节类型=检定(03)，成本类型=人工(02)，基础数据类型=日薪(01)
-    mask = (cost_df['LINK_TYPE'] == '03') & (cost_df['COST_TYPE'] == '02') & (cost_df['BASE_COST_TYPE'] == '01')
-    matched = cost_df[mask]
 
-    if matched.empty :
-        # detail['VERIF_COST'] = 0.0
+    # 筛选：环节类型=检定(03)，成本类型=人工(02)，基础数据类型=日薪(01)
+    mask_labor = (cost_df['LINK_TYPE'] == '03') & (cost_df['COST_TYPE'] == '02') & (cost_df['BASE_COST_TYPE'] == '01')
+    matched_labor = cost_df[mask_labor]
+
+    if matched_labor.empty:
         daily_wage = 200
-    try:
-        daily_wage = matched.iloc[0]['BASE_COST_VALUE']
-    except Exception as e:
-        daily_wage = 200
+    else:
+        try:
+            daily_wage = float(matched_labor.iloc[0]['BASE_COST_VALUE'])
+        except Exception:
+            daily_wage = 200
+
+    # 筛选维保费用: LINK_TYPE='03', COST_TYPE='03', BASE_COST_TYPE='03'维修费/'04'检测费/'05'年度检定量
+    mask_maint = (
+        (cost_df['LINK_TYPE'] == '03') &
+        (cost_df['COST_TYPE'] == '03') &
+        (cost_df['BASE_COST_TYPE'].isin(['03', '04', '05']))
+    )
+    maint_df = cost_df[mask_maint]
+
+    repair_cost = 5000000.0   # BASE_COST_TYPE='03' 维修费用, 默认500万
+    test_cost = 1000000.0     # BASE_COST_TYPE='04' 检测费用, 默认100万
+    annual_volume = 4500000.0 # BASE_COST_TYPE='05' 年度检定量, 默认450万
+
+    if not maint_df.empty:
+        for _, mr in maint_df.iterrows():
+            bct = str(mr['BASE_COST_TYPE'])
+            val = float(mr['BASE_COST_VALUE'])
+            if bct == '03':
+                repair_cost = val
+            elif bct == '04':
+                test_cost = val
+            elif bct == '05':
+                annual_volume = max(val, 1.0)
+
+    # 单只月均维保费用 = (维修费 + 检测费) / 年度检定量 / 12
+    per_device_monthly_maint = (repair_cost + test_cost) / annual_volume / 12.0
 
     hourly_wage = daily_wage / 8.0   # 时薪，元/小时
     verif_costs = []
     total_cost = 0.0
     for _, row in detail.iterrows():
-        demand = row['DEMAND']
+        verif_qty = row['VERIF_QTY']
         hourly_rate = row['HOURLY_VERI_NUM']
+
+        # 人工成本
         if hourly_rate > 0:
-            hours = demand / hourly_rate
-            cost = hours * hourly_wage
-            cost = round(cost,1)
+            hours = verif_qty / hourly_rate
+            labor_cost = hours * hourly_wage
         else:
-            cost = 0.0
+            labor_cost = 0.0
+
+        # 维保成本
+        maint_cost = verif_qty * per_device_monthly_maint
+
+        cost = round(labor_cost + maint_cost, 1)
         verif_costs.append(cost)
         total_cost += cost
-    
+
     detail['VERIF_COST'] = verif_costs
-    return total_cost,detail
+    return total_cost, detail
 
 def GetDeliverCost(detail:pd.DataFrame):
 
@@ -596,6 +741,170 @@ def GetDeliverCost(detail:pd.DataFrame):
 
     return total_deliver_cost,detail
 
+
+def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
+    """
+    按 Scheduling 逻辑计算各单位各设备码的到货量和检定量。
+
+    步骤:
+      1. 读取省级库存: 得到每个 DEV_CODE 的合格品/不合格品/已检定完工量
+      2. 计算省级总量: 对每个 DEV_CODE, 按 Scheduling 公式算出总到货量/总检定量
+      3. 拆分到行: 按各单位需求量占该 DEV_CODE 总需求的比例, 拆分到 (ORG_NO, DEV_CODE)
+    """
+    import math
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+
+    from backend.api.data_api.fetch_data import (
+        query_adam_qua_stock_sample_by_year_month,
+        query_adam_realtime_pend_stock,
+        query_adam_realtime_qua_stock,
+        query_adam_future_arrivals,
+        query_adam_future_detections,
+        query_adam_completed_inspections,
+    )
+
+    def _clean_dev_code(df):
+        """清洗 DEV_CODE: 转字符串去空格去 .0"""
+        df = df.copy()
+        if 'DEV_CODE' in df.columns:
+            df['DEV_CODE'] = df['DEV_CODE'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+        return df
+
+    # ========================================================================
+    #  步骤1: 读取省级库存，汇总得到 DF_stock[DEV_CODE, 合格品, 不合格品, 已检定]
+    # ========================================================================
+
+    logger.info(f'[到货/检定量] 开始读取省级库存数据, 目标月份: {yearMonth}')
+
+    # 合格品快照: 目标月往前推2个月
+    target_dt = datetime.strptime(yearMonth, '%Y%m')
+    prev_dt = target_dt - relativedelta(months=2)
+    qua_period = prev_dt.strftime('%Y%m')
+    logger.info(f'[到货/检定量] 合格品快照: {qua_period} (目标月-2)')
+
+    df_qua = query_adam_qua_stock_sample_by_year_month(
+        prev_dt.strftime('%Y'), prev_dt.strftime('%m')
+    )
+    df_qua = df_qua[['DEV_CODE', 'QUA_STOCK_NUM']] if not df_qua.empty else pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
+    df_qua = _clean_dev_code(df_qua)
+    df_qua = df_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK_NUM'].sum()
+    df_qua.rename(columns={'QUA_STOCK_NUM': 'QUA_STOCK'}, inplace=True)
+    logger.info(f'[到货/检定量] 合格品快照: {len(df_qua)} 个设备码, 合计 {int(df_qua["QUA_STOCK"].sum())} 只')
+
+    # 实时待检 + 区间到货 - 区间检定 = 不合格品
+    df_pend = query_adam_realtime_pend_stock()
+    df_pend = df_pend[['DEV_CODE', 'NOW_PEND_NUM']] if not df_pend.empty else pd.DataFrame(columns=['DEV_CODE', 'NOW_PEND_NUM'])
+    df_pend = _clean_dev_code(df_pend)
+    df_pend = df_pend.groupby('DEV_CODE', as_index=False)['NOW_PEND_NUM'].sum()
+    logger.info(f'[到货/检定量] 实时待检: {len(df_pend)} 个设备码, 合计 {int(df_pend["NOW_PEND_NUM"].sum())} 只')
+
+    target_start = target_dt.strftime('%Y-%m-%d 00:00:00')
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    logger.info(f'[到货/检定量] 区间范围: {now_str} → {target_start}')
+
+    df_arr = query_adam_future_arrivals(now_str, target_start)
+    df_arr = df_arr[['DEV_CODE', 'ARR_NUM']] if not df_arr.empty else pd.DataFrame(columns=['DEV_CODE', 'ARR_NUM'])
+    df_arr = _clean_dev_code(df_arr)
+    df_arr = df_arr.groupby('DEV_CODE', as_index=False)['ARR_NUM'].sum()
+    logger.info(f'[到货/检定量] 区间到货: {len(df_arr)} 个设备码, 合计 {int(df_arr["ARR_NUM"].sum())} 只')
+
+    df_det = query_adam_future_detections(now_str, target_start)
+    df_det = df_det[['DEV_CODE', 'DETECT_NUM']] if not df_det.empty else pd.DataFrame(columns=['DEV_CODE', 'DETECT_NUM'])
+    df_det = _clean_dev_code(df_det)
+    df_det = df_det.groupby('DEV_CODE', as_index=False)['DETECT_NUM'].sum()
+    logger.info(f'[到货/检定量] 区间检定: {len(df_det)} 个设备码, 合计 {int(df_det["DETECT_NUM"].sum())} 只')
+
+    # 合并为不合格品: 实时待检 + 区间到货 - 区间检定
+    df_unqua = df_pend.merge(df_arr, on='DEV_CODE', how='outer').merge(df_det, on='DEV_CODE', how='outer')
+    df_unqua.fillna(0, inplace=True)
+    df_unqua['UNQUA_STOCK'] = (df_unqua['NOW_PEND_NUM'] + df_unqua['ARR_NUM'] - df_unqua['DETECT_NUM']).clip(lower=0)
+    df_unqua = df_unqua[['DEV_CODE', 'UNQUA_STOCK']]
+    logger.info(f'[到货/检定量] 推算不合格品: {len(df_unqua)} 个设备码, 合计 {int(df_unqua["UNQUA_STOCK"].sum())} 只')
+
+    # 实时合格品
+    df_rt_qua = query_adam_realtime_qua_stock()
+    df_rt_qua = df_rt_qua[['DEV_CODE', 'QUA_STOCK_NUM']] if not df_rt_qua.empty else pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
+    df_rt_qua = _clean_dev_code(df_rt_qua)
+    df_rt_qua = df_rt_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK_NUM'].sum()
+    df_rt_qua.rename(columns={'QUA_STOCK_NUM': 'QUA_STOCK_RT'}, inplace=True)
+    logger.info(f'[到货/检定量] 实时合格品: {len(df_rt_qua)} 个设备码, 合计 {int(df_rt_qua["QUA_STOCK_RT"].sum())} 只')
+
+    # 当月已检定完工量
+    df_insp = query_adam_completed_inspections(yearMonth)
+    df_insp = df_insp[['DEV_CODE', 'INSPECTED_NUM']] if not df_insp.empty else pd.DataFrame(columns=['DEV_CODE', 'INSPECTED_NUM'])
+    df_insp = _clean_dev_code(df_insp)
+    df_insp = df_insp.groupby('DEV_CODE', as_index=False)['INSPECTED_NUM'].sum()
+    logger.info(f'[到货/检定量] 已检定完工: {len(df_insp)} 个设备码, 合计 {int(df_insp["INSPECTED_NUM"].sum())} 只')
+
+    # 合并为库存总表 DF_stock: 每个 DEV_CODE 一行
+    DF_stock = df_qua.merge(df_unqua, on='DEV_CODE', how='outer') \
+                     .merge(df_rt_qua, on='DEV_CODE', how='outer') \
+                     .merge(df_insp, on='DEV_CODE', how='outer')
+    DF_stock.fillna(0, inplace=True)
+    logger.info(f'[到货/检定量] 库存总表合并完成: {len(DF_stock)} 个设备码')
+    # DF_stock 列: DEV_CODE, QUA_STOCK, UNQUA_STOCK, QUA_STOCK_RT, INSPECTED_NUM
+
+    # ========================================================================
+    #  步骤2: 计算省级总量 DF_dev[D DEV_CODE, TOTAL_ARR, TOTAL_VERIF]
+    # ========================================================================
+
+    # 清洗 detail 的 DEV_CODE
+    detail = _clean_dev_code(detail)
+
+    # 汇总每个 DEV_CODE 的总需求量
+    dev_demand = detail.groupby('DEV_CODE', as_index=False)['DEMAND'].sum()
+    dev_demand.rename(columns={'DEMAND': 'TOTAL_DEMAND'}, inplace=True)
+    logger.info(f'[到货/检定量] detail 中 {len(dev_demand)} 个设备码, 总需求量 {int(dev_demand["TOTAL_DEMAND"].sum())}')
+
+    # 合并库存
+    DF_dev = dev_demand.merge(DF_stock, on='DEV_CODE', how='left')
+    DF_dev.fillna(0, inplace=True)
+
+    # Scheduling 到货公式
+    DF_dev['TOTAL_ARR'] = (1.25 * (1.25 * DF_dev['TOTAL_DEMAND'] - DF_dev['QUA_STOCK'])
+                           - DF_dev['UNQUA_STOCK']).clip(lower=0).apply(math.ceil)
+
+    # Scheduling 检定公式
+    DF_dev['TOTAL_VERIF'] = (DF_dev['TOTAL_DEMAND'] - DF_dev['QUA_STOCK_RT']
+                             - DF_dev['INSPECTED_NUM']).clip(lower=0)
+
+    logger.info(f'[到货/检定量] 省级总量: 到货 {int(DF_dev["TOTAL_ARR"].sum())} 只, 检定 {int(DF_dev["TOTAL_VERIF"].sum())} 只')
+
+    # 省中心日均合格品 = (月初 + 月末) / 2
+    # 月末 = 月初 + 检定新增 - 配送出库
+    DF_dev['END_QUA'] = DF_dev['QUA_STOCK'] + DF_dev['TOTAL_VERIF'] - DF_dev['TOTAL_DEMAND']
+    DF_dev['CENTRAL_AVG_INV'] = ((DF_dev['QUA_STOCK'] + DF_dev['END_QUA']) / 2.0).clip(lower=0)
+    total_central_avg_inv = DF_dev['CENTRAL_AVG_INV'].sum()
+    logger.info(f'[到货/检定量] 省中心总日均合格品: {total_central_avg_inv:.1f}')
+
+    # DF_dev 列: DEV_CODE, TOTAL_DEMAND, TOTAL_ARR, TOTAL_VERIF (plus 库存中间列)
+    DF_dev = DF_dev[['DEV_CODE', 'TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF']]
+
+    # ========================================================================
+    #  步骤3: 按各单位需求量占比拆分到 (ORG_NO, DEV_CODE)
+    # ========================================================================
+
+    detail = detail.merge(DF_dev, on='DEV_CODE', how='left')
+    detail['TOTAL_DEMAND'] = detail['TOTAL_DEMAND'].fillna(0)
+
+    # 占比 = 该行 DEMAND / 该 DEV_CODE 总 DEMAND
+    detail['RATIO'] = detail.apply(
+        lambda r: r['DEMAND'] / r['TOTAL_DEMAND'] if r['TOTAL_DEMAND'] > 0 else 0,
+        axis=1
+    )
+
+    detail['ARR_QTY'] = (detail['TOTAL_ARR'] * detail['RATIO']).round(0).astype(int)
+    detail['VERIF_QTY'] = (detail['TOTAL_VERIF'] * detail['RATIO']).round(0).astype(int)
+
+    logger.info(f'[到货/检定量] 拆分完成: ARR_QTY 合计 {int(detail["ARR_QTY"].sum())}, VERIF_QTY 合计 {int(detail["VERIF_QTY"].sum())}')
+
+    # 清理
+    detail.drop(columns=['TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF', 'RATIO'], inplace=True)
+
+    return detail, total_central_avg_inv
+
+
 def GetGlobalSchemeLPS(detail: pd.DataFrame, scheme_id: str) -> pd.DataFrame:
     """
     生成全局策略方案环节计划汇总明细表 (ADAM_GLOB_STRATEGY_SCHEME_LPS)
@@ -611,20 +920,21 @@ def GetGlobalSchemeLPS(detail: pd.DataFrame, scheme_id: str) -> pd.DataFrame:
     import time
     import datetime
 
-    # 1. 按管理单位、设备分类、设备类别汇总总需求和日均库存
+    # 1. 按管理单位、设备分类、设备类别汇总各环节数量
     grouped = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'], as_index=False).agg(
         DEMAND_SUM=('DEMAND', 'sum'),
-        AVG_INV_SUM=('AVG_INV', 'sum')   # 仓储使用日均库存总和
+        ARR_QTY_SUM=('ARR_QTY', 'sum'),
+        VERIF_QTY_SUM=('VERIF_QTY', 'sum'),
+        AVG_INV_SUM=('AVG_INV', 'sum')
     )
 
     # 2. 定义环节类型及对应的数量字段
-    # 采购、到货、检定、配送 均使用 DEMAND_SUM；仓储使用 AVG_INV_SUM
     link_mapping = [
-        ('01', 'DEMAND_SUM'),   # 采购
-        ('02', 'DEMAND_SUM'),   # 到货
-        ('03', 'DEMAND_SUM'),   # 检定
-        ('04', 'AVG_INV_SUM'),  # 仓储
-        ('05', 'DEMAND_SUM')    # 配送
+        ('01', 'DEMAND_SUM'),      # 采购 = 需求量
+        ('02', 'ARR_QTY_SUM'),     # 到货 = ceil(1.25×(1.25×DEMAND-合格)-不合格)
+        ('03', 'VERIF_QTY_SUM'),   # 检定 = max(0, DEMAND-实时合格)
+        ('04', 'AVG_INV_SUM'),     # 仓储 = 日均库存
+        ('05', 'DEMAND_SUM')       # 配送 = 需求量
     ]
 
     # 3. 生成记录
@@ -705,11 +1015,11 @@ def GetGlobalSchemeCost(detail: pd.DataFrame, scheme_id: str, yearMonth: str) ->
     # 1. 按管理单位、设备分类、设备类别汇总需求总量及各环节总成本
     grouped = detail.groupby(['ORG_NO', 'DEV_CLS', 'DEV_CATEG'], as_index=False).agg(
         DEMAND_SUM=('DEMAND', 'sum'),
-        COST_01=('ARR_COST', 'sum'),      # 采购
-        COST_02=('ARR_COST', 'sum'),      # 到货
-        COST_03=('VERIF_COST', 'sum'),    # 检定
-        COST_04=('HOLDING_COST', 'sum'),  # 仓储
-        COST_05=('DELIVER_COST', 'sum')   # 配送
+        COST_01=('PROCURE_COST', 'sum'),   # 采购
+        COST_02=('ARR_COST', 'sum'),        # 到货
+        COST_03=('VERIF_COST', 'sum'),      # 检定
+        COST_04=('HOLDING_COST', 'sum'),    # 仓储
+        COST_05=('DELIVER_COST', 'sum')     # 配送
     )
 
     # 2. 生成基础记录（无同比环比）

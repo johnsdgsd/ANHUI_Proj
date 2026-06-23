@@ -34,8 +34,20 @@ def _calc_route_cost(route, DMAT_arr, VeUnitPrice):
     return total
 
 
+def _calc_round_trip_dist(route, DMAT_arr):
+    """计算路径往返总里程: 省中心 → 各站 → 省中心"""
+    deliveries = route['deliveries']
+    if not deliveries:
+        return 0.0
+    dist = DMAT_arr[0, deliveries[0][0]]  # depot → 首站
+    for i in range(len(deliveries) - 1):
+        dist += DMAT_arr[deliveries[i][0], deliveries[i + 1][0]]
+    dist += DMAT_arr[deliveries[-1][0], 0]  # 末站 → depot
+    return dist
+
+
 def _eval_route_fitness(route, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice):
-    """评估路径适应度（成本 + 满载率惩罚，越低越好）"""
+    """评估路径适应度（成本 + 满载率惩罚 + 超距软约束，越低越好）"""
     cost = _calc_route_cost(route, DMAT_arr, VeUnitPrice)
     if not route['deliveries']:
         return cost
@@ -47,6 +59,12 @@ def _eval_route_fitness(route, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice):
     if rate < 0.8:
         penalty = (10000 + cost * 100) * ((0.8 - rate) ** 2)
 
+    round_trip = _calc_round_trip_dist(route, DMAT_arr)
+    if round_trip > 750:
+        penalty += 1e10 * (round_trip - 750)
+
+    # 单位载重率综合成本: (固定基数 + 运输成本 + 惩罚) / (满载率 + 防除零)
+    # 固定基数 500 避免 cost→0 时分母效应放大; 防除零 0.1 保证满载率为 0 时不会除零
     return (500.0 + cost + penalty) / (rate + 0.1)
 
 
@@ -394,7 +412,7 @@ def _merge_scheme_tables(MainDf, DetailDf, VeCap, CarTypeStrList, max_stops, DMA
 
 # ==================== 主入口 ====================
 
-def AdjustDaliyDeliveryV2(date: str, max_stops: int = 5, max_iter: int = 600):
+def AdjustDaliyDeliveryV2(date: str, max_stops: int = 3, max_iter: int = 600):
     """
     启发式日配送调整算法 V2。
 

@@ -20,8 +20,20 @@ from backend.Scheduling.GetDelivPlan import GetDelivPlan
 def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap,
                         VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, record_start_date_str,
                         locations):
+    """
+    【核心运筹引擎：检定与配送联合排程 (Two-Phase Scheduling)】
+
+    算法核心机制拆解：
+    1. 空间配送（正向推导）：基于各地市局的缺口，调用 ALNS 算法排车。
+    2. 检定排产（逆向推导）：
+       - 【Phase 1 (宏观定班)】：剥离批次概念，纯算全月总量。强制优先月初加班，按 8h->12h->24h 的梯队，从每月1号开始填平算力差值。
+       - 【Phase 2 (微观落盘)】：拿着定死的日班次表，将具体批次按 FIFO 灌入。保证批次处于连续的作业时段内，绝不撕裂！
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
+    # =========================================================================
+    # 0. 基础时间轴与辅助函数初始化
+    # =========================================================================
     sim_start_dt = datetime.strptime(sim_start_date_str, '%Y-%m-%d')
     month_end_dt = sim_start_dt + timedelta(days=total_sim_days - 1)
     SubTypeNum = len(SubTypeList)
@@ -69,7 +81,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         return str(val).replace('.0', '').strip() if str(val) not in ('nan', 'None', '') else None
 
     # =========================================================================
-    # 阶段一：先生成配送方案
+    # 阶段一：调用空间运筹模型 (ALNS)，生成车辆配送明细方案
     # =========================================================================
     logging.info(">>> [阶段一] 生成精确到每一辆车的配送路线与日历分配...")
     work_days_list = [d for d in all_days if is_workday_safe(d)]
@@ -153,7 +165,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             GlobalDelivPlan.append({'master': master_data, 'details': details_data})
 
     # =========================================================================
-    # 阶段二：计算缺口与当月排产计划
+    # 阶段二：解析产线结构，生成虚拟物理并发实例
     # =========================================================================
     logging.info(">>> [阶段二] 正在计算缺口与当月到货清库存计划...")
 
@@ -163,56 +175,57 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
     DevCatToLines = defaultdict(list)
     line_idx = 0
+
     if not DeviceCaps.empty:
         for _, row in DeviceCaps.iterrows():
-            line_idx += 1
             veri_cat = str(row['VERI_CATEG']).strip().zfill(2)
             veri_type = str(row['VERI_TYPE']).strip().zfill(2)
 
-            v_num = int(pd.to_numeric(row['VDRILINE_NUM'], errors='coerce') or 0)
+            # 根据 VDRILINE_NUM 将物理连线克隆为独立的并行虚拟线
+            v_num = int(pd.to_numeric(row['VDRILINE_NUM'], errors='coerce') or 1)
+            if v_num <= 0: v_num = 1
+
             p_num = int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1)
             pc_num = int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
-            cap = v_num * p_num * pc_num
-            if cap <= 0: cap = 200
+            cap_per_line = p_num * pc_num
+            if cap_per_line <= 0: cap_per_line = 200
 
             dev_categ_str = str(row.get('DEV_CATEG', '')).strip()
-            for dc in dev_categ_str.replace('，', ',').split(','):
-                if dc.strip():
-                    DevCatToLines[dc.strip()].append({
-                        'line_id': f"L_{line_idx}",
+            cats = [dc.strip() for dc in dev_categ_str.replace('，', ',').split(',') if dc.strip()]
+
+            for i in range(v_num):
+                line_idx += 1
+                unique_line_id = f"L_{line_idx}"
+                for dc in cats:
+                    DevCatToLines[dc].append({
+                        'line_id': unique_line_id,
                         'veri_cat': veri_cat,
                         'veri_type': veri_type,
-                        'batch_cap': cap
+                        'batch_cap': cap_per_line
                     })
 
-    HoursUsed = {d: defaultdict(float) for d in all_days}
-    QtyUsed = {d: defaultdict(int) for d in all_days}
-    CatMaxHrs = {d: defaultdict(float) for d in all_days}
-
+    # =========================================================================
+    # 构建待检批次队列 (FIFO)
+    # =========================================================================
     LotObjects = []
-
     for idx, row in LotList.iterrows():
         dev_code_str = row['DEV_CODE_NO']
         sub_idx = DevCodeToIndex.get(dev_code_str)
-        if sub_idx is None:
-            continue
+        if sub_idx is None: continue
 
         arr_dt_pd = pd.to_datetime(row['PLAN_DATE'])
         arr_dt = datetime(arr_dt_pd.year, arr_dt_pd.month, arr_dt_pd.day) if not pd.isna(arr_dt_pd) else sim_start_dt
 
         rem = int(row['RemNum'])
-        if rem <= 0:
-            continue
+        if rem <= 0: continue
 
         is_realtime = (str(row.get('SOURCE_TYPE', '')).upper() == 'REALTIME')
         days_to_end = (month_end_dt - arr_dt).days
-
-        # 卸载掉补丁：因为到货时间已经是100%绝对真实的，直接遵循“次日开工”的物理铁律即可！
         earliest_bgn = max(arr_dt + timedelta(days=1), sim_start_dt)
-
         last_dist_date = Last_Delivery_Date.get(sub_idx, sim_start_dt)
         is_actually_needed = (Inspect_Target[sub_idx] > 0) and (earliest_bgn <= last_dist_date)
 
+        # 混合备货策略：前中期全部兜底囤货，月末压线严格按需检定
         if is_realtime:
             take = rem
         elif days_to_end >= 5:
@@ -220,76 +233,172 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         else:
             take = rem if is_actually_needed else 0
 
-        if take <= 0:
-            continue
+        if take <= 0: continue
 
         if Inspect_Target[sub_idx] > 0 and is_actually_needed:
             Inspect_Target[sub_idx] -= take
 
         LotObjects.append({
-            'idx': idx, 'row': row,
-            'orig_take': take, 'rem': take,
-            'earliest': earliest_bgn,
-            'bgn': None, 'end': None, 'veri_type_used': None
+            'idx': idx, 'row': row, 'earliest': earliest_bgn,
+            'orig_take': take, 'rem': take, 'processed': 0,
+            'bgn': None, 'end': None, 'veri_types_used': set()
         })
 
-    # 【8级漏斗：极致压榨产线】
-    inspection_passes = [
-        {'max_h': 8, 'auto': True, 'wd': True},
-        {'max_h': 12, 'auto': True, 'wd': True},
-        {'max_h': 24, 'auto': True, 'wd': True},
-        {'max_h': 24, 'auto': True, 'wd': False},
-        {'max_h': 8, 'auto': False, 'wd': True},
-        {'max_h': 12, 'auto': False, 'wd': True},
-        {'max_h': 24, 'auto': False, 'wd': True},
-        {'max_h': 24, 'auto': False, 'wd': False}
+    # =========================================================================
+    # 【核心：Phase 1 宏观产能规划 (时间顺序优先月初)】
+    # 不看具体批次到达时间，纯算账！如果全月需要加班 2 天 12H，雷打不动铺在 1号、2号！
+    # =========================================================================
+
+    # 记录每天分配的宏观工时上限
+    cat_auto_h_dict = defaultdict(lambda: np.zeros(total_sim_days))
+    cat_manual_h_dict = defaultdict(lambda: np.zeros(total_sim_days))
+
+    # 定义 8 级阶梯。注意：is_base=True 代表基础工作日产能，无条件全月铺满 8H。
+    # 其余阶梯都是加班增量，只有全月总任务吃不消时，才会从每月 1 号开始依次触发！
+    passes = [
+        {'is_auto': True, 'target': 'wd', 'add_h': 8, 'is_base': True},  # 自动线 基础8H
+        {'is_auto': True, 'target': 'wd', 'add_h': 4, 'is_base': False},  # 自动线 +4H (变12H)
+        {'is_auto': True, 'target': 'wd', 'add_h': 12, 'is_base': False},  # 自动线 +12H (变24H)
+        {'is_auto': True, 'target': 'we', 'add_h': 24, 'is_base': False},  # 自动线 周末24H
+        {'is_auto': False, 'target': 'wd', 'add_h': 8, 'is_base': False},  # 人工线 开始启动 8H
+        {'is_auto': False, 'target': 'wd', 'add_h': 4, 'is_base': False},  # 人工线 +4H (变12H)
+        {'is_auto': False, 'target': 'wd', 'add_h': 12, 'is_base': False},  # 人工线 +12H (变24H)
+        {'is_auto': False, 'target': 'we', 'add_h': 24, 'is_base': False},  # 人工线 周末24H
     ]
 
-    for p in inspection_passes:
-        for lot in LotObjects:
-            if lot['rem'] <= 0: continue
-            dev_code_str = lot['row']['DEV_CODE_NO']
-            dev_cat = get_cat(dev_code_str)
-            lines = DevCatToLines.get(dev_cat, [])
+    all_cats = set(get_cat(lot['row']['DEV_CODE_NO']) for lot in LotObjects)
+
+    for cat in all_cats:
+        lots_cat = [lot for lot in LotObjects if get_cat(lot['row']['DEV_CODE_NO']) == cat]
+
+        auto_lines = [l for l in DevCatToLines.get(cat, []) if l['veri_type'] == '02']
+        manual_lines = [l for l in DevCatToLines.get(cat, []) if l['veri_type'] == '01']
+        num_a, num_m = len(auto_lines), len(manual_lines)
+        if num_a == 0 and num_m == 0: continue
+
+        # 换算流速 PPH
+        sample_code = lots_cat[0]['row']['DEV_CODE_NO']
+        a_dur = get_detect_time(sample_code, '02')
+        m_dur = get_detect_time(sample_code, '01')
+        a_pph = (auto_lines[0]['batch_cap'] if num_a > 0 else 200) / a_dur if a_dur > 0 else 9999
+        m_pph = (manual_lines[0]['batch_cap'] if num_m > 0 else 200) / m_dur if m_dur > 0 else 9999
+
+        # 该品类全月总共要消化的数量
+        rem_items = sum(lot['rem'] for lot in lots_cat)
+
+        # 按优先级阶梯，依次将任务量折算为时间铺设到日历上
+        for p in passes:
+            # 如果不是基础班，且任务已经全部分配完了，停止后续更高级别的加班运算！
+            if not p.get('is_base', False) and rem_items <= 0.0001: break
+
+            is_auto = p['is_auto']
+            if is_auto and num_a == 0: continue
+            if not is_auto and num_m == 0: continue
+
+            pph = a_pph if is_auto else m_pph
+            num_l = num_a if is_auto else num_m
+
+            # 【完美月初优先】：永远从 day 0 (1号) 开始循环寻找可以垫高工时的日子！
+            for d_idx in range(total_sim_days):
+                if not p.get('is_base', False) and rem_items <= 0.0001: break
+
+                d = all_days[d_idx]
+                is_wd = is_workday_safe(d)
+
+                # 'wd' 仅工作日生效，'we' 仅周末生效
+                if p['target'] == 'wd' and not is_wd: continue
+                if p['target'] == 'we' and is_wd: continue
+
+                cap_items = p['add_h'] * num_l * pph  # 这个班次格子能吃多少货
+
+                if p.get('is_base', False):
+                    # 基础班次无条件全月铺设 8H，即使导致 rem_items 变成负数（产能溢出）也没关系
+                    actual_items = cap_items
+                    need_h = p['add_h']
+                else:
+                    # 加班班次极度克制：只吃掉剩余的缺口量，缺口吃完立马停止，绝不多排一天！
+                    actual_items = min(rem_items, cap_items)
+                    need_h = actual_items / (num_l * pph)
+
+                if is_auto:
+                    cat_auto_h_dict[cat][d_idx] += need_h
+                else:
+                    cat_manual_h_dict[cat][d_idx] += need_h
+
+                rem_items -= actual_items
+
+    # =========================================================================
+    # 【核心：Phase 2 微观批次物理落盘 (绝不撕裂)】
+    # Phase 1 已经把每天的框子（8H或12H）定死了。
+    # 批次来了，直接往当天的框子里灌，如果 12H 框子大，批次就在 12H 内一口气干完！
+    # =========================================================================
+    HoursUsed = {d: defaultdict(float) for d in all_days}
+    QtyUsed = {d: defaultdict(float) for d in all_days}
+
+    # 修复关键点：追踪物理产线大类（VERI_CATEG，如'01'或'02'）所承载的宏观最高排班时长
+    MaxAlloc = {d: defaultdict(float) for d in all_days}
+
+    for lot in LotObjects:
+        if lot['rem'] <= 0.0001: continue
+
+        cat = get_cat(lot['row']['DEV_CODE_NO'])
+        dev_code = lot['row']['DEV_CODE_NO']
+
+        lines = sorted(DevCatToLines.get(cat, []), key=lambda x: str(x['veri_type']), reverse=True)
+        curr_idx = max(0, (lot['earliest'] - sim_start_dt).days)
+
+        while lot['rem'] > 0.0001 and curr_idx < len(all_days):
+            d = all_days[curr_idx]
 
             for line in lines:
-                if p['auto'] and line['veri_type'] != '02': continue
-                if not p['auto'] and line['veri_type'] == '02': continue
+                if lot['rem'] <= 0.0001: break
 
-                detect_time_hours = get_detect_time(dev_code_str, line['veri_type'])
-                pph = line['batch_cap'] / detect_time_hours if detect_time_hours > 0 else 9999
+                is_auto = (line['veri_type'] == '02')
+                # 调取 Phase 1 算好的当天这条线的“宏观最大工时”
+                allowed_h = cat_auto_h_dict[cat][curr_idx] if is_auto else cat_manual_h_dict[cat][curr_idx]
 
-                for d in all_days:
-                    if d < lot['earliest']: continue
-                    is_wd = is_workday_safe(d)
-                    if p['wd'] and not is_wd: continue
-                    if not p['wd'] and is_wd: continue
+                # 减去被前面的批次占用的时间，剩下的就是当前可分配的连续空隙
+                avail_h = allowed_h - HoursUsed[d][line['line_id']]
 
-                    avail_h = p['max_h'] - HoursUsed[d][line['line_id']]
-                    if avail_h > 0:
-                        do_qty = min(lot['rem'], math.floor(avail_h * pph))
-                        if do_qty > 0:
-                            lot['rem'] -= do_qty
-                            used_h = do_qty / pph
-                            HoursUsed[d][line['line_id']] += used_h
-                            QtyUsed[d][line['veri_cat']] += do_qty
-                            CatMaxHrs[d][line['veri_cat']] = max(CatMaxHrs[d][line['veri_cat']],
-                                                                 HoursUsed[d][line['line_id']])
+                if avail_h > 0:
+                    dur = get_detect_time(dev_code, line['veri_type'])
+                    pph = line['batch_cap'] / dur if dur > 0 else 9999
 
-                            if not lot['bgn'] or d < lot['bgn']: lot['bgn'] = d
-                            if not lot['end'] or d > lot['end']: lot['end'] = d
-                            lot['veri_type_used'] = line['veri_type']
-                    if lot['rem'] <= 0: break
-            if lot['rem'] <= 0: continue
+                    do_qty = min(lot['rem'], avail_h * pph)
+                    if do_qty > 0.0001:
+                        used_h = do_qty / pph
+                        lot['rem'] -= do_qty
+                        lot['processed'] += do_qty
 
+                        # 落盘统计
+                        HoursUsed[d][line['line_id']] += used_h
+                        QtyUsed[d][line['veri_cat']] += do_qty
+
+                        # 同步记录这条物理线（veri_cat，如大类'01'）今天被分配了多大的宏观班次框
+                        MaxAlloc[d][line['veri_cat']] = max(MaxAlloc[d][line['veri_cat']], allowed_h)
+
+                        lot['veri_types_used'].add(line['veri_type'])
+
+                        if not lot['bgn'] or d < lot['bgn']: lot['bgn'] = d
+                        if not lot['end'] or d > lot['end']: lot['end'] = d
+
+            curr_idx += 1
+
+    # =========================================================================
+    # 落库结果组装输出
+    # =========================================================================
     DetectPlanResult = []
     for lot in LotObjects:
-        if lot['rem'] > 0:
+        if lot['rem'] > 0.0001:
             logging.warning(
-                f"⚠️ [产能告急] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} (设备 {lot['row']['DEV_CODE_NO']}) 仍有 {lot['rem']} 只未能在本月排产，顺延至下月！")
+                f"⚠️ [产能极度高压] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} 经全月极限排产仍剩 {lot['rem']} 只，将顺延！")
 
         if lot['bgn'] is None: continue
-        actual_detected_num = lot['orig_take'] - lot['rem']
+        actual_detected_num = int(lot['processed'])
+
+        # 只要沾了自动线就显示 02
+        primary_veri_type = '02' if '02' in lot['veri_types_used'] else (
+            '01' if '01' in lot['veri_types_used'] else '01')
 
         if actual_detected_num > 0:
             DetectPlanResult.append({
@@ -300,21 +409,31 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 'DETECT_PLAN_NUM': actual_detected_num,
                 'DETECT_BGN_DATE': lot['bgn'].strftime('%Y-%m-%d'), 'DETECT_END_DATE': lot['end'].strftime('%Y-%m-%d'),
                 'PLAN_STAT': '01', 'DAY_DETECT_PLAN_PRE_ID': lot['row'].get('DAY_DETECT_PLAN_PRE_ID'),
-                'VERI_TYPE': lot['veri_type_used'] or '01'
+                'VERI_TYPE': primary_veri_type
             })
 
     WorkArrangeResult = []
     for d in all_days:
-        for cat, qty in QtyUsed[d].items():
+        # 修复：遍历真正在当天干过活的产线大类（VERI_CATEG）
+        for veri_cat, qty in QtyUsed[d].items():
             if qty <= 0: continue
 
-            hrs = CatMaxHrs[d][cat]
-            w_flag = '02' if is_workday_safe(d) else '03'
-            d_dur = '8h' if hrs <= 8.1 else ('12h' if hrs <= 12.1 else '24h')
+            # 获取这条大类线在当天的最高宏观班次配置（由 Phase 1 定死，Phase 2 透传）
+            max_alloc = MaxAlloc[d][veri_cat]
+
+            # 【精准打标】：完美反映阶梯溢出的结果。只要加班量溢出到了 12H 的区间，就定性为 12h 班。
+            if max_alloc <= 8.1:
+                d_dur = '8h'
+            elif max_alloc <= 12.1:
+                d_dur = '12h'
+            else:
+                d_dur = '24h'
+
+            w_flag = '02'  # 强制工作日状态兜底
+
             WorkArrangeResult.append({
-                'VERI_CATEG': cat, 'WORK_DATE': d.strftime('%Y-%m-%d'), 'WORK_FLAG': w_flag,
-                'DETECT_DUR': d_dur,
-                'CAPACITY_NUM': int(qty)
+                'VERI_CATEG': veri_cat, 'WORK_DATE': d.strftime('%Y-%m-%d'), 'WORK_FLAG': w_flag,
+                'DETECT_DUR': d_dur, 'CAPACITY_NUM': int(qty)
             })
 
     return pd.DataFrame(DetectPlanResult), GlobalDelivPlan, pd.DataFrame(WorkArrangeResult)

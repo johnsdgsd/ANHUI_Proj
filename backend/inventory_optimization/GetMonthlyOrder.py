@@ -14,6 +14,24 @@ from backend.inventory_optimization.demand_distribution import PoissonDistributi
 from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
 
 
+def _ceil_to_multiple(qty: int, m: int) -> int:
+    """向上取整到 m 的倍数"""
+    return ((qty + m - 1) // m) * m
+
+
+def _round_order_qty(qty: int, dev_cls: str, dev_categ: str) -> int:
+    """按设备类别/品类取整补库数量"""
+    if qty == 0:
+        return 0
+    if dev_cls == '02':
+        return _ceil_to_multiple(qty, 36)
+    elif dev_cls == '09':
+        return _ceil_to_multiple(qty, 20)
+    elif dev_cls == '01':
+        return _ceil_to_multiple(qty, 60) if dev_categ == '01_01' else _ceil_to_multiple(qty, 20)
+    return qty
+
+
 def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFrame,tag:str,alpha:float):
     '''
     计算月度各市县库存阈值
@@ -110,7 +128,9 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
             # 获取设备分类和类别
             dev_cls = dev_cls_mapping.get(item.dev_code, '')
             dev_categ = dev_categ_mapping.get(item.dev_code, '')
-            
+            # 按设备类别/品类取整
+            order = _round_order_qty(order, dev_cls, dev_categ)
+
             record1 = {
                 "STOCK_MONTH_LIMIT_PRE_ID": stock_id,  # 修正字段名拼写
                 "PRE_YEAR": year,

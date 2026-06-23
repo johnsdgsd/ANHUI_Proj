@@ -1986,3 +1986,110 @@ def query_pk_next(pkCode: str, num: int) -> list:
 
     except Exception as e:
         raise
+
+
+def query_adam_realtime_pend_stock():
+    """查询实时待检库存（不合格品）"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_realtime_pend_stock'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise
+
+
+def query_adam_realtime_qua_stock():
+    """查询实时合格品库存"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_realtime_qua_stock'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise
+
+
+def query_adam_future_arrivals(start_bound: str, end_bound: str):
+    """查询区间内未来到货量"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_future_arrivals'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"start_bound": start_bound, "end_bound": end_bound})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise
+
+
+def query_adam_future_detections(start_bound: str, end_bound: str):
+    """查询区间内未来检定完成量"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_future_detections'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"start_bound": start_bound, "end_bound": end_bound})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise
+
+
+def query_adam_completed_inspections(target_month: str):
+    """查询当月已检定完工量
+
+    Args:
+        target_month: 目标月份, 格式 'YYYYMM'
+
+    Returns:
+        pd.DataFrame: 包含 DEV_CODE, INSPECTED_NUM 等列
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_completed_inspections'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"target_month": target_month})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise

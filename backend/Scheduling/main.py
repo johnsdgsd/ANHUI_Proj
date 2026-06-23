@@ -227,47 +227,92 @@ def run_full_aps_process(preMonth, preConcId=None):
 
             if df_orders.empty: continue
 
-            dev_orders = df_orders[df_orders['DEV_CODE'] == dev_code].sort_values(by='ORDER_NUM', ascending=False)
+            dev_orders = df_orders[df_orders['DEV_CODE'] == dev_code]
             if dev_orders.empty: continue
 
-            M = box_mapping.get(dev_code, 5)
-            max_pieces_per_batch = 2500 * M
+            # =========================================================================
+            #严格基于订单模板 + 绝对防爆仓 + 绝对不产生散件
+            # =========================================================================
+            unique_orders = sorted([int(x) for x in dev_orders['ORDER_NUM'].unique() if int(x) > 0], reverse=True)
+            if not unique_orders: continue
+
+            M = unique_orders[-1]  # 绝对最小发货标准
+            box_cap = box_mapping.get(dev_code, 5)
+            max_pieces_per_batch = 2500 * box_cap
 
             actual_assigned_qty = 0
             dev_lot_list = []
 
-            for _, order in dev_orders.iterrows():
+            # 1. 规格贪心切分：从大到小吃需求
+            for order_qty in unique_orders:
                 if target_req <= 0: break
 
-                avail_order_qty = int(order['ORDER_NUM'])
-                if avail_order_qty <= 0: continue
+                num_full_batches = target_req // order_qty
 
-                take_qty = min(target_req, avail_order_qty)
-                take_qty = math.ceil(take_qty / M) * M
+                for _ in range(num_full_batches):
+                    remaining_in_batch = order_qty
 
-                if take_qty > avail_order_qty:
-                    take_qty = math.floor(avail_order_qty / M) * M
+                    # 循环切分当前订单规格
+                    while remaining_in_batch > 0:
+                        # 场景 A: 剩下的小于库房极限，一刀切完，绝不爆仓
+                        if remaining_in_batch <= max_pieces_per_batch:
+                            chunk = remaining_in_batch
+                        # 场景 B: 剩下的大于库房极限，需要顶着极限切一刀
+                        else:
+                            chunk = max_pieces_per_batch
+                            remainder = remaining_in_batch - chunk
 
-                if take_qty <= 0: continue
+                            # 核心防散件逻辑：如果切完极限后，剩下的尾巴变成散件(小于 M)了
+                            if 0 < remainder < M:
+                                # 调整当前刀法：把当前这一刀切小一点，从而给最后正好留出 M
+                                chunk = remaining_in_batch - M
+                                # 极端物理异常：如果库房极限比 M 还小，为了【绝对不爆仓】，只能截断极限
+                                if chunk <= 0:
+                                    chunk = max_pieces_per_batch
 
-                remaining_to_split = take_qty
-                while remaining_to_split > 0:
-                    chunk = min(remaining_to_split, max_pieces_per_batch)
+                        dev_lot_list.append({
+                            'DEV_CODE_NO': dev_code,
+                            'PLAN_ARR_NUM': chunk,
+                            'PLAN_ARR_DATE': target_dt.replace(day=1).strftime('%Y-%m-%d %H:%M:%S')
+                        })
+                        remaining_in_batch -= chunk
+                        actual_assigned_qty += chunk
+
+                    # 扣除已安排的需求
+                    target_req -= order_qty
+
+            # 2. 尾批兜底：如果还剩一点点零散需求未被吃掉
+            if target_req > 0:
+                # 铁律：尾批订单很小，强制拉高到最小采购量 M
+                tail_qty = max(target_req, M)
+
+                remaining_in_batch = tail_qty
+                while remaining_in_batch > 0:
+                    # 使用与上面完全一样的绝对安全刀法
+                    if remaining_in_batch <= max_pieces_per_batch:
+                        chunk = remaining_in_batch
+                    else:
+                        chunk = max_pieces_per_batch
+                        remainder = remaining_in_batch - chunk
+                        if 0 < remainder < M:
+                            chunk = remaining_in_batch - M
+                            if chunk <= 0:
+                                chunk = max_pieces_per_batch
 
                     dev_lot_list.append({
                         'DEV_CODE_NO': dev_code,
                         'PLAN_ARR_NUM': chunk,
                         'PLAN_ARR_DATE': target_dt.replace(day=1).strftime('%Y-%m-%d %H:%M:%S')
                     })
-
-                    remaining_to_split -= chunk
-                    target_req -= chunk
+                    remaining_in_batch -= chunk
                     actual_assigned_qty += chunk
+
+                target_req = 0
 
             if actual_assigned_qty > 0:
                 lot_list_data.extend(dev_lot_list)
                 month_plan_data.append({
-                    "MONTH_PLAN_ARR_ID": None,  # 预留主键占位符
+                    "MONTH_PLAN_ARR_ID": None,
                     "PLAN_ARR_NO": f"MP-{preMonth}-{dev_code}",
                     "PRE_YEAR": target_dt.strftime('%Y'),
                     "PRE_MONTH": target_dt.strftime('%m'),
@@ -284,9 +329,6 @@ def run_full_aps_process(preMonth, preConcId=None):
             update_pre_conc_status(preConcId, '03')
             return
 
-        # =========================================================================
-        # 【修改1】：批量获取 [月到货] 主键 SEQ_ADAM_MONTH_PLAN_ARR_PRE
-        # =========================================================================
         if month_plan_data:
             month_ids = fetch_primary_keys("SEQ_ADAM_MONTH_PLAN_ARR_PRE", len(month_plan_data))
             for i, data in enumerate(month_plan_data):
@@ -310,9 +352,6 @@ def run_full_aps_process(preMonth, preConcId=None):
 
         day_plan_data = []
         if not ARR_PLAN_RESULT.empty:
-            # =========================================================================
-            # 【修改2】：批量获取 [日到货] 主键 SEQ_ADAM_DAY_PLAN_ARR_PRE
-            # =========================================================================
             day_ids = fetch_primary_keys("SEQ_ADAM_DAY_PLAN_ARR_PRE", len(ARR_PLAN_RESULT))
             for i, (idx, row) in enumerate(ARR_PLAN_RESULT.iterrows()):
                 plan_date = row['PLAN_ARR_DATE']
