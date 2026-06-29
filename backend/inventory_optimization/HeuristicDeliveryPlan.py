@@ -482,7 +482,8 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     total_boxes = np.sum(DemandsBoxs)
     unit_sum = {i + 1: float(DemandsBoxs[i]) for i in range(LocationNum) if DemandsBoxs[i] > 0}
     logging.info(f"箱数转换完成: 总件数={int(total_pieces)}, 总箱数={int(total_boxes)}, 有需求站点={len(unit_sum)}")
-    logging.info(f"站点需求分布: min={min(unit_sum.values()):.0f}, max={max(unit_sum.values()):.0f}, avg={total_boxes/len(unit_sum):.1f}")
+    if unit_sum:
+        logging.info(f"站点需求分布: min={min(unit_sum.values()):.0f}, max={max(unit_sum.values()):.0f}, avg={total_boxes/len(unit_sum):.1f}")
 
     empty_cols = {
         'main': ['DIST_SCHEME_ID', 'CAR_TYPE', 'PLAN_DIST_DATE', 'DIST_FLAG', 'LATE_FLAG',

@@ -765,8 +765,11 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     )
 
     def _clean_dev_code(df):
-        """清洗 DEV_CODE: 转字符串去空格去 .0"""
+        """清洗 DEV_CODE: 统一列名大写, DEV_CODE_NO → DEV_CODE, 转字符串去空格去 .0"""
         df = df.copy()
+        df.columns = [c.upper() for c in df.columns]
+        if 'DEV_CODE_NO' in df.columns and 'DEV_CODE' not in df.columns:
+            df.rename(columns={'DEV_CODE_NO': 'DEV_CODE'}, inplace=True)
         if 'DEV_CODE' in df.columns:
             df['DEV_CODE'] = df['DEV_CODE'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         return df
@@ -783,59 +786,54 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     qua_period = prev_dt.strftime('%Y%m')
     logger.info(f'[到货/检定量] 合格品快照: {qua_period} (目标月-2)')
 
-    df_qua = query_adam_qua_stock_sample_by_year_month(
-        prev_dt.strftime('%Y'), prev_dt.strftime('%m')
-    )
-    df_qua = df_qua[['DEV_CODE', 'QUA_STOCK_NUM']] if not df_qua.empty else pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
-    df_qua = _clean_dev_code(df_qua)
-    df_qua = df_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK_NUM'].sum()
-    df_qua.rename(columns={'QUA_STOCK_NUM': 'QUA_STOCK'}, inplace=True)
-    logger.info(f'[到货/检定量] 合格品快照: {len(df_qua)} 个设备码, 合计 {int(df_qua["QUA_STOCK"].sum())} 只')
-
-    # 实时待检 + 区间到货 - 区间检定 = 不合格品
-    df_pend = query_adam_realtime_pend_stock()
-    df_pend = df_pend[['DEV_CODE', 'NOW_PEND_NUM']] if not df_pend.empty else pd.DataFrame(columns=['DEV_CODE', 'NOW_PEND_NUM'])
-    df_pend = _clean_dev_code(df_pend)
-    df_pend = df_pend.groupby('DEV_CODE', as_index=False)['NOW_PEND_NUM'].sum()
-    logger.info(f'[到货/检定量] 实时待检: {len(df_pend)} 个设备码, 合计 {int(df_pend["NOW_PEND_NUM"].sum())} 只')
+    raw_qua = query_adam_qua_stock_sample_by_year_month(prev_dt.strftime('%Y'), prev_dt.strftime('%m'))
+    raw_pend = query_adam_realtime_pend_stock()
 
     target_start = target_dt.strftime('%Y-%m-%d 00:00:00')
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f'[到货/检定量] 区间范围: {now_str} → {target_start}')
 
-    df_arr = query_adam_future_arrivals(now_str, target_start)
-    df_arr = df_arr[['DEV_CODE', 'ARR_NUM']] if not df_arr.empty else pd.DataFrame(columns=['DEV_CODE', 'ARR_NUM'])
-    df_arr = _clean_dev_code(df_arr)
-    df_arr = df_arr.groupby('DEV_CODE', as_index=False)['ARR_NUM'].sum()
+    raw_arr = query_adam_future_arrivals(now_str, target_start)
+    raw_det = query_adam_future_detections(now_str, target_start)
+    raw_rt_qua = query_adam_realtime_qua_stock()
+    raw_insp = query_adam_completed_inspections(yearMonth)
+
+    # ---- 统一清洗: 列名大写, DEV_CODE_NO → DEV_CODE, 按 DEV_CODE 汇总 ----
+
+    def _clean_and_sum(raw, val_col, output_col=None):
+        """清洗 → 按 DEV_CODE 汇总 → 重命名"""
+        if raw.empty:
+            return pd.DataFrame(columns=['DEV_CODE', output_col or val_col])
+        raw = _clean_dev_code(raw)
+        result = raw.groupby('DEV_CODE', as_index=False)[val_col.upper()].sum()
+        if output_col:
+            result.rename(columns={val_col.upper(): output_col}, inplace=True)
+        return result
+
+    df_qua = _clean_and_sum(raw_qua, 'QUA_STOCK_NUM', 'QUA_STOCK')
+    logger.info(f'[到货/检定量] 合格品快照: {len(df_qua)} 个设备码, 合计 {int(df_qua["QUA_STOCK"].sum())} 只')
+
+    df_pend = _clean_and_sum(raw_pend, 'NOW_PEND_NUM')
+    logger.info(f'[到货/检定量] 实时待检: {len(df_pend)} 个设备码, 合计 {int(df_pend["NOW_PEND_NUM"].sum())} 只')
+
+    df_arr = _clean_and_sum(raw_arr, 'ARR_NUM')
     logger.info(f'[到货/检定量] 区间到货: {len(df_arr)} 个设备码, 合计 {int(df_arr["ARR_NUM"].sum())} 只')
 
-    df_det = query_adam_future_detections(now_str, target_start)
-    df_det = df_det[['DEV_CODE', 'DETECT_NUM']] if not df_det.empty else pd.DataFrame(columns=['DEV_CODE', 'DETECT_NUM'])
-    df_det = _clean_dev_code(df_det)
-    df_det = df_det.groupby('DEV_CODE', as_index=False)['DETECT_NUM'].sum()
+    df_det = _clean_and_sum(raw_det, 'DETECT_NUM')
     logger.info(f'[到货/检定量] 区间检定: {len(df_det)} 个设备码, 合计 {int(df_det["DETECT_NUM"].sum())} 只')
 
-    # 合并为不合格品: 实时待检 + 区间到货 - 区间检定
+    df_rt_qua = _clean_and_sum(raw_rt_qua, 'QUA_STOCK_NUM', 'QUA_STOCK_RT')
+    logger.info(f'[到货/检定量] 实时合格品: {len(df_rt_qua)} 个设备码, 合计 {int(df_rt_qua["QUA_STOCK_RT"].sum())} 只')
+
+    df_insp = _clean_and_sum(raw_insp, 'INSPECTED_NUM')
+    logger.info(f'[到货/检定量] 已检定完工: {len(df_insp)} 个设备码, 合计 {int(df_insp["INSPECTED_NUM"].sum())} 只')
+
+    # 推算不合格品: 实时待检 + 区间到货 - 区间检定
     df_unqua = df_pend.merge(df_arr, on='DEV_CODE', how='outer').merge(df_det, on='DEV_CODE', how='outer')
     df_unqua.fillna(0, inplace=True)
     df_unqua['UNQUA_STOCK'] = (df_unqua['NOW_PEND_NUM'] + df_unqua['ARR_NUM'] - df_unqua['DETECT_NUM']).clip(lower=0)
     df_unqua = df_unqua[['DEV_CODE', 'UNQUA_STOCK']]
     logger.info(f'[到货/检定量] 推算不合格品: {len(df_unqua)} 个设备码, 合计 {int(df_unqua["UNQUA_STOCK"].sum())} 只')
-
-    # 实时合格品
-    df_rt_qua = query_adam_realtime_qua_stock()
-    df_rt_qua = df_rt_qua[['DEV_CODE', 'QUA_STOCK_NUM']] if not df_rt_qua.empty else pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
-    df_rt_qua = _clean_dev_code(df_rt_qua)
-    df_rt_qua = df_rt_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK_NUM'].sum()
-    df_rt_qua.rename(columns={'QUA_STOCK_NUM': 'QUA_STOCK_RT'}, inplace=True)
-    logger.info(f'[到货/检定量] 实时合格品: {len(df_rt_qua)} 个设备码, 合计 {int(df_rt_qua["QUA_STOCK_RT"].sum())} 只')
-
-    # 当月已检定完工量
-    df_insp = query_adam_completed_inspections(yearMonth)
-    df_insp = df_insp[['DEV_CODE', 'INSPECTED_NUM']] if not df_insp.empty else pd.DataFrame(columns=['DEV_CODE', 'INSPECTED_NUM'])
-    df_insp = _clean_dev_code(df_insp)
-    df_insp = df_insp.groupby('DEV_CODE', as_index=False)['INSPECTED_NUM'].sum()
-    logger.info(f'[到货/检定量] 已检定完工: {len(df_insp)} 个设备码, 合计 {int(df_insp["INSPECTED_NUM"].sum())} 只')
 
     # 合并为库存总表 DF_stock: 每个 DEV_CODE 一行
     DF_stock = df_qua.merge(df_unqua, on='DEV_CODE', how='outer') \

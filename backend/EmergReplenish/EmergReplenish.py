@@ -254,7 +254,7 @@ def run_emergency_replenishment(
             'DEV_CLS': dev_cls,
             'DEV_CATEG': dev_categ,
             'DEV_CODE': dev_code,
-            'PLAN_IAS_NUM': row['RECOMMEND_QTY'],
+            'PLAN_IAS_NUM': int(row['RECOMMEND_QTY']),
             'EST_STOCK_NUM': None,                # 预计库存不填
             'GLOBAL_SCHEME_ID': row['GLOBAL_SCHEME_ID'],  # 统一全局ID
             'DAILY_PLAN_STATUS': '01',           # 未确认

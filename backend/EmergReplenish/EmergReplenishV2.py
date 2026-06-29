@@ -267,7 +267,7 @@ def run_emergency_replenishment_v2(
             'DEV_CLS': spec.iloc[0]['DEV_CLS'],
             'DEV_CATEG': spec.iloc[0]['DEV_CATEG'],
             'DEV_CODE': dev_code,
-            'PLAN_IAS_NUM': row['RECOMMEND_QTY'],
+            'PLAN_IAS_NUM': int(row['RECOMMEND_QTY']),
             'EST_STOCK_NUM': None,
             'GLOBAL_SCHEME_ID': row['GLOBAL_SCHEME_ID'],
             'DAILY_PLAN_STATUS': '01',
@@ -280,7 +280,7 @@ def run_emergency_replenishment_v2(
 
     insert_df = pd.DataFrame(insert_records)
     from backend.api.data_api.fetch_data import query_pk_next
-    insert_df['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_DAY_IAS_PRE_EMERGENCY", len(insert_df))]
+    insert_df['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_DAY_IAS_PRE", len(insert_df))]
 
     try:
         result = insert_into_adam_plan_day_ias_pre(insert_df)
