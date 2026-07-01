@@ -46,7 +46,31 @@ def _calc_round_trip_dist(route, DMAT_arr):
     return dist
 
 
-def _eval_route_fitness(route, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice):
+def _max_sector_angle(station_indices, lons, lats):
+    """以省中心(索引0)为顶点，计算覆盖给定站点的最小扇形角度"""
+    if len(station_indices) <= 1:
+        return 0.0
+    depot_lat, depot_lon = math.radians(lats[0]), math.radians(lons[0])
+    bearings = []
+    for i in station_indices:
+        lat_i = math.radians(lats[i])
+        lon_i = math.radians(lons[i])
+        dlon = lon_i - depot_lon
+        y = math.sin(dlon) * math.cos(lat_i)
+        x = (math.cos(depot_lat) * math.sin(lat_i)
+             - math.sin(depot_lat) * math.cos(lat_i) * math.cos(dlon))
+        b = math.degrees(math.atan2(y, x))
+        bearings.append((b + 360) % 360)
+    bearings.sort()
+    max_gap = max(
+        (bearings[i + 1] - bearings[i] for i in range(len(bearings) - 1)),
+        default=0
+    )
+    max_gap = max(max_gap, 360 - (bearings[-1] - bearings[0]))
+    return 360 - max_gap
+
+
+def _eval_route_fitness(route, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice, lons=None, lats=None):
     """评估路径适应度（成本 + 满载率惩罚 + 超距软约束，越低越好）"""
     cost = _calc_route_cost(route, DMAT_arr, VeUnitPrice)
     if not route['deliveries']:
@@ -62,6 +86,14 @@ def _eval_route_fitness(route, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice):
     round_trip = _calc_round_trip_dist(route, DMAT_arr)
     if round_trip > 750:
         penalty += 1e10 * (round_trip - 750)
+
+    if lons is not None and lats is not None:
+        station_indices = [cid for cid, _ in route['deliveries']]
+        angle = _max_sector_angle(station_indices, lons, lats)
+        if angle > 45:
+            penalty += 1e10 * (angle - 45)
+            logging.info(f"[角度约束] 适应度惩罚: 站点={station_indices}, 夹角={angle:.1f}° > 45°, "
+                          f"惩罚={1e10 * (angle - 45):.0f}")
 
     # 单位载重率综合成本: (固定基数 + 运输成本 + 惩罚) / (满载率 + 防除零)
     # 固定基数 500 避免 cost→0 时分母效应放大; 防除零 0.1 保证满载率为 0 时不会除零
@@ -111,9 +143,11 @@ def _reassign_vehicles(routes, VEHICLE_CONFIG):
     return sorted_routes
 
 
-def _generate_initial_solution(unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice):
+def _generate_initial_solution(unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice,
+                               lons=None, lats=None):
     """贪心构造初始解：需求大的优先，尽量合并到已有路径"""
     routes = []
+    angle_checks, angle_blocks = 0, 0
     pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
     for cid, total_amt in pending:
         amt = total_amt
@@ -123,7 +157,18 @@ def _generate_initial_solution(unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, 
                 cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == r.get('vehicle_type', 1))
                 space = cap - sum(a for _, a in r['deliveries'])
                 has_cid = any(c == cid for c, _ in r['deliveries'])
-                if space > 0 and (has_cid or len(r['deliveries']) < max_stops):
+                # 新增站点时检查 45° 夹角硬约束
+                angle_ok = True
+                if not has_cid and lons is not None and lats is not None:
+                    test_indices = [c for c, _ in r['deliveries']] + [cid]
+                    sector = _max_sector_angle(test_indices, lons, lats)
+                    angle_checks += 1
+                    angle_ok = sector <= 45
+                    if not angle_ok:
+                        angle_blocks += 1
+                        logging.debug(f"[角度约束] 初始构造: 站点{cid}无法加入路线 "
+                                      f"(当前站点={[c for c, _ in r['deliveries']]}, 夹角={sector:.1f}° > 45°)")
+                if space > 0 and (has_cid or (len(r['deliveries']) < max_stops and angle_ok)):
                     load = min(amt, space)
                     if has_cid:
                         for i, (c, a) in enumerate(r['deliveries']):
@@ -145,6 +190,8 @@ def _generate_initial_solution(unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, 
                 load = min(amt, cfg['cap'])
                 routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
                 amt -= load
+    if angle_checks > 0:
+        logging.info(f"[角度约束] 初始构造完成: 检查{angle_checks}次, 拦截{angle_blocks}次")
     return routes
 
 
@@ -166,7 +213,8 @@ def _random_removal(solution, num_remove):
     return sol, unassigned
 
 
-def _greedy_insertion(routes, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice):
+def _greedy_insertion(routes, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice,
+                      lons=None, lats=None):
     """贪心修复：将移除的需求重新插入最优位置"""
     pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
     for cid, amt in pending:
@@ -177,6 +225,14 @@ def _greedy_insertion(routes, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, V
                 has_cid = any(c == cid for c, _ in route['deliveries'])
                 if not has_cid and len(route['deliveries']) >= max_stops:
                     continue
+                # 新增站点时检查 45° 夹角硬约束
+                if not has_cid and lons is not None and lats is not None:
+                    test_indices = [c for c, _ in route['deliveries']] + [cid]
+                    sector = _max_sector_angle(test_indices, lons, lats)
+                    if sector > 45:
+                        logging.debug(f"[角度约束] 贪心插入: 站点{cid}无法插入路线 "
+                                      f"(当前站点={[c for c, _ in route['deliveries']]}, 夹角={sector:.1f}° > 45°)")
+                        continue
                 cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == route.get('vehicle_type', 1))
                 space = cap - sum(a for _, a in route['deliveries'])
                 if space > 0:
@@ -190,7 +246,7 @@ def _greedy_insertion(routes, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, V
                     else:
                         tmp['deliveries'].append((cid, ins_amt))
                     tmp = _optimize_route_sequence(tmp, DMAT_arr, VeUnitPrice)
-                    fit = _eval_route_fitness(tmp, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice)
+                    fit = _eval_route_fitness(tmp, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice, lons, lats)
                     if fit < best_fit:
                         best_fit = fit
                         best_action = ('insert', ri, ins_amt, tmp['deliveries'])
@@ -464,7 +520,10 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     logging.info(f"V2 启发式日配送开始: date={date}, max_stops={max_stops}, max_iter={max_iter}")
     t_start = time.time()
 
-    Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, _, CarTypeStrList = LoadDelivData(date)
+    Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, _, CarTypeStrList, lons, lats = LoadDelivData(date)
+    lons = [float(x) for x in lons]
+    lats = [float(x) for x in lats]
+    logging.info(f"[角度约束] 已启用，省中心=({lons[0]:.4f},{lats[0]:.4f})，配送站点={len(lons)-1}个")
     org_labels = DMAT.columns.tolist()  # ["中心", org1, org2, ...]
     SubTypeNum = len(SubTypeList)
     logging.info(f"数据载入完成: {LocationNum} 个配送站点, {SubTypeNum} 种设备, {VeTypeNum} 种车型")
@@ -515,11 +574,12 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     logging.info(f"开始启发式求解: {len(unit_sum)} 站点, {VeTypeNum} 车型, 每车最多 {max_stops} 站")
 
     t_solve = time.time()
-    best_sol = _generate_initial_solution(unit_sum, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice)
+    best_sol = _generate_initial_solution(unit_sum, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice,
+                                          lons, lats)
     logging.info(f"初始构造完成: {len(best_sol)} 条路径, 平均每车 {len(unit_sum)/max(1,len(best_sol)):.1f} 站")
 
     best_sol = _reassign_vehicles(best_sol, VEHICLE_CONFIG)
-    best_fitness = sum(_eval_route_fitness(r, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice) for r in best_sol)
+    best_fitness = sum(_eval_route_fitness(r, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice, lons, lats) for r in best_sol)
     init_load_rates = []
     for r in best_sol:
         cap = next(v['cap'] for v in VEHICLE_CONFIG if v['type'] == r.get('vehicle_type', 1))
@@ -533,9 +593,10 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     for i in range(max_iter):
         remove_cnt = max(2, int(len(unit_sum) * 0.3))
         destroyed, unassigned = _random_removal(best_sol, num_remove=remove_cnt)
-        new_sol = _greedy_insertion(destroyed, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice)
+        new_sol = _greedy_insertion(destroyed, unassigned, VEHICLE_CONFIG, max_stops, DMAT_arr, VeUnitPrice,
+                                     lons, lats)
         new_sol = _reassign_vehicles(new_sol, VEHICLE_CONFIG)
-        new_fitness = sum(_eval_route_fitness(r, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice) for r in new_sol)
+        new_fitness = sum(_eval_route_fitness(r, DMAT_arr, VEHICLE_CONFIG, VeUnitPrice, lons, lats) for r in new_sol)
 
         if new_fitness < best_fitness:
             best_sol, best_fitness = new_sol, new_fitness

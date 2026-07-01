@@ -9,6 +9,7 @@ import pulp
 import logging
 import sys
 
+
 def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
@@ -23,7 +24,6 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         if 'DEV_CLS' in SubTypeList.columns:
             cls_val = str(SubTypeList.loc[i, 'DEV_CLS']).replace('.0', '').strip().zfill(2)
         vol_mult = 2.5 if cls_val == '02' else 1.0
-        # 互感器向上取整，消灭碎片
         DemandsBoxs[:, i] = np.ceil(np.ceil(Demands_arr[:, i] / UnitPerBoxI) * vol_mult)
 
     DemandsBoxs = np.sum(DemandsBoxs, axis=1)
@@ -37,11 +37,31 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             key=lambda x: x['cap'])
     MAX_CAP = VEHICLE_CONFIG[-1]['cap']
 
+    # 【新增全局红线】：单条路线的闭环最大行驶里程
+    MAX_ROUTE_DIST = 750
+
     DMAT_arr = DMAT.values if isinstance(DMAT, pd.DataFrame) else DMAT
-    DMAT_arr = DMAT_arr + DMAT_arr.T
+    # 使用 np.maximum 完美兼容：
+    # 如果是上三角矩阵，它能正确补齐；如果是完整对称矩阵，它保持原值绝对不会翻倍！
+    DMAT_arr = np.maximum(DMAT_arr, DMAT_arr.T)
 
     def get_dist(id1, id2):
         return DMAT_arr[id1, id2]
+
+    # ====================================================================
+    # 【核心约束 1】：8方向切分（利用余弦定理计算夹角，小于45度）
+    # ====================================================================
+    def check_angle_constraint(cid1, cid2):
+        if cid1 == cid2: return True
+        d01 = get_dist(0, cid1)
+        d02 = get_dist(0, cid2)
+        d12 = get_dist(cid1, cid2)
+
+        if d01 <= 0.001 or d02 <= 0.001: return True
+
+        cos_theta = (d01 ** 2 + d02 ** 2 - d12 ** 2) / (2 * d01 * d02)
+        cos_theta = max(-1.0, min(1.0, cos_theta))
+        return cos_theta >= 0.707
 
     def calc_route_cost(route):
         total_cost = 0.0
@@ -60,14 +80,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         for cid, _ in deliveries:
             dist += get_dist(prev_node, cid)
             prev_node = cid
-        dist += get_dist(prev_node, 0)  # 回到省库
+        dist += get_dist(prev_node, 0)
         return dist
 
     def eval_route_fitness(route):
         real_cost = calc_route_cost(route)
         if not route['deliveries']: return real_cost
 
-        # 动态评估这趟车配什么车型最合理，计算真实装载率
         load = sum(a for _, a in route['deliveries'])
         best_cap = MAX_CAP
         for cfg in VEHICLE_CONFIG:
@@ -76,33 +95,25 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 break
 
         load_rate = load / best_cap if best_cap > 0 else 0
+        dist_penalty = calc_route_distance(route['deliveries']) * 500.0
 
-        # 【惩罚 1】：物理绕路成本。由于拆除了硬隔离红线，这里全靠数学打压过度绕路
-        dist_penalty = calc_route_distance(route['deliveries']) * 5.0
-
-        # 【惩罚 2】：70% 柔性装载率。达到 70% 就没有惩罚了
         penalty = 0
         if load_rate < 0.70:
             penalty = 12000 * ((0.70 - load_rate) ** 2)
 
         return real_cost + dist_penalty + penalty
 
+    # ====================================================================
+    # 【核心约束 2】：终极防绕路（强制由近及远顺路卸货）
+    # ====================================================================
     def optimize_route_sequence(route):
         deliveries = route['deliveries']
         if len(deliveries) <= 1: return route
-        best_dist = float('inf')
-        best_seq = None
-        for seq in itertools.permutations(deliveries):
-            dist = calc_route_distance(list(seq))
-            if dist < best_dist:
-                best_dist = dist
-                best_seq = list(seq)
-        route['deliveries'] = best_seq
+        route['deliveries'] = sorted(deliveries, key=lambda x: get_dist(0, x[0]))
         return route
 
     def reassign_vehicles(routes):
         monthly_quota = {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG}
-
         routes_sorted = sorted(routes, key=lambda r: sum(a for _, a in r['deliveries']), reverse=True)
         for r in routes_sorted:
             load = sum(a for _, a in r['deliveries'])
@@ -140,24 +151,38 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     space = MAX_CAP - sum(a for _, a in r['deliveries'])
                     has_cid = any(c == cid for c, _ in r['deliveries'])
 
-                    # 【修改点1】：仅保留：网点合并不超3 的业务红线
                     if space > 0 and (has_cid or len(r['deliveries']) < 3):
-                        load = min(amt, space)
-                        temp_route = copy.deepcopy(r)
-                        if has_cid:
-                            for i, (c, a) in enumerate(temp_route['deliveries']):
-                                if c == cid:
-                                    temp_route['deliveries'][i] = (c, a + load)
+
+                        direction_ok = True
+                        if not has_cid:
+                            for exist_cid, _ in r['deliveries']:
+                                if not check_angle_constraint(cid, exist_cid):
+                                    direction_ok = False
                                     break
-                        else:
-                            temp_route['deliveries'].append((cid, load))
 
-                        temp_route = optimize_route_sequence(temp_route)
+                        if direction_ok:
+                            load = min(amt, space)
+                            temp_route = copy.deepcopy(r)
+                            if has_cid:
+                                for i, (c, a) in enumerate(temp_route['deliveries']):
+                                    if c == cid:
+                                        temp_route['deliveries'][i] = (c, a + load)
+                                        break
+                            else:
+                                temp_route['deliveries'].append((cid, load))
 
-                        r['deliveries'] = temp_route['deliveries']
-                        amt -= load
-                        assigned = True
-                        break
+                            temp_route = optimize_route_sequence(temp_route)
+
+                            # =======================================================
+                            # 【核心约束 3】：路线总里程验证（拦截器）
+                            # 预判拼车后的总里程，只有 <= 750Km 才能被批准上车！
+                            # =======================================================
+                            if calc_route_distance(temp_route['deliveries']) <= MAX_ROUTE_DIST:
+                                r['deliveries'] = temp_route['deliveries']
+                                amt -= load
+                                assigned = True
+                                break
+
                 if not assigned:
                     cfg = VEHICLE_CONFIG[-1]
                     for c in VEHICLE_CONFIG:
@@ -189,8 +214,16 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 best_action = None
                 for ri, route in enumerate(routes):
                     has_cid = any(c == cid for c, _ in route['deliveries'])
-                    # 【修改点2】：单车3网点红线，达到或超过3个则跳过不插入新网点
+
                     if not has_cid and len(route['deliveries']) >= 3: continue
+
+                    direction_ok = True
+                    if not has_cid:
+                        for exist_cid, _ in route['deliveries']:
+                            if not check_angle_constraint(cid, exist_cid):
+                                direction_ok = False
+                                break
+                    if not direction_ok: continue
 
                     space = MAX_CAP - sum(a for _, a in route['deliveries'])
                     if space > 0:
@@ -206,10 +239,16 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
                         temp = optimize_route_sequence(temp)
 
-                        fit = eval_route_fitness(temp)
-                        if fit < best_fit:
-                            best_fit = fit
-                            best_action = ('insert', ri, ins_amt, temp['deliveries'])
+                        # =======================================================
+                        # 【核心约束 3】：路线总里程验证（贪心插入拦截器）
+                        # 破坏重建时，尝试塞入新货，同样必须满足 <= 750Km 的安全底线
+                        # =======================================================
+                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                            fit = eval_route_fitness(temp)
+                            if fit < best_fit:
+                                best_fit = fit
+                                best_action = ('insert', ri, ins_amt, temp['deliveries'])
+
                 if best_action is None:
                     cfg = VEHICLE_CONFIG[-1]
                     for c in VEHICLE_CONFIG:
@@ -217,6 +256,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     ins_amt = min(amt, cfg['cap'])
                     temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
                     best_action = ('new', cfg['type'], ins_amt, temp['deliveries'])
+
                 if best_action[0] == 'insert':
                     routes[best_action[1]]['deliveries'] = best_action[3]
                     amt -= best_action[2]
@@ -225,7 +265,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     amt -= best_action[2]
         return [r for r in routes if r['deliveries']]
 
-    '''3. 启发式算法：空间最优解'''
+    '''3. 启发式算法：空间最优解 (ALNS)'''
     max_iter = 600
     best_sol = generate_initial_solution(unit_sum)
     best_sol = reassign_vehicles(best_sol)
@@ -236,28 +276,49 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         destroyed, unassigned = random_removal(best_sol, num_remove=remove_cnt)
         new_sol = greedy_insertion(destroyed, unassigned)
 
-        # 随时清理空车
         new_sol = [r for r in new_sol if r['deliveries']]
-
         new_sol = reassign_vehicles(new_sol)
         new_fitness = sum(eval_route_fitness(r) for r in new_sol)
 
         if new_fitness < best_fitness or math.exp((best_fitness - new_fitness) / 100) > random.random():
             best_sol, best_fitness = new_sol, new_fitness
 
-    # 最终强制收紧约束
     best_sol = reassign_vehicles(best_sol)
     best_sol = [r for r in best_sol if r['deliveries']]
 
-    '''4. 整数线性规划 Stage 2: 日期精确排程 (绝对硬约束)'''
+    '''4. 整数线性规划 Stage 2: 日期精确排程 (引入网点时间窗离散惩罚)'''
     num_routes = len(best_sol)
     if num_routes == 0: return []
-    prob2 = pulp.LpProblem("Minimize_Peak_Daily_Volume", pulp.LpMinimize)
-    x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
 
+    prob2 = pulp.LpProblem("Minimize_Peak_Daily_And_Clustering", pulp.LpMinimize)
+    x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
-    prob2 += Z
+    ALPHA = 50000
+
+    node_to_routes = defaultdict(list)
+    for r in range(num_routes):
+        for cid, _ in best_sol[r]['deliveries']:
+            node_to_routes[cid].append(r)
+
+    penalties = []
+    for cid, r_list in node_to_routes.items():
+        freq = len(r_list)
+        if freq <= 1:
+            continue
+
+        window_size = min(max(1, (DelivDay // freq) - 1), 5)
+
+        for d in range(DelivDay - window_size):
+            routes_in_window = pulp.lpSum(x[r, d + i] for r in r_list for i in range(window_size + 1))
+            p_var = pulp.LpVariable(f"Pen_Node_{cid}_Day_{d}", lowBound=0, cat='Continuous')
+            prob2 += p_var >= routes_in_window - 1
+            penalties.append(p_var)
+
+    if penalties:
+        prob2 += Z + ALPHA * pulp.lpSum(penalties)
+    else:
+        prob2 += Z
 
     for r in range(num_routes):
         prob2 += pulp.lpSum(x[r, d] for d in range(DelivDay)) == 1

@@ -64,7 +64,11 @@ def LoadDelivData(date:str):
         Demands = pd.DataFrame(np.zeros((LocationNum, SubTypeNum)))
         labels = ["中心"] + list(tb1['ORG_NO'])
         DMat = pd.DataFrame(np.zeros((LocationNum + 1, LocationNum + 1)), index=labels, columns=labels)
-        return Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMat, 2, VeType
+        lon_mc = marketing_center['LONGITUDE'].iloc[0]
+        lat_mc = marketing_center['LATITUDE'].iloc[0]
+        lons = [lon_mc] + list(tb1['LONGITUDE'])
+        lats = [lat_mc] + list(tb1['LATITUDE'])
+        return Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMat, 2, VeType, lons, lats
 
     Location = tb1['ORG_NO']
     LocationInd = tb2['REC_ORG_NO']
@@ -134,7 +138,7 @@ def LoadDelivData(date:str):
     labels = ["中心"] + list(tb1['ORG_NO'])
     DMat = pd.DataFrame(DMat_np, index=labels, columns=labels)
 
-    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen,VeType
+    return Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMat,MaxLen,VeType,lons,lats
 
 def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
     """
