@@ -142,54 +142,100 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
     def generate_initial_solution(unassigned):
         routes = []
-        pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
+
+        # 【借鉴main copy: 极角扫描排序】
+        # 利用距离矩阵计算各网点相对于基准方向的cos角, 同方向网点聚在一起
+        nodes = list(unassigned.keys())
+        if len(nodes) >= 2:
+            # 取距省库最远的网点作为极轴参考方向
+            ref_node = max(nodes, key=lambda x: get_dist(0, x))
+            d0_ref = get_dist(0, ref_node)
+            polar_info = []
+            for cid in nodes:
+                d0_i = max(get_dist(0, cid), 0.001)
+                d_ref_i = get_dist(ref_node, cid)
+                cos_val = (d0_i**2 + d0_ref**2 - d_ref_i**2) / (2 * d0_i * d0_ref)
+                cos_val = max(-1.0, min(1.0, cos_val))
+                polar_info.append((cid, cos_val, unassigned[cid]))
+            # 先按cos角分组(同方向), 组内按需求量降序
+            polar_info.sort(key=lambda x: (-x[1], -x[2]))
+            pending = [(cid, amt) for cid, _, amt in polar_info]
+        else:
+            pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
+
         for cid, total_amt in pending:
             amt = total_amt
             while amt > 0:
-                assigned = False
+                # Phase 1: 优先找能完整装下的路线（防拆分）
+                best_route = None
                 for r in routes:
                     space = MAX_CAP - sum(a for _, a in r['deliveries'])
+                    if space < amt: continue
                     has_cid = any(c == cid for c, _ in r['deliveries'])
+                    if not has_cid and len(r['deliveries']) >= 3: continue
+                    if not has_cid:
+                        if not all(check_angle_constraint(cid, ec) for ec, _ in r['deliveries']): continue
+                    temp = copy.deepcopy(r)
+                    if has_cid:
+                        for i, (c, a) in enumerate(temp['deliveries']):
+                            if c == cid: temp['deliveries'][i] = (c, a + amt); break
+                    else:
+                        temp['deliveries'].append((cid, amt))
+                    temp = optimize_route_sequence(temp)
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        best_route = r
+                        break
+                if best_route is not None:
+                    has_cid = any(c == cid for c, _ in best_route['deliveries'])
+                    if has_cid:
+                        for i, (c, a) in enumerate(best_route['deliveries']):
+                            if c == cid: best_route['deliveries'][i] = (c, a + amt); break
+                    else:
+                        best_route['deliveries'].append((cid, amt))
+                    best_route = optimize_route_sequence(best_route)
+                    amt = 0
+                    continue
 
-                    if space > 0 and (has_cid or len(r['deliveries']) < 3):
+                # Phase 2: 拆分插入 — 选能装最多的路线, 最小化拆分碎片
+                best_space = 0
+                best_route = None
+                for r in routes:
+                    space = MAX_CAP - sum(a for _, a in r['deliveries'])
+                    if space <= 0: continue
+                    has_cid = any(c == cid for c, _ in r['deliveries'])
+                    if not has_cid and len(r['deliveries']) >= 3: continue
+                    if not has_cid:
+                        if not all(check_angle_constraint(cid, ec) for ec, _ in r['deliveries']): continue
+                    take = min(amt, space)
+                    temp = copy.deepcopy(r)
+                    if has_cid:
+                        for i, (c, a) in enumerate(temp['deliveries']):
+                            if c == cid: temp['deliveries'][i] = (c, a + take); break
+                    else:
+                        temp['deliveries'].append((cid, take))
+                    temp = optimize_route_sequence(temp)
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        if space > best_space:
+                            best_space = space
+                            best_route = r
 
-                        direction_ok = True
-                        if not has_cid:
-                            for exist_cid, _ in r['deliveries']:
-                                if not check_angle_constraint(cid, exist_cid):
-                                    direction_ok = False
-                                    break
+                if best_route is not None:
+                    take = min(amt, best_space)
+                    has_cid = any(c == cid for c, _ in best_route['deliveries'])
+                    if has_cid:
+                        for i, (c, a) in enumerate(best_route['deliveries']):
+                            if c == cid: best_route['deliveries'][i] = (c, a + take); break
+                    else:
+                        best_route['deliveries'].append((cid, take))
+                    best_route = optimize_route_sequence(best_route)
+                    amt -= take
+                    continue
 
-                        if direction_ok:
-                            load = min(amt, space)
-                            temp_route = copy.deepcopy(r)
-                            if has_cid:
-                                for i, (c, a) in enumerate(temp_route['deliveries']):
-                                    if c == cid:
-                                        temp_route['deliveries'][i] = (c, a + load)
-                                        break
-                            else:
-                                temp_route['deliveries'].append((cid, load))
-
-                            temp_route = optimize_route_sequence(temp_route)
-
-                            # =======================================================
-                            # 【核心约束 3】：路线总里程验证（拦截器）
-                            # 预判拼车后的总里程，只有 <= 750Km 才能被批准上车！
-                            # =======================================================
-                            if calc_route_distance(temp_route['deliveries']) <= MAX_ROUTE_DIST:
-                                r['deliveries'] = temp_route['deliveries']
-                                amt -= load
-                                assigned = True
-                                break
-
-                if not assigned:
-                    cfg = VEHICLE_CONFIG[-1]
-                    for c in VEHICLE_CONFIG:
-                        if c['cap'] >= amt: cfg = c; break
-                    load = min(amt, cfg['cap'])
-                    routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
-                    amt -= load
+                # Phase 3: 新建路线 — 优先大车, 留空间给后续合并
+                cfg = VEHICLE_CONFIG[-1]
+                load = min(amt, MAX_CAP)
+                routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
+                amt -= load
         return routes
 
     def random_removal(solution, num_remove=3):
@@ -245,15 +291,20 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         # =======================================================
                         if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
                             fit = eval_route_fitness(temp)
+                            # 同网点优先: 防止需求被拆散到其他路线
+                            if has_cid:
+                                fit *= 0.5
+                            # 拆分惩罚: 装不下全部时加罚, 最小化碎片
+                            if ins_amt < (amt - 0.001):
+                                fit *= 1.5
                             if fit < best_fit:
                                 best_fit = fit
                                 best_action = ('insert', ri, ins_amt, temp['deliveries'])
 
                 if best_action is None:
+                    # 优先大车: 留空间给后续合并
                     cfg = VEHICLE_CONFIG[-1]
-                    for c in VEHICLE_CONFIG:
-                        if c['cap'] >= amt: cfg = c; break
-                    ins_amt = min(amt, cfg['cap'])
+                    ins_amt = min(amt, MAX_CAP)
                     temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
                     best_action = ('new', cfg['type'], ins_amt, temp['deliveries'])
 

@@ -4,8 +4,8 @@ from geopy.distance import geodesic
 import logging
 import sys
 
-
 def LoadDeliChcekData(target_month, start_date_str):
+
     from backend.Scheduling.Service_CheckDeliver import fetch_data
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
@@ -25,7 +25,7 @@ def LoadDeliChcekData(target_month, start_date_str):
     locations = df_demand[['ORG_NO', 'ORG_NAME', 'LAT', 'LON']].drop_duplicates().reset_index(drop=True)
     LocationNum = len(locations)
 
-    center_loc = pd.DataFrame([{'ORG_NO': 'CENTER', 'ORG_NAME': '省级总库', 'LAT': 31.87, 'LON': 117.18}])
+    center_loc = pd.DataFrame([{'ORG_NO': '34101', 'ORG_NAME': '省级总库', 'LAT': 31.87, 'LON': 117.18}])
     locations = pd.concat([center_loc, locations], ignore_index=True)
 
     df_mapping = fetch_data("gk-adam-query_aps_pro_dev_mapping")
@@ -124,16 +124,28 @@ def LoadDeliChcekData(target_month, start_date_str):
     if not DeviceCaps.empty:
         DeviceCaps.columns = [c.upper() for c in DeviceCaps.columns]
 
-    logging.info(">>> 计算网点距离矩阵...")
+    logging.info(">>> 从数据库加载网点实际运输距离矩阵...")
     num_nodes = LocationNum + 1
     DMAT = np.zeros((num_nodes, num_nodes))
-    lats = locations['LAT'].values
-    lons = locations['LON'].values
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            if pd.notnull(lats[i]) and pd.notnull(lons[i]) and pd.notnull(lats[j]) and pd.notnull(lons[j]):
-                dist = geodesic((lats[i], lons[i]), (lats[j], lons[j])).km
-                DMAT[i, j] = DMAT[j, i] = 1.15 * dist
+    df_dist = fetch_data("gk-adam-query_distance_matrix")
+    if not df_dist.empty:
+        df_dist.columns = [c.upper() for c in df_dist.columns]
+        # 构建 ORG_NO → 矩阵索引的映射 (两边统一转str避免类型不匹配)
+        org_to_idx = {str(locations.loc[i, 'ORG_NO']).strip(): i for i in range(num_nodes)}
+        matched = 0
+        for _, r in df_dist.iterrows():
+            from_org = str(r['DIST_ORG_NO']).strip()
+            to_org = str(r['RECEIVE_ORG_NO']).strip()
+            dist_val = float(r['DIST_MIST'])
+            fi = org_to_idx.get(from_org)
+            ti = org_to_idx.get(to_org)
+            if fi is not None and ti is not None and dist_val > 0:
+                DMAT[fi, ti] = dist_val
+                matched += 1
+        logging.info(f"距离矩阵: {len(df_dist)}条记录, 成功匹配{matched}对")
+
+    else:
+        logging.warning("未获取到实际距离数据，矩阵全为0！")
 
     # ================= 5. 【核心重构】：通过 ds_sql 动态拉取车队参数 =================
     logging.info(">>> 从 ds_sql 动态引擎读取车队运力及单价配置...")
@@ -157,3 +169,8 @@ def LoadDeliChcekData(target_month, start_date_str):
 
     # 【核心】：将 global_scheme_id 作为最后一个参数返回
     return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id
+
+
+
+
+    

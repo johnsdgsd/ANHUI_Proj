@@ -13,9 +13,14 @@ from collections import defaultdict
 import datetime
 import time
 
-def LoadDelivData(date:str):
+def LoadDelivData(date: str, adjust_pack_box: bool = True):
     '''
-    根据当日补库计划载入配送数据
+    根据当日补库计划载入配送数据。
+
+    参数:
+        date:              配送日期，格式 'YYYY-MM-DD'
+        adjust_pack_box:   是否对互感器(DEV_CLS='02')做 PACK_BOX_NUM/3 调整。
+                           默认 True（兼容 V1/V2）；V3 传入 False，保留原始值供 GetDelivPlan 使用。
     '''
     logging.basicConfig(
         level=logging.INFO,  # 设置日志级别为 INFO
@@ -28,13 +33,16 @@ def LoadDelivData(date:str):
     )
     #完整的规格设备码信息
     SubTypeList = query_adam_spec_code_config()
-    # 互感器(DEV_CLS='02')按3倍体积折算，保留原始装箱数用于最终输出
+    # 互感器(DEV_CLS='02')按3倍体积折算（V1/V2 用），保留原始装箱数用于最终输出
     SubTypeList['PACK_BOX_NUM_ORIG'] = SubTypeList['PACK_BOX_NUM']
-    mask_hgq = SubTypeList['DEV_CLS'] == '02'
-    n_hgq = mask_hgq.sum()
-    if n_hgq > 0:
-        SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] = (SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] / 3).round().astype(int)
-        logging.info(f'互感器体积折算(/3): {n_hgq} 种规格')
+    if adjust_pack_box:
+        mask_hgq = SubTypeList['DEV_CLS'] == '02'
+        n_hgq = mask_hgq.sum()
+        if n_hgq > 0:
+            SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] = (SubTypeList.loc[mask_hgq, 'PACK_BOX_NUM'] / 3).round().astype(int)
+            logging.info(f'互感器体积折算(/3): {n_hgq} 种规格')
+    else:
+        logging.info(f'V3 模式：跳过互感器体积折算，保留原始 PACK_BOX_NUM')
     logging.info(f'载入配送数据：查询到{len(SubTypeList)}条规格设备码数据')
     SubTypeNum = len(SubTypeList)
     
@@ -218,7 +226,7 @@ def GenerateDelivPlan(DelivPlan, Demands, SubTypeList):
 
     return DelivPlan
 
-def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList):
+def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList, VeUnitPrice=None):
     """
     将配送计划解析为 ADAM_DIST_SCHEME（主表）和 ADAM_DIST_SCHEME_DET（明细表）
     参数：
@@ -291,12 +299,11 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
                 DevCls = SubTypeList.iloc[DevIdx].get('DEV_CLS', '')
                 DevCateg = SubTypeList.iloc[DevIdx].get('DEV_CATEG', '')
 
-                dev_ratio = Qty / stop_pieces if stop_pieces > 0 else 0
-                DistExp = Price * (DeNum[StopIdx] / TotalBoxes if TotalBoxes > 0 else 0) * dev_ratio
-
                 box_cap_col = 'PACK_BOX_NUM_ORIG' if DevCls == '02' else 'PACK_BOX_NUM'
                 BoxCap = SubTypeList.iloc[DevIdx][box_cap_col]
                 plan_box_num = int(np.ceil(Qty / BoxCap))
+                unit_price = VeUnitPrice[VeType - 1] if VeUnitPrice is not None else 0.0695
+                DistExp = unit_price * plan_box_num * stop_est_dist
                 DetailRows.append({
                     'DIST_SCHEME_DET_ID': det_id,
                     'DIST_SCHEME_ID': scheme_id,
@@ -457,7 +464,7 @@ def AdjustDaliyDelivery(date:str):
     except ValueError:
         logging.info(f"当天 ({date}) 无旧配送方案，跳过删除")
 
-    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen,CarTypeStrList=LoadDelivData(date)
+    Demands,LocationNum,SubTypeList,VeUnitPrice,VeTypeNum,VNums,VeCap,DMAT,MaxLen,CarTypeStrList,lons,lats=LoadDelivData(date)
     org_labels = DMAT.columns.tolist()  # ["中心", org1, org2, ...]
     EmptyPenalty = VeUnitPrice * 0.5  # 可根据实际调整
     SubTypeNum = len(SubTypeList)
@@ -786,6 +793,6 @@ def AdjustDaliyDelivery(date:str):
     logging.info(f"[校验] 配送计划总箱数: {int(total_deliv_boxes)}")
 
     logging.info("开始 GenerateSchemeTables...")
-    MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap, CarTypeStrList)
+    MainScheme , DetailScheme = GenerateSchemeTables(DelivPlan,date,SubTypeList, VeCap, CarTypeStrList, VeUnitPrice)
     logging.info(f"GenerateSchemeTables 完成: MainScheme={len(MainScheme)}行, DetailScheme={len(DetailScheme)}行")
     return MainScheme , DetailScheme

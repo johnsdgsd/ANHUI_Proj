@@ -48,16 +48,11 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     # 生成初始时间戳（精确到毫秒）
     timestamp = int(time.time()*1000)
     # 获得月度预测结果表
+    # SQL 层已处理：SUM(PRE_NUM) 聚合所有业务类型 + CROSS JOIN 补全 87单位×全部设备码 + NVL(...,5) 缺失填5
+    # 返回的每条 (ORG_NO, DEV_CODE) 唯一，无需再做 groupby sum
     df = query_adam_yqm_dmd_pre_by_year_month(year, month)
     print(f'获取月度需求预测数据成功，日期{year}{month}，数据量：{len(df)}')
-    # 按单位、设备码分组，汇总预测数量（将所有业务类型的数据相加）
-    df_grouped = df#.groupby(
-    #     ['PRE_YEAR', 'PRE_MONTH', 'ORG_NO', 'DEV_CODE'],
-    #     as_index=False
-    # )['PRE_NUM'].sum()
-    
-    # 重命名列名
-    df_grouped = df_grouped.rename(columns={'PRE_NUM': '预测数量'})
+    df_grouped = df.rename(columns={'PRE_NUM': '预测数量'})
     
     # 初始化地方库
     LWI = LocalWarehouseInitializer()

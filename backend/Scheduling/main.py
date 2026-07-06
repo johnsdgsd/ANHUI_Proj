@@ -118,16 +118,7 @@ def run_full_aps_process(preMonth, preConcId=None):
         target_dt = datetime.strptime(preMonth, '%Y%m')
         target_start_str = target_dt.strftime('%Y-%m-%d 00:00:00')
 
-        prev_month_dt = target_dt - relativedelta(months=2)
-        prev_year = prev_month_dt.strftime('%Y')
-        prev_month = prev_month_dt.strftime('%m')
         current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        logging.info("提取基础业务数据...")
-        df_demand = fetch_data("gk-adam-query_replenish_demand", {"stat_month": preMonth})
-        df_qua = fetch_data("gk-adam-query_qua_stock", {"sam_year": prev_year, "sam_month": prev_month})
-        df_orders = fetch_data("gk-adam-query_unused_pur_orders")
-        df_mapping = fetch_data("gk-adam-query_aps_pro_dev_mapping")
 
         is_forward = current_time_str < target_start_str
         start_bound = current_time_str if is_forward else target_start_str
@@ -138,17 +129,24 @@ def run_full_aps_process(preMonth, preConcId=None):
             "end_bound": end_bound
         }
 
-        logging.info(f"推演 {preMonth} 月初的待检库存状态...")
+        logging.info("提取基础业务数据...")
+        df_demand = fetch_data("gk-adam-query_replenish_demand", {"stat_month": preMonth})
+        df_qua = fetch_data("gk-adam-query_realtime_qua_stock")
+        df_orders = fetch_data("gk-adam-query_unused_pur_orders")
+        df_mapping = fetch_data("gk-adam-query_aps_pro_dev_mapping")
+
+        logging.info(f"推演 {preMonth} 月初的库存状态...")
         df_realtime_pend = fetch_data("gk-adam-query_realtime_pend_stock")
         df_future_arr = fetch_data("gk-adam-query_future_arrivals", interval_params)
         df_future_det = fetch_data("gk-adam-query_future_detections", interval_params)
+        df_future_deliv = fetch_data("gk-adam-query_future_deliveries", interval_params)
 
         if df_demand.empty:
             logging.info("补货需求为空，无需排程。")
             update_pre_conc_status(preConcId, '03')
             return
 
-        dfs_to_clean = [df_demand, df_qua, df_realtime_pend, df_future_arr, df_future_det, df_orders, df_mapping]
+        dfs_to_clean = [df_demand, df_qua, df_realtime_pend, df_future_arr, df_future_det, df_future_deliv, df_orders, df_mapping]
         for df in dfs_to_clean:
             if not df.empty:
                 df.columns = [c.upper() for c in df.columns]
@@ -176,11 +174,39 @@ def run_full_aps_process(preMonth, preConcId=None):
         logging.info("开始聚合实时数据，推算排程月初库存...")
         df_demand_agg = df_demand.groupby('DEV_CODE', as_index=False)['REQ_NUM'].sum()
 
-        if not df_qua.empty and 'QUA_STOCK' in df_qua.columns:
-            df_qua_agg = df_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK'].sum()
+        # --- 合格品库存: 实时 + 期间检定 - 期间配送 ---
+        if not df_qua.empty:
+            if 'DEV_CODE_NO' in df_qua.columns:
+                df_qua['DEV_CODE'] = df_qua['DEV_CODE_NO']
+            if 'QUA_STOCK_NUM' in df_qua.columns:
+                df_qua_agg = df_qua.groupby('DEV_CODE', as_index=False)['QUA_STOCK_NUM'].sum()
+            else:
+                df_qua_agg = pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
         else:
-            df_qua_agg = pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK'])
+            df_qua_agg = pd.DataFrame(columns=['DEV_CODE', 'QUA_STOCK_NUM'])
 
+        if not df_future_det.empty and 'DETECT_NUM' in df_future_det.columns:
+            df_det_agg = df_future_det.groupby('DEV_CODE', as_index=False)['DETECT_NUM'].sum()
+        else:
+            df_det_agg = pd.DataFrame(columns=['DEV_CODE', 'DETECT_NUM'])
+
+        if not df_future_deliv.empty and 'DELIVERED_NUM' in df_future_deliv.columns:
+            df_deliv_agg = df_future_deliv.groupby('DEV_CODE', as_index=False)['DELIVERED_NUM'].sum()
+        else:
+            df_deliv_agg = pd.DataFrame(columns=['DEV_CODE', 'DELIVERED_NUM'])
+
+        df_qua_agg = df_qua_agg.merge(df_det_agg, on='DEV_CODE', how='outer').merge(df_deliv_agg, on='DEV_CODE', how='outer')
+        df_qua_agg.fillna(0, inplace=True)
+
+        if is_forward:
+            df_qua_agg['QUA_STOCK'] = df_qua_agg['QUA_STOCK_NUM'] + df_qua_agg['DETECT_NUM'] - df_qua_agg['DELIVERED_NUM']
+        else:
+            df_qua_agg['QUA_STOCK'] = df_qua_agg['QUA_STOCK_NUM'] - df_qua_agg['DETECT_NUM'] + df_qua_agg['DELIVERED_NUM']
+
+        df_qua_agg['QUA_STOCK'] = df_qua_agg['QUA_STOCK'].clip(lower=0)
+        df_qua_agg = df_qua_agg[['DEV_CODE', 'QUA_STOCK']]
+
+        # --- 待检库存: 实时 + 期间到货 - 期间检定 ---
         if not df_realtime_pend.empty and 'NOW_PEND_NUM' in df_realtime_pend.columns:
             df_rt_agg = df_realtime_pend.groupby('DEV_CODE', as_index=False)['NOW_PEND_NUM'].sum()
         else:
@@ -192,12 +218,11 @@ def run_full_aps_process(preMonth, preConcId=None):
             df_arr_agg = pd.DataFrame(columns=['DEV_CODE', 'ARR_NUM'])
 
         if not df_future_det.empty and 'DETECT_NUM' in df_future_det.columns:
-            df_det_agg = df_future_det.groupby('DEV_CODE', as_index=False)['DETECT_NUM'].sum()
+            df_det2_agg = df_future_det.groupby('DEV_CODE', as_index=False)['DETECT_NUM'].sum()
         else:
-            df_det_agg = pd.DataFrame(columns=['DEV_CODE', 'DETECT_NUM'])
+            df_det2_agg = pd.DataFrame(columns=['DEV_CODE', 'DETECT_NUM'])
 
-        df_pend_agg = df_rt_agg.merge(df_arr_agg, on='DEV_CODE', how='outer').merge(df_det_agg, on='DEV_CODE',
-                                                                                    how='outer')
+        df_pend_agg = df_rt_agg.merge(df_arr_agg, on='DEV_CODE', how='outer').merge(df_det2_agg, on='DEV_CODE', how='outer')
         df_pend_agg.fillna(0, inplace=True)
 
         if is_forward:

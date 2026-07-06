@@ -1,4 +1,5 @@
 from numbers import Number
+import logging
 import requests
 import pandas as pd
 from backend.config.config import API_CONFIG
@@ -850,6 +851,50 @@ def query_adam_org_stock_sample_by_month(month: str):
     except Exception as e:
         raise
 
+
+def query_adam_realtime_stocknum():
+    '''
+    查询地市实时库存。
+
+    说明:
+        - 已包含下级单位库存，按87家地市仓库汇总
+        - 包含87家单位和启用设备码维度
+        - 按仓库(ORG_NO) × 设备码(DEV_CODE) 维度返回
+        - 已完成新旧设备码转换
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, ORG_NAME, DEV_CODE, STOCK_NUM
+    '''
+    import logging
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-realtime-stocknum'
+        url = f"http://{host}:{port}{endpoint}"
+
+        response = session.post(url, json={})
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"地市实时库存接口返回格式异常，期望 list，实际为 {type(data).__name__}")
+
+        if len(data) == 0:
+            raise ValueError("地市实时库存查询返回空数据")
+
+        df = pd.DataFrame(data)
+        logging.info(f'获取地市实时库存成功，数据量{len(df)}条')
+        return df
+
+    except requests.exceptions.RequestException:
+        logging.exception('地市实时库存查询网络异常')
+        raise
+    except Exception:
+        logging.exception('地市实时库存查询失败')
+        raise
+
+
 def query_adam_yqm_dmd_pre_by_year(year: str):
     try:
         host = API_CONFIG["database"]["host"]
@@ -1291,6 +1336,85 @@ def insert_into_adam_glob_strategy_scheme_cost(df: pd.DataFrame):
     except Exception as e:
         raise
 
+def batch_insert_adam_glob_strategy_scheme_cost(df: pd.DataFrame, batch_size: int = 100):
+    """批量插入全局策略方案成本明细数据
+
+    Args:
+        df: DataFrame，包含以下列：
+            - COST_DET_ID: 方案成本明细标识
+            - SCHEME_ID: 方案标识
+            - LINK_TYPE: 环节类型
+            - COST_TYPE: 成本类型
+            - ORG_NO: 管理单位
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_STAT_COST: 预期总成本
+            - PRE_SINGLE_COST: 预期平均单只成本
+            - PRE_COST_YOY: 预期成本同比变化率
+            - PRE_COST_TR: 预期成本环比变化率
+            - INCUR_STAT_COST: 当前产生总成本
+            - INCUR_SINGLE_COST: 当前平均单只成本
+            - INCUR_COST_YOY: 当前成本同比变化率
+            - INCUR_COST_TR: 当前成本环比变化率
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+        batch_size: 每批插入条数，默认 100
+
+    Returns:
+        dict: 插入结果
+    """
+    import math
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_cost'
+        url = f"http://{host}:{port}{endpoint}"
+
+        if 'PRE_SINGLE_COST' in df.columns:
+            df['PRE_SINGLE_COST'] = df['PRE_SINGLE_COST'].fillna(0)
+        df = df.astype(object).where(df.notna(), None)
+        records = df.rename(columns=str.lower).to_dict('records')
+        import math
+        for r in records:
+            for k, v in r.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    r[k] = None
+        total = len(records)
+        batches = math.ceil(total / batch_size)
+        logging.info(f'批量插入 COST: 共 {total} 条, 分 {batches} 批(每批 {batch_size} 条)')
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for i in range(0, total, batch_size):
+            chunk = records[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                response = session.post(url, json=chunk)
+                response.raise_for_status()
+                success_count += len(chunk)
+                logging.info(f'批量插入 COST 第 {batch_no}/{batches} 批成功, {len(chunk)} 条')
+            except Exception as e:
+                failed_count += len(chunk)
+                errors.append({"batch": batch_no, "count": len(chunk), "error": str(e)})
+                logging.error(f'批量插入 COST 第 {batch_no}/{batches} 批失败: {e}')
+                raise
+
+        return {
+            "success": failed_count == 0,
+            "message": f"批量插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "batches": batches,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
 def insert_into_adam_glob_strategy_scheme_lps(df: pd.DataFrame):
     """插入全局策略方案环节计划汇总明细数据到数据库
 
@@ -1347,6 +1471,71 @@ def insert_into_adam_glob_strategy_scheme_lps(df: pd.DataFrame):
         raise
     except Exception as e:
         raise
+
+
+def batch_insert_adam_glob_strategy_scheme_lps(df: pd.DataFrame, batch_size: int = 100):
+    """批量插入全局策略方案环节计划汇总明细数据
+
+    Args:
+        df: DataFrame，包含以下列：
+            - ITT_DET_ID: 方案周转明细标识
+            - SCHEME_ID: 方案标识
+            - LINK_TYPE: 环节类型
+            - ORG_NO: 管理单位
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_STAT_NUM: 预期计划总量
+            - INCUR_STAT_NUM: 当前已完成总量
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+        batch_size: 每批插入条数，默认 100
+
+    Returns:
+        dict: 插入结果
+    """
+    import math
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_lps'
+        url = f"http://{host}:{port}{endpoint}"
+
+        records = df.rename(columns=str.lower).to_dict('records')
+        total = len(records)
+        batches = math.ceil(total / batch_size)
+        logging.info(f'批量插入 LPS: 共 {total} 条, 分 {batches} 批(每批 {batch_size} 条)')
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for i in range(0, total, batch_size):
+            chunk = records[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                response = session.post(url, json=chunk)
+                response.raise_for_status()
+                success_count += len(chunk)
+                logging.info(f'批量插入 LPS 第 {batch_no}/{batches} 批成功, {len(chunk)} 条')
+            except Exception as e:
+                failed_count += len(chunk)
+                errors.append({"batch": batch_no, "count": len(chunk), "error": str(e)})
+                logging.error(f'批量插入 LPS 第 {batch_no}/{batches} 批失败: {e}')
+                raise
+
+        return {
+            "success": failed_count == 0,
+            "message": f"批量插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "batches": batches,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
 
 def insert_into_adam_glob_strategy_scheme(df: pd.DataFrame):
     """插入全局策略方案主表数据到数据库
@@ -1417,6 +1606,84 @@ def insert_into_adam_glob_strategy_scheme(df: pd.DataFrame):
         raise
     except Exception as e:
         raise
+
+def batch_insert_adam_glob_strategy_scheme_itt(df: pd.DataFrame, batch_size: int = 100):
+    """批量插入全局策略方案周转明细数据
+
+    Args:
+        df: DataFrame，包含以下列：
+            - ITT_DET_ID: 方案周转明细标识
+            - SCHEME_ID: 方案标识
+            - ORG_NO: 管理单位
+            - START_STOCK_NUM: 月初库存总量
+            - END_STOCK_NUM: 月末库存总量
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - PRE_ITR: 预期库存运行比%
+            - ITR_YOY: 运行比同比变化率%
+            - ITR_TR: 运行比环比变化率%
+            - INCUR_ITR: 当前库存运行比%
+            - PRE_ITT: 预期库存周转次数
+            - ITT_YOY: 周转同比变化率%
+            - ITT_TR: 周转环比变化率%
+            - INCUR_ITT: 当前库存周转次数
+            - MADE_DATE: 生成时间
+            - UPDATE_DATE: 更新时间
+        batch_size: 每批插入条数，默认 100
+
+    Returns:
+        dict: 插入结果
+    """
+    import math
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert_into_adam_glob_strategy_scheme_itt'
+        url = f"http://{host}:{port}{endpoint}"
+
+        df = df.astype(object).where(df.notna(), None)
+        records = df.rename(columns=str.lower).to_dict('records')
+        import math
+        for r in records:
+            for k, v in r.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    r[k] = None
+
+        total = len(records)
+        batches = math.ceil(total / batch_size)
+        logging.info(f'批量插入 ITT: 共 {total} 条, 分 {batches} 批(每批 {batch_size} 条)')
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for i in range(0, total, batch_size):
+            chunk = records[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                response = session.post(url, json=chunk)
+                response.raise_for_status()
+                success_count += len(chunk)
+                logging.info(f'批量插入 ITT 第 {batch_no}/{batches} 批成功, {len(chunk)} 条')
+            except Exception as e:
+                failed_count += len(chunk)
+                errors.append({"batch": batch_no, "count": len(chunk), "error": str(e)})
+                logging.error(f'批量插入 ITT 第 {batch_no}/{batches} 批失败: {e}')
+                raise
+
+        return {
+            "success": failed_count == 0,
+            "message": f"批量插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "batches": batches,
+            "errors": errors if errors else None
+        }
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
 
 def insert_into_adam_glob_strategy_scheme_itt(df: pd.DataFrame):
     """插入全局策略方案周转明细数据到数据库
@@ -2068,6 +2335,26 @@ def query_adam_future_detections(start_bound: str, end_bound: str):
         raise
 
 
+def query_adam_future_deliveries(start_bound: str, end_bound: str):
+    """查询区间内已配送出库量（期间配送）"""
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_future_deliveries'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"start_bound": start_bound, "end_bound": end_bound})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        else:
+            return pd.DataFrame([data])
+    except requests.exceptions.RequestException as e:
+        raise
+
+
 def query_adam_completed_inspections(target_month: str):
     """查询当月已检定完工量
 
@@ -2093,3 +2380,119 @@ def query_adam_completed_inspections(target_month: str):
             return pd.DataFrame([data])
     except requests.exceptions.RequestException as e:
         raise
+
+
+def query_adam_org_stock_sample_estimated(target_month: str):
+    """
+    推算目标月初库存。
+
+    逻辑:
+        输入 target_month（如 202608 = 8月初），取上月（202607 = 7月），
+        从当前实时库存出发，扣除 7月剩余需求，加上 7月待配送，得到 7月底库存，
+        即 8月初库存。
+
+    公式:
+        目标月初库存 = 实时库存 + 上月未来待配送 − 上月剩余需求
+        上月剩余需求 = 上月需求预测 × (上月剩余天数 / 上月总天数)
+
+    参数:
+        target_month: 目标月份，格式 YYYYMM，上月必须 >= 当前月份
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, ORG_NAME, DEV_CODE, STOCK_NUM
+    """
+    import logging
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    import calendar
+
+    # 0. 入参校验
+    if not isinstance(target_month, str) or len(target_month) != 6 or not target_month.isdigit():
+        raise ValueError(f"target_month 格式错误，需为 YYYYMM，实际: {target_month}")
+
+    target_dt = datetime.strptime(target_month, '%Y%m')
+    prev_dt = target_dt - relativedelta(months=1)
+    prev_month = prev_dt.strftime('%Y%m')
+    today = datetime.now()
+    current_month = today.strftime('%Y%m')
+
+    if prev_month < current_month:
+        raise ValueError(
+            f"无法推算: 目标月={target_month}, 上月={prev_month}, "
+            f"上月早于当前月={current_month}，无法用实时库存推算"
+        )
+
+    logging.info(f'推算目标月初库存: target={target_month}, 上月={prev_month}, 当前={current_month}')
+
+    # 1. 获取地市实时库存
+    df_realtime = query_adam_realtime_stocknum()
+    rt = df_realtime[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']].copy()
+    rt.rename(columns={'STOCK_NUM': 'RT_STOCK'}, inplace=True)
+
+    # 2. 获取上月需求预测（SQL 已按 ORG_NO+DEV_CODE 聚合所有业务类型，无需再 groupby）
+    year = prev_month[:4]
+    month = prev_month[4:6]
+    demand = query_adam_yqm_dmd_pre_by_year_month(year, month)[['ORG_NO', 'DEV_CODE', 'PRE_NUM']].copy()
+    demand.rename(columns={'PRE_NUM': 'MONTHLY_DEMAND'}, inplace=True)
+
+    # 3. 计算上月剩余需求 = 上月需求 × (上月剩余天数 / 上月总天数)
+    days_in_prev = calendar.monthrange(prev_dt.year, prev_dt.month)[1]
+    if today.year == prev_dt.year and today.month == prev_dt.month:
+        remaining_days = days_in_prev - today.day + 1  # 含当天
+    elif today > prev_dt:
+        remaining_days = 0  # 上月已过完
+    else:
+        remaining_days = days_in_prev  # 上月还没到，全月算
+    ratio = remaining_days / days_in_prev
+    demand['REMAIN_DEMAND'] = demand['MONTHLY_DEMAND'] * ratio
+
+    # 4. 获取上月未来待配送 = 上月剩余日期的日补库计划汇总
+    df_plan = query_adam_plan_day_ias_pre_by_month(prev_month)
+    if df_plan.empty:
+        df_delivery = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PENDING_DELIVERY'])
+    else:
+        df_plan['PRE_DATE'] = pd.to_datetime(df_plan['PRE_DATE'], errors='coerce')
+        # 兼容时区：带时区则去掉，不带则不动
+        if df_plan['PRE_DATE'].dt.tz is not None:
+            df_plan['PRE_DATE'] = df_plan['PRE_DATE'].dt.tz_convert(None)
+        today_date = pd.Timestamp(today.date())
+        last_day_of_prev = pd.Timestamp(prev_dt.year, prev_dt.month, days_in_prev)
+        mask_future = (df_plan['PRE_DATE'] >= today_date) & (df_plan['PRE_DATE'] <= last_day_of_prev)
+        df_future = df_plan[mask_future]
+        if df_future.empty:
+            df_delivery = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PENDING_DELIVERY'])
+        else:
+            df_delivery = df_future.groupby(['REC_ORG_NO', 'DEV_CODE'], as_index=False)['PLAN_IAS_NUM'].sum()
+            df_delivery.rename(columns={'REC_ORG_NO': 'ORG_NO', 'PLAN_IAS_NUM': 'PENDING_DELIVERY'}, inplace=True)
+            n_dates = df_future['PRE_DATE'].nunique()
+            n_dup = len(df_future) - len(df_delivery)
+            logging.info(f'未来待配送: {len(df_future)} 条日补库(跨{n_dates}天) → {len(df_delivery)} 条 (ORG,DEV_CODE)'
+                         f'({n_dup}条同ORG+DEV合并)')
+
+    # 5. 合并三表，计算推算月末库存 = 下月初库存
+    logging.info(f'MERGE前维度: '
+                 f'RT(单位={rt["ORG_NO"].nunique()},设备={rt["DEV_CODE"].nunique()},行={len(rt)}), '
+                 f'需求(单位={demand["ORG_NO"].nunique()},设备={demand["DEV_CODE"].nunique()},行={len(demand)}), '
+                 f'配送(单位={df_delivery["ORG_NO"].nunique() if not df_delivery.empty else 0},'
+                 f'设备={df_delivery["DEV_CODE"].nunique() if not df_delivery.empty else 0},'
+                 f'行={len(df_delivery)})')
+    logging.info(f'RT设备码: {sorted(rt["DEV_CODE"].unique())}')
+    logging.info(f'需求设备码: {sorted(demand["DEV_CODE"].unique())}')
+    logging.info(f'配送设备码: {sorted(df_delivery["DEV_CODE"].unique()) if not df_delivery.empty else []}')
+    result = rt.merge(demand, on=['ORG_NO', 'DEV_CODE'], how='outer') \
+               .merge(df_delivery, on=['ORG_NO', 'DEV_CODE'], how='left')
+    # 仅数值列填0，避免 ORG_NAME 等字符串列被填充
+    num_cols = ['RT_STOCK', 'MONTHLY_DEMAND', 'REMAIN_DEMAND', 'PENDING_DELIVERY']
+    for c in num_cols:
+        if c in result.columns:
+            result[c] = result[c].fillna(0)
+    logging.info(f'MERGE后维度: 单位={result["ORG_NO"].nunique()}, 设备={result["DEV_CODE"].nunique()}, 行={len(result)}')
+
+    result['STOCK_NUM'] = (result['RT_STOCK'] + result['PENDING_DELIVERY']
+                           - result['REMAIN_DEMAND']).clip(lower=0).round(0)
+
+    logging.info(f'推算目标月初库存完成: 实时={len(rt)}条, 需求={len(demand)}条, '
+                 f'配送={len(df_delivery)}条, 结果={len(result)}条, '
+                 f'上月={prev_month}, 剩余{remaining_days}/{days_in_prev}天')
+
+    return result[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']]

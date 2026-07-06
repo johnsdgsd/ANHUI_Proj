@@ -100,7 +100,7 @@ def run_optimization_from_api(
         insert_into_aps_inventory_replenish_qty,
         query_adam_qua_stock_sample_by_year_month,
         query_adam_pend_stock_sample_by_year_month,
-        query_adam_org_stock_sample_by_month,
+        query_adam_org_stock_sample_estimated,
         query_adam_spec_code_config
     )
     
@@ -109,7 +109,8 @@ def run_optimization_from_api(
         # 月份减1
         month = f"{init_stock_month % 100 -1:02d}"
         # 获取初始库存数据
-        init_stock = query_adam_org_stock_sample_by_month(str(init_stock_month))
+        init_stock = query_adam_org_stock_sample_estimated(str(init_stock_month))
+        print(f'推算月初库存成功，数据量{len(init_stock)}条', flush=True)
         #合格品库存
         qua_sto = query_adam_qua_stock_sample_by_year_month(year,month)
         #不合格品库存

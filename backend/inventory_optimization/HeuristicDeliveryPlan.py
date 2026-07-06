@@ -339,7 +339,7 @@ def _build_delivery_plan(best_sol, Demands, SubTypeList, VeCap, VeUnitPrice,
     logging.info(f"[V2校验] 配送计划总箱数: {int(total_deliv_boxes_v2)}")
 
     MainScheme, DetailScheme = GenerateSchemeTables(
-        DelivPlan, date, SubTypeList, VeCap, CarTypeStrList
+        DelivPlan, date, SubTypeList, VeCap, CarTypeStrList, VeUnitPrice
     )
     return MainScheme, DetailScheme
 
@@ -658,6 +658,15 @@ def _adjust_daily_delivery_v2_impl(date: str, max_stops: int, max_iter: int):
     MainScheme, DetailScheme = _merge_scheme_tables(
         MainScheme, DetailScheme, VeCap, CarTypeStrList, max_stops, DMAT_arr, org_labels
     )
+
+    # ---- 6. 落库前重算配送费用: DIST_EXP = PLAN_BOX_NUM × EST_TOT_DIST_MIST × 单价 ----
+    car_price_map = {CarTypeStrList[i]: VeUnitPrice[i] for i in range(len(CarTypeStrList))}
+    scheme_price_map = MainScheme.set_index('DIST_SCHEME_ID')['CAR_TYPE'].map(car_price_map)
+    DetailScheme['DIST_EXP'] = (
+        DetailScheme['PLAN_BOX_NUM'].astype(float) *
+        DetailScheme['EST_TOT_DIST_MIST'].astype(float) *
+        DetailScheme['DIST_SCHEME_ID'].map(scheme_price_map)
+    ).round(4)
 
     t_end = time.time()
     logging.info(f"输出完成: MainScheme={len(MainScheme)}行, DetailScheme={len(DetailScheme)}行")

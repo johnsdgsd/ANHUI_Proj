@@ -241,7 +241,7 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                 for d in plan['details']:
                     unit_price = master.get('UNIT_PRICE', 0.0695)
                     real_box_num = int(d.get('PLAN_BOX_NUM', 0))
-                    dist_exp = round(real_box_num * d.get('DIST_SEGMENT', 0.0) * unit_price, 2)
+                    dist_exp = real_box_num * d.get('DIST_SEGMENT', 0.0) * unit_price
                     dist_detail_db_list.append({
                         "dist_scheme_det_id": detail_ids[det_idx],
                         "dist_scheme_id": scheme_id,
@@ -249,7 +249,7 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                         "dev_code": str(d['DEV_CODE']).replace('.0', '').strip(), "dev_cls": str(d['DEV_CLS']),
                         "dev_categ": str(d['DEV_CATEG']), "dist_seq": d['DIST_SEQ'], "load_seq": d['LOAD_SEQ'],
                         "plan_dist_num": int(d['PLAN_DIST_NUM']), "plan_box_num": real_box_num, "dist_exp": dist_exp,
-                        "est_tot_dist_mist": round(d.get('DIST_SEGMENT', 0.0), 2), "global_scheme_id": global_scheme_id
+                        "est_tot_dist_mist": d.get('DIST_SEGMENT', 0.0), "global_scheme_id": global_scheme_id
                     })
                     det_idx += 1
 

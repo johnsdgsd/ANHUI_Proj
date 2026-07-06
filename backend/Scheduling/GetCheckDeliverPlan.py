@@ -15,8 +15,6 @@ except ImportError:
 from backend.Scheduling.GetDelivPlan import GetDelivPlan
 
 
-
-
 def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap,
                         VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, record_start_date_str,
                         locations):
@@ -181,28 +179,23 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             veri_cat = str(row['VERI_CATEG']).strip().zfill(2)
             veri_type = str(row['VERI_TYPE']).strip().zfill(2)
 
-            # 根据 VDRILINE_NUM 将物理连线克隆为独立的并行虚拟线
-            v_num = int(pd.to_numeric(row['VDRILINE_NUM'], errors='coerce') or 1)
-            if v_num <= 0: v_num = 1
-
             p_num = int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1)
             pc_num = int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
-            cap_per_line = p_num * pc_num
+            cap_per_line = p_num * pc_num  # POSI_NUM × POSI_CHECK_NUM = 单线总容量
             if cap_per_line <= 0: cap_per_line = 200
 
             dev_categ_str = str(row.get('DEV_CATEG', '')).strip()
             cats = [dc.strip() for dc in dev_categ_str.replace('，', ',').split(',') if dc.strip()]
 
-            for i in range(v_num):
-                line_idx += 1
-                unique_line_id = f"L_{line_idx}"
-                for dc in cats:
-                    DevCatToLines[dc].append({
-                        'line_id': unique_line_id,
-                        'veri_cat': veri_cat,
-                        'veri_type': veri_type,
-                        'batch_cap': cap_per_line
-                    })
+            line_idx += 1
+            unique_line_id = f"L_{line_idx}"
+            for dc in cats:
+                DevCatToLines[dc].append({
+                    'line_id': unique_line_id,
+                    'veri_cat': veri_cat,
+                    'veri_type': veri_type,
+                    'batch_cap': cap_per_line
+                })
 
     # =========================================================================
     # 构建待检批次队列 (FIFO)
@@ -437,3 +430,4 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             })
 
     return pd.DataFrame(DetectPlanResult), GlobalDelivPlan, pd.DataFrame(WorkArrangeResult)
+
