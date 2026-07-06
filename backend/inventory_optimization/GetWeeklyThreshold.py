@@ -85,7 +85,6 @@ def GenerateWeeklyThreshold(year:str, month:str):
     WeekSeq = df_grouped['PRE_WEEK'].unique()
     res_df = []
 
-
     # 读取设备分类和类别映射
     print("开始读取设备分类配置...", flush=True)
     spec_df = query_adam_spec_code_config()
