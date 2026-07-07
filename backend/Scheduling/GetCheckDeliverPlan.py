@@ -221,7 +221,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         # 混合备货策略：前中期全部兜底囤货，月末压线严格按需检定
         if is_realtime:
             take = rem
-        elif days_to_end >= 5:
+        elif days_to_end >= 2:
             take = rem
         else:
             take = rem if is_actually_needed else 0
@@ -387,7 +387,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 f"⚠️ [产能极度高压] 批次 {lot['row'].get('ARR_BATCH_NO', 'N/A')} 经全月极限排产仍剩 {lot['rem']} 只，将顺延！")
 
         if lot['bgn'] is None: continue
-        actual_detected_num = int(lot['processed'])
+        actual_detected_num = int(lot['orig_take'])
 
         # 只要沾了自动线就显示 02
         primary_veri_type = '02' if '02' in lot['veri_types_used'] else (
@@ -429,5 +429,5 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 'DETECT_DUR': d_dur, 'CAPACITY_NUM': int(qty)
             })
 
+    logging.info(f"LotObjects: {len(LotObjects)}个批次, 产出DetectPlan: {len(DetectPlanResult)}条")
     return pd.DataFrame(DetectPlanResult), GlobalDelivPlan, pd.DataFrame(WorkArrangeResult)
-

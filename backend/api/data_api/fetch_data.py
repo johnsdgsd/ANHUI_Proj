@@ -1958,25 +1958,59 @@ def delete_adam_glob_strategy_scheme_by_ym(exec_ym: str):
     except Exception as e:
         raise
 
+def query_unused_pur_orders():
+    """
+    查询未使用的采购订单批次规格。
+    返回 DEV_CODE 和 ORDER_NUM（每个采购批次的只数）。
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_unused_pur_orders'
+        url = f"http://{host}:{port}{endpoint}"
+
+        response = session.post(url, json={})
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, list) and len(data) == 0:
+            return pd.DataFrame(columns=['DEV_CODE', 'ORDER_NUM'])
+
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+
+        return df
+    except requests.exceptions.RequestException as e:
+        raise
+    except Exception as e:
+        raise
+
+
 def deleteScheme(yearMonth:str):
     '''
     删除当前年月所有方案
     '''
+    logger = logging.getLogger(__name__)
     global_scheme = query_adam_glob_strategy_scheme_by_month(yearMonth)
 
-    if global_scheme is None or global_scheme.empty :
-        print('数据为空无需删除')
+    if global_scheme is None or global_scheme.empty:
+        logger.info(f'[删除方案] 年月 {yearMonth} 无历史方案数据，无需删除')
         return
 
     scheme_id_list = global_scheme['SCHEME_ID'].tolist()
+    logger.info(f'[删除方案] 年月 {yearMonth} 找到 {len(scheme_id_list)} 条历史方案，开始删除: {scheme_id_list}')
 
-    for id in scheme_id_list:
-        delete_adam_glob_strategy_scheme_itt(id)
-        delete_adam_glob_strategy_scheme_lps(id)
-        delete_adam_glob_strategy_scheme_cost(id)
+    for sid in scheme_id_list:
+        delete_adam_glob_strategy_scheme_itt(sid)
+        delete_adam_glob_strategy_scheme_lps(sid)
+        delete_adam_glob_strategy_scheme_cost(sid)
+        logger.info(f'[删除方案] SCHEME_ID={sid} 明细已删除')
 
     delete_adam_glob_strategy_scheme_by_ym(yearMonth)
-    print('方案数据删除成功')
+    logger.info(f'[删除方案] 年月 {yearMonth} 主表已删除，共清理 {len(scheme_id_list)} 条方案')
 
 
 def query_adam_run_dur_sample_by_org_no(org_no: str):
@@ -2479,6 +2513,7 @@ def query_adam_org_stock_sample_estimated(target_month: str):
     logging.info(f'RT设备码: {sorted(rt["DEV_CODE"].unique())}')
     logging.info(f'需求设备码: {sorted(demand["DEV_CODE"].unique())}')
     logging.info(f'配送设备码: {sorted(df_delivery["DEV_CODE"].unique()) if not df_delivery.empty else []}')
+
     result = rt.merge(demand, on=['ORG_NO', 'DEV_CODE'], how='outer') \
                .merge(df_delivery, on=['ORG_NO', 'DEV_CODE'], how='left')
     # 仅数值列填0，避免 ORG_NAME 等字符串列被填充
@@ -2487,6 +2522,7 @@ def query_adam_org_stock_sample_estimated(target_month: str):
         if c in result.columns:
             result[c] = result[c].fillna(0)
     logging.info(f'MERGE后维度: 单位={result["ORG_NO"].nunique()}, 设备={result["DEV_CODE"].nunique()}, 行={len(result)}')
+
 
     result['STOCK_NUM'] = (result['RT_STOCK'] + result['PENDING_DELIVERY']
                            - result['REMAIN_DEMAND']).clip(lower=0).round(0)
