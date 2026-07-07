@@ -14,50 +14,55 @@ def GenerateWeeklyThreshold(year:str, month:str):
 
     year_month = year + month
     global_scheme_id, epsilon = get_approved_scheme_config(year_month)
-    beta = 0.95
-    alpha = epsilon
+    # 审批未通过则默认 0.99
+    if epsilon is None:
+        epsilon = 0.99
     print(f'使用审批方案: GLOBAL_SCHEME_ID={global_scheme_id}, epsilon={epsilon}')
 
     from backend.api.data_api.fetch_data import (
         query_adam_wd_dmd_pre_by_year_month_and_pretype,
+        query_adam_yqm_dmd_pre_by_year_month,
         query_adam_del_site_conf,
         query_adam_spec_code_config,
         insert_into_adam_stock_week_limt_pre,
         delete_adam_stock_week_limt_pre_by_ym)
 
+    # ============ 1. 加载月度需求预测（用于上限） ============
+    monthly_df = query_adam_yqm_dmd_pre_by_year_month(year, month)
+    print(f'成功读取月度需求预测，时间：{year}{month}，数据量：{len(monthly_df)}条')
+    monthly_demand = {}
+    for _, row in monthly_df.iterrows():
+        key = (str(row['ORG_NO']), str(row['DEV_CODE']))
+        monthly_demand[key] = float(row['PRE_NUM'])
+
+    # ============ 2. 加载周度需求预测（用于下限） ============
     pre_type = '04'
-    #获得站点信息，去掉省中心
     org_df = query_adam_del_site_conf()
     org_df = org_df[org_df['STAT_NAME'] != '营销服务中心']
     org_dict = org_df.set_index('ORG_NO')['ORG_NAME'].to_dict()
-    #获得预测结果表
-    df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year,month,pre_type)
+
+    df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year, month, pre_type)
     print(f'成功读取周度预测结果，时间：{year}{month}类型：{pre_type}，数据量：{len(df)}条')
     columns_to_drop = ['WD_DMD_PRE_ID', 'PRE_TYPE', 'PRE_DATE']
     df = df.drop(columns=columns_to_drop, errors='ignore')
     df['ORG_NAME'] = df['ORG_NO'].map(org_dict)
-    # 按单位、设备码、周次分组，汇总预测数量（将新装、故障、更换三类数据相加）
     df_grouped = df.groupby(
-        ['PRE_YEAR', 'PRE_MONTH', 'PRE_QUARTER', 'PRE_WEEK', 'ORG_NO', 'DEV_CODE','ORG_NAME'],
+        ['PRE_YEAR', 'PRE_MONTH', 'PRE_QUARTER', 'PRE_WEEK', 'ORG_NO', 'DEV_CODE', 'ORG_NAME'],
         as_index=False
     )['PRE_NUM'].sum()
-    
-    # 重命名列名
     df_grouped = df_grouped.rename(columns={'PRE_NUM': '预测数量'})
-
     print(f'聚合后周度预测值数据为：{len(df_grouped)}')
-    # 准备初始化仓库的临时数据
-    df_temp = df_grouped[['ORG_NO','ORG_NAME']].drop_duplicates()
+
+    # ============ 3. 构建仓库（基于周度数据中的单位） ============
+    df_temp = df_grouped[['ORG_NO', 'ORG_NAME']].drop_duplicates()
     print(f'准备初始化仓库的临时数据，数据量为:{len(df_temp)}')
     LWI = LocalWarehouseInitializer()
     LWI.load_city_mapping(df_temp)
     local_warehouses = LWI.initialize_warehouses(df_temp)
-    
-    # 创建仓库字典，方便根据城市编码查找
     warehouse_dict = {w.city_code: w for w in local_warehouses}
-    # 按照 ORG_NO, ORG_NAME, DEV_CODE 分组
+
+    # ============ 4. 为每个物资装入周度需求分布 ============
     grouped = df_grouped.groupby(['ORG_NO', 'ORG_NAME', 'DEV_CODE'])
-    
     item_count = 0
     for (org_no, org_name, dev_code), group in grouped:
         warehouse = warehouse_dict.get(str(org_no))
@@ -74,34 +79,52 @@ def GenerateWeeklyThreshold(year:str, month:str):
         for _, row in group.iterrows():
             week = int(row['PRE_WEEK'])
             lambda_value = float(row['预测数量'])
-            # 创建泊松分布并设置到物资
             distribution = PoissonDistribution(lambda_=lambda_value)
             item.set_demand_distribution(week, distribution)
-        # 将物资添加到仓库
         warehouse.add_item(dev_code, item)
         item_count += 1
     print(f"物资创建完成，共 {item_count} 个物资", flush=True)
-    
-    WeekSeq = df_grouped['PRE_WEEK'].unique()
-    res_df = []
 
-    # 读取设备分类和类别映射
+    # ============ 5. 读取设备分类映射 ============
     print("开始读取设备分类配置...", flush=True)
     spec_df = query_adam_spec_code_config()
     dev_cls_mapping = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
     dev_categ_mapping = spec_df.set_index('DEV_CODE')['DEV_CATEG'].to_dict()
     print(f"设备分类配置读取完成，共 {len(dev_cls_mapping)} 种设备", flush=True)
 
+    # ============ 6. 计算周度阈值 ============
+    # 上限 = 月度需求 × 1.5 倍泊松 × epsilon
+    # 下限 = 周度需求 × 0.467 倍泊松 × epsilon
+    # 基准 = (上限 + 下限) / 2
+    import math as _math
+    from scipy.stats import poisson as _poisson
+
+    res_df = []
     stock_id = int(time.time() * 1000)
     pretime = datetime.datetime.now().strftime("%Y-%m-%d")
     total_items = sum(len(w.items) for w in local_warehouses)
     processed = 0
+    zero_monthly = 0
+
     for warehouse in local_warehouses:
-        for item_key,item in warehouse.items.items():
+        for item_key, item in warehouse.items.items():
             try:
+                m_key = (warehouse.city_code, str(item.dev_code))
+                monthly_lambda = monthly_demand.get(m_key, 0)
+                if monthly_lambda <= 0:
+                    zero_monthly += 1
+
                 for week_seq in sorted(item.demand_distributions.keys()):
-                    low , mid , high = item.get_weekly_threshold(week_seq,beta,alpha)
-                    # 获取设备分类和类别
+                    weekly_dist = item.demand_distributions[week_seq]
+                    weekly_lambda = weekly_dist.lambda_
+
+                    # 上限: 月度需求 × 1.5 (tn=0.5)
+                    high = int(_math.ceil(_poisson.ppf(epsilon, monthly_lambda * 1.5)))
+                    # 下限: 周度需求 × 0.467
+                    low = int(_math.ceil(_poisson.ppf(epsilon, weekly_lambda * 0.467)))
+                    # 基准 = (上限 + 下限) / 2
+                    mid = int((high + low) / 2)
+
                     dev_cls = dev_cls_mapping.get(item.dev_code, '').zfill(2)
                     dev_categ = dev_categ_mapping.get(item.dev_code, '').zfill(2)
                     record = {
@@ -128,6 +151,9 @@ def GenerateWeeklyThreshold(year:str, month:str):
             except Exception as e:
                 print(f"计算阈值失败: dev_code={item.dev_code}, error={e}", flush=True)
                 raise
+
+    if zero_monthly > 0:
+        print(f"⚠ 注意: {zero_monthly}/{total_items} 个物资无月度需求数据，上限=0", flush=True)
 
     print(f"阈值计算完成，共处理 {processed} 个物资", flush=True)
     WeeklyThreshold = pd.DataFrame(res_df)

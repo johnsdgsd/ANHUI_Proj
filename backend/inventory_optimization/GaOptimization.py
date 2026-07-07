@@ -14,7 +14,11 @@ def GenerateMonthlyThresholdAndOrderGA(
     month: str,
     init_stock: pd.DataFrame,
     tag: str,
-    alpha: float
+    alpha: float,
+    n_iter: int = 10,
+    pop_size: int = 200,
+    n_processor: int = 10,
+    verbose: bool = False
 ):
     """
     使用遗传算法生成月度库存阈值和补货订单。
@@ -38,10 +42,11 @@ def GenerateMonthlyThresholdAndOrderGA(
     InventoryThreshold, InventoryOrder = run_optimization_from_api(
         init_stock_month=init_stock_month,
         tag=str(tag),
-        n_iter=100,
-        pop_size=200,
+        n_iter=n_iter,
+        pop_size=pop_size,
         epsilon=alpha,
-        n_processor=10
+        n_processor=n_processor,
+        verbose=verbose
     )
 
     # ---- 构建 DemandPre（与 GenerateMonthlyThresholdAndOrder 一致） ----

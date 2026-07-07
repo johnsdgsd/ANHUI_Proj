@@ -24,4 +24,9 @@ def health():
 host = API_CONFIG['server']['host']
 port = API_CONFIG['server']['port']
 if __name__ == '__main__':
+    print("环境变量配置:")
+    print(f"  DB_HOST: {API_CONFIG['database']['host']}")
+    print(f"  DB_PORT: {API_CONFIG['database']['port']}")
+    print(f"  SERVER_HOST: {API_CONFIG['server']['host']}")
+    print(f"  SERVER_PORT: {API_CONFIG['server']['port']}")
     app.run(host=host, port=port, debug=True)

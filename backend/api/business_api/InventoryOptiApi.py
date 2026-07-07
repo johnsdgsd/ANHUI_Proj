@@ -12,6 +12,7 @@ from backend.inventory_optimization.DailyReplenishmentPlan import AdjustDaliyDel
 from backend.inventory_optimization.HeuristicDeliveryPlan import AdjustDaliyDeliveryV2
 from backend.inventory_optimization.SchedulingDeliveryAdapter import AdjustDaliyDeliveryV3
 from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
+from backend.inventory_optimization.GaOptimization import GenerateMonthlyThresholdAndOrderGA
 # 创建蓝图
 inventory_opti_bp = Blueprint('inventory_opti', __name__, url_prefix='/inventory')
 
@@ -65,9 +66,9 @@ def optimize():
             "error": str(e)
         }), 500
 
-# 月度补库和月度阈值
-@inventory_opti_bp.route('/optimize', methods=['POST'])
-def GetMonthThresholdAndOrder():
+# 月度补库和月度阈值（分析版，保留备用）
+@inventory_opti_bp.route('/optimize-analytical', methods=['POST'])
+def GetMonthThresholdAndOrderAnalytical():
     try:
         data = request.get_json() or {}
         
@@ -130,6 +131,116 @@ def GetMonthThresholdAndOrder():
     except Exception as e:
         logging.exception("月度阈值接口异常")
         update_adam_pre_conc_stat(int(preConcId),'04')
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# 月度补库和月度阈值（遗传算法版）
+@inventory_opti_bp.route('/optimize', methods=['POST'])
+def GetMonthThresholdAndOrder():
+    try:
+        data = request.get_json() or {}
+
+        yearMonth = data.get('preMonth')
+        preConcId = data.get('preConcId')
+
+        if not all([yearMonth, preConcId]):
+            return jsonify({
+                "success": False,
+                "error": "缺少必需参数: preMonth, preConcId"
+            }), 400
+
+        year = yearMonth[:4]
+        month = yearMonth[4:6]
+
+        # GA 可选参数
+        n_iter = data.get('nIter', 10)
+        pop_size = data.get('popSize', 200)
+        n_processor = data.get('nProcessor', 10)
+        verbose = data.get('verbose', False)
+
+        import time
+        t_start = time.time()
+
+        from backend.api.data_api.fetch_data import (
+            insert_into_adam_stock_month_limit_pre,
+            insert_into_adam_plan_month_ias_pre,
+            update_adam_pre_conc_stat,
+            delete_adam_stock_month_limit_pre_by_ym,
+            delete_adam_plan_month_ias_pre_by_ym)
+        from backend.config.scheme_config import get_approved_scheme_config
+
+        print('=' * 60, flush=True)
+        print(f'[GA] 遗传算法优化开始: yearMonth={yearMonth}, preConcId={preConcId}', flush=True)
+        print(f'[GA] 参数: n_iter={n_iter}, pop_size={pop_size}, n_processor={n_processor}', flush=True)
+
+        # Step 1: 更新状态
+        print('[GA] Step 1/6: 更新预处理状态...', flush=True)
+        update_adam_pre_conc_stat(int(preConcId), '02')
+
+        # Step 2: 获取方案配置
+        print('[GA] Step 2/6: 获取审批方案配置...', flush=True)
+        global_scheme_id, epsilon = get_approved_scheme_config(yearMonth)
+        print(f'[GA] → GLOBAL_SCHEME_ID={global_scheme_id}, epsilon={epsilon}', flush=True)
+
+        # Step 3: 运行 GA
+        print('[GA] Step 3/6: 开始遗传算法寻优...', flush=True)
+        t_ga_start = time.time()
+        Threshold, Order, _ = GenerateMonthlyThresholdAndOrderGA(
+            year=year,
+            month=month,
+            init_stock=None,
+            tag=global_scheme_id,
+            alpha=epsilon,
+            n_iter=n_iter,
+            pop_size=pop_size,
+            n_processor=n_processor,
+            verbose=verbose
+        )
+        t_ga_end = time.time()
+        print(f'[GA] → 寻优完成, 耗时 {t_ga_end - t_ga_start:.1f}s', flush=True)
+        print(f'[GA] → 阈值 {len(Threshold)} 条, 补货量 {len(Order)} 条', flush=True)
+
+        # Step 4: 删旧阈值 + 插新
+        print('[GA] Step 4/6: 写入月度阈值表...', flush=True)
+        try:
+            del_res = delete_adam_stock_month_limit_pre_by_ym(year, month)
+            print(f'[GA] → 删除旧阈值: {del_res}', flush=True)
+        except Exception as e:
+            print(f'[GA] → 删除旧阈值失败(继续): {e}', flush=True)
+
+        from backend.api.data_api.fetch_data import query_pk_next
+        Threshold['STOCK_MONTH_LIMIT_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_STOCK_MONTH_LIMIT_PRE", len(Threshold))]
+        result = insert_into_adam_stock_month_limit_pre(Threshold)
+        print(f'[GA] → 插入阈值: {result}', flush=True)
+
+        # Step 5: 删旧补货 + 插新
+        print('[GA] Step 5/6: 写入月度补货量表...', flush=True)
+        try:
+            del_res = delete_adam_plan_month_ias_pre_by_ym(year, month)
+            print(f'[GA] → 删除旧补货: {del_res}', flush=True)
+        except Exception as e:
+            print(f'[GA] → 删除旧补货失败(继续): {e}', flush=True)
+
+        Order['PLAN_MONTH_IAS_PRE_ID'] = [int(x) for x in query_pk_next("SEQ_ADAM_PLAN_MONTH_IAS_PRE", len(Order))]
+        result = insert_into_adam_plan_month_ias_pre(Order)
+        print(f'[GA] → 插入补货: {result}', flush=True)
+
+        # Step 6: 更新状态
+        print('[GA] Step 6/6: 更新完成状态...', flush=True)
+        update_adam_pre_conc_stat(int(preConcId), '03')
+
+        t_end = time.time()
+        print(f'[GA] 全部完成, 总耗时 {t_end - t_start:.1f}s', flush=True)
+        print('=' * 60, flush=True)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logging.exception("[GA] 月度阈值接口异常")
+        update_adam_pre_conc_stat(int(preConcId), '04')
         return jsonify({
             "success": False,
             "error": str(e)

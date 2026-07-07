@@ -65,166 +65,224 @@ def get_device_install_data(year:str):
 
   
 
+def _round_order_qty(qty: int, dev_cls: str, dev_categ: str) -> int:
+    """按设备类别/品类取整补库数量（与分析版 GetMonthlyOrder 一致）"""
+    if qty == 0:
+        return 0
+    dev_cls = str(dev_cls).replace('.0', '').strip().zfill(2)
+    if dev_cls == '02':
+        return ((qty + 35) // 36) * 36
+    elif dev_cls == '09':
+        return ((qty + 19) // 20) * 20
+    elif dev_cls == '01':
+        return ((qty + 59) // 60) * 60 if str(dev_categ) == '01_01' else ((qty + 19) // 20) * 20
+    return qty
+
+
 def run_optimization_from_api(
     init_stock_month: int,
-    tag:str,
-    n_iter: int = 1,
+    tag: str,
+    n_iter: int = 10,
     pop_size: int = 200,
     epsilon: float = 0.95,
-    n_processor: int = 10
+    n_processor: int = 10,
+    verbose: bool = False
 ):
-    """从API数据源运行库存优化
-    
-    从数据API获取数据后运行完整的库存优化流程
-    
-    Args:
-        init_stock_month: 初始库存月份 (YYYYMM)
-        install_start_month: 安装量数据起始月份 (YYYYMM)
-        install_end_month: 安装量数据结束月份 (YYYYMM)
-        n_iter: 遗传算法迭代次数
-        pop_size: 种群大小
-        epsilon: 目标满足率
-        n_processor: 并行处理器数量
-        tag: 全局标识
-        
-    Returns:
-         优化结果
-    """
-    # 在函数内部导入，避免循环导入
-    from backend.api.data_api.fetch_data import (
-        query_aps_inventory_init_stock_by_month,
-        query_device_install_data_by_month_range,
-        query_adam_pre_range_info,
-        insert_into_aps_inventory_fulfill_rate,
-        insert_into_aps_inventory_replenish,
-        insert_into_aps_inventory_replenish_qty,
-        query_adam_qua_stock_sample_by_year_month,
-        query_adam_pend_stock_sample_by_year_month,
-        query_adam_org_stock_sample_estimated,
-        query_adam_spec_code_config
-    )
-    
-    try:
-        year = str(init_stock_month // 100)
-        # 月份减1
-        month = f"{init_stock_month % 100 -1:02d}"
-        # 获取初始库存数据
-        init_stock = query_adam_org_stock_sample_estimated(str(init_stock_month))
-        print(f'推算月初库存成功，数据量{len(init_stock)}条', flush=True)
-        #合格品库存
-        qua_sto = query_adam_qua_stock_sample_by_year_month(year,month)
-        #不合格品库存
-        unqua_sto = query_adam_pend_stock_sample_by_year_month(year,month)
-        # 获取设备类别配置
-        spec_df = query_adam_spec_code_config()
-        spec_dict = spec_df.set_index('DEV_CODE')['DEV_CLS'].to_dict()
-        # 添加设备类别列
-        unqua_sto['DEV_CLS'] = unqua_sto['DEV_CODE'].map(spec_dict)
+    """使用遗传算法优化月度库存阈值与补货量（单月版本）
 
-        #安装量数据-获取2026年所有需求预测信息
-        install_df = get_device_install_data(year)
-        #预测范围中的物资价格
+    入参与 GenerateMonthlyThresholdAndOrder 对齐：
+        init_stock_month: 目标月份 (YYYYMM)
+        tag:              全局方案标识
+        n_iter:           遗传算法迭代次数
+        pop_size:         种群大小
+        epsilon:          目标满足率下限
+        n_processor:      并行处理器数量
+
+    Returns:
+        (InventoryThreshold, InventoryOrder)
+        列名与分析版 GenerateMonthlyThresholdAndOrder 完全一致。
+    """
+    from types import SimpleNamespace
+    from backend.api.data_api.fetch_data import (
+        query_adam_org_stock_sample_estimated,
+        query_adam_yqm_dmd_pre_by_year_month,
+        query_adam_pre_range_info,
+        query_adam_spec_code_config,
+    )
+    from backend.inventory_optimization.demand_distribution import PoissonDistribution
+    from backend.inventory_optimization.item import Item as GaItem
+    from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
+
+    try:
+        # ---- 1. 解析日期 ----
+        init_stock_month_str = str(init_stock_month)
+        year = init_stock_month_str[:4]
+        month = init_stock_month_str[4:6]
+        target_month = int(month)
+
+        # ---- 2. 加载数据 ----
+        init_stock = query_adam_org_stock_sample_estimated(init_stock_month_str)
+        print(f'推算月初库存成功，数据量{len(init_stock)}条', flush=True)
+
+        demand_df = query_adam_yqm_dmd_pre_by_year_month(year, month)
+        print(f'获取{year}年{month}月需求预测数据成功，数据量{len(demand_df)}条', flush=True)
+
         item_cost = query_adam_pre_range_info()
-        
-        # 创建库存优化器
+        # 仅保留初始库存中存在的物资价格
+        valid_dev_codes = init_stock['DEV_CODE'].unique()
+        item_cost = item_cost[item_cost['DEV_CODE'].isin(valid_dev_codes)]
+        print(f'物资价格匹配: {len(item_cost)}/{len(valid_dev_codes)} 种设备码', flush=True)
+        spec_df = query_adam_spec_code_config()
+        spec_dev_dict = spec_df.set_index('DEV_CODE')[['DEV_CLS', 'DEV_CATEG']].to_dict('index')
+
+        # 成本映射
+        cost_df = item_cost[['DEV_CODE', 'TAX_UP']].copy()
+        cost_df['holding_cost'] = (cost_df['TAX_UP'] * 0.1).round(1)
+        cost_df['shortage_cost'] = (cost_df['TAX_UP'] * 0.5).round(1)
+        cost_dict = cost_df.set_index('DEV_CODE')[['holding_cost', 'shortage_cost']].to_dict('index')
+
+        # ---- 3. 构建仓库与物资 ----
+        LWI = LocalWarehouseInitializer()
+        LWI.load_city_mapping(init_stock)
+        local_warehouses = LWI.initialize_warehouses(init_stock)
+        warehouse_dict = {w.city_code: w for w in local_warehouses}
+
+        # 跟踪每个仓库是否有物资
+        wh_has_items = {w.city_code: False for w in local_warehouses}
+
+        for _, row in demand_df.iterrows():
+            org_no = str(row['ORG_NO'])
+            dev_code = str(row['DEV_CODE'])
+            monthly_demand = float(row['PRE_NUM'])
+
+            wh = warehouse_dict.get(org_no)
+            if not wh:
+                continue
+            wh_has_items[org_no] = True
+
+            # 初始库存
+            mask = ((init_stock['ORG_NO'].astype(str) == org_no) &
+                    (init_stock['DEV_CODE'].astype(str) == dev_code))
+            init_stock_val = float(init_stock.loc[mask, 'STOCK_NUM'].sum()) if mask.any() else 0.0
+
+            # 成本
+            costs = cost_dict.get(dev_code, {})
+            holding_cost = float(costs.get('holding_cost', 0.0))
+            shortage_cost = float(costs.get('shortage_cost', 0.0))
+
+            # 设备类别
+            dev_info = spec_dev_dict.get(dev_code, {})
+            dev_cls = str(dev_info.get('DEV_CLS', '00')).replace('.0', '').strip().zfill(2)
+
+            # 创建物资
+            item = GaItem(
+                cls=dev_cls,
+                dev_code=dev_code,
+                initial_inventory=init_stock_val,
+                holding_cost=holding_cost,
+                shortage_cost=shortage_cost,
+                alpha=0.95
+            )
+
+            # 设置单月需求分布 (tn=0.5 → rate=1.5，与分析版一致)
+            distribution = PoissonDistribution(lambda_=monthly_demand, T=1, tn=0.5)
+            item.set_demand_distribution(target_month, distribution)
+
+            wh.add_item(dev_code, item)
+
+        # 移除没有任何物资的空仓库（避免 GA 维度膨胀）
+        local_warehouses = [w for w in local_warehouses if wh_has_items.get(w.city_code, False)]
+        if not local_warehouses:
+            raise ValueError("没有任何仓库存在物资！请检查需求预测数据与月初库存数据是否匹配。")
+        print(f'有效仓库数: {len(local_warehouses)}', flush=True)
+
+        # ---- 4. 构建 GA 上下文 ----
+        context = SimpleNamespace()
+        context.local_warehouses = local_warehouses
+        context.central_warehouse = CentralWarehouse()  # 空中心库（单期不需要）
+
+        target_ym = int(f"{year}{month}")
+
+        # 创建优化器并挂载上下文
         optimizer = InventoryOptimizer(init_stock)
-        # 获取需求分布
-        optimizer.get_distributions_from_install_data(install_df)
-        
-        # 初始化地方库
-        optimizer.set_local_warehouses_from_dataframe()
-        #初始化中心库
-        optimizer.central_warehouse = CentralWarehouse()
-        optimizer.central_warehouse.city_name = '中心库'
-        optimizer.central_warehouse.initialize_from_sto_data(qua_sto,unqua_sto)
-        optimizer.central_warehouse.update_items_from_local_warehouses(optimizer.local_warehouses)
-        # 设置地方库和中心库物资成本
-        optimizer.set_item_costs_from_dataframe(item_cost)
-        
-        # 运行优化
+        optimizer.local_warehouses = local_warehouses
+        optimizer.central_warehouse = context.central_warehouse
+        optimizer.context = context
+
+        # ---- 5. 遗传算法寻优 ----
+        print(f'开始遗传算法寻优: n_iter={n_iter}, pop_size={pop_size}, epsilon={epsilon}, target_ym={target_ym}')
         best_solution, best_cost = optimizer.optimize_alpha(
             n_iter=n_iter,
             pop_size=pop_size,
             epsilon=epsilon,
-            n_processor=n_processor
+            n_processor=n_processor,
+            target_ym=target_ym,
+            end_ym=target_ym,
+            verbose=verbose
         )
+        print(f'GA 完成: best_cost={best_cost:.2f}, best_alpha={best_solution}', flush=True)
 
-        alpha_dict = optimizer._build_alpha_dict(best_solution,optimizer.context)
-        optimizer.set_alpha(alpha_dict,optimizer.context)
+        # 应用最优 alpha
+        alpha_dict = InventoryOptimizer._build_alpha_dict(best_solution, optimizer.context)
+        InventoryOptimizer.set_alpha(alpha_dict, optimizer.context)
 
-        # 构建满足率结果DataFrame
-        result_data = []
-        for warehouse in optimizer.context.local_warehouses:
-            for item_key, item in warehouse.items.items():
-                result_data.append({
-                    'STAT_MONTH': init_stock_month,
-                    'UNIT_CODE': warehouse.city_code,
-                    'UNIT_NAME': warehouse.city_name,
-                    'DEVICE_TYPE': item.cls,
-                    'DEVICE_CODE': item.dev_code,
-                    'TAG': tag,
-                    'FULFILL_RATE': round(item.alpha, 4)
-                })
-        alpha_result_df = pd.DataFrame(result_data)
-        insert_into_aps_inventory_fulfill_rate(alpha_result_df)
-        #构建库存阈值上限结果以及补货量结果
-        month_id = init_stock_month % 100
-        demand_result_data = []
-        order_result_data = []
-        # 生成唯一标识
+        # ---- 6. 构建输出 ----
+        pretime = datetime.now().strftime('%Y-%m-%d')
         stock_id = 1
-        for local_warehouse in optimizer.context.local_warehouses:
-            for item_key, item in local_warehouse.items.items():
-                demand = item.generate_demand_quantile(month_id)
-                order = max(0,demand - item.initial_inventory)
-                # 拆分年份和月份
-                pre_year = init_stock_month[:4]
-                pre_month = init_stock_month[4:6]
-                # 获取设备分类和类别（从规格设备码映射字典获取）
-                from backend.api.data_api.fetch_data import query_adam_spec_code_config
-                spec_df = query_adam_spec_code_config()
-                spec_dict = spec_df.set_index('DEV_CODE')[['DEV_CLS', 'DEV_CATEG']].to_dict('index')
-                
-                device_info = spec_dict.get(item.dev_code, {})
-                dev_cls = device_info.get('DEV_CLS', '00').zfill(2)
-                dev_categ = device_info.get('DEV_CATEG', '00_00')
-                
-                demand_result_data.append(
-                    {
-                        'STOCK_MONTH_LIMIT_PRE_ID': stock_id,
-                        'PRE_YEAR': pre_year,
-                        'PRE_MONTH': pre_month,
-                        'ORG_NO': local_warehouse.city_code,
-                        'DEV_CLS': dev_cls,
-                        'DEV_CATEG': dev_categ,
-                        'DEV_CODE': item.dev_code,
-                        'BASE_LIMIT': int(demand),
-                        'PRE_TIME': datetime.now().strftime('%Y-%m-%d'),
-                        'GLOBAL_SCHEME_ID': tag 
-                    }
-                )      
-                order_result_data.append(
-                    {
-                        'PLAN_MONTH_IAS_PRE_ID': stock_id,
-                        'PRE_YEAR': pre_year,
-                        'PRE_MONTH': pre_month,
-                        'REC_ORG_NO': local_warehouse.city_code,
-                        'DEV_CLS': dev_cls,
-                        'DEV_CATEG': dev_categ,
-                        'DEV_CODE': item.dev_code,
-                        'PLAN_IAS_NUM': int(order),
-                        'GLOBAL_SCHEME_ID': tag
-                    }
-                )
-                stock_id+=1
-        
+        threshold_rows = []
+        order_rows = []
 
-        InventoryThreshold = pd.DataFrame(demand_result_data)
-        InventoryOrder = pd.DataFrame(order_result_data)
+        for wh in local_warehouses:
+            for item_key, item in wh.items.items():
+                demand = item.generate_demand_quantile(target_month)
+                demand = round(demand)
+                order = max(0, demand - item.initial_inventory)
 
-        return InventoryThreshold,InventoryOrder
+                dev_info = spec_dev_dict.get(item.dev_code, {})
+                dev_cls = str(dev_info.get('DEV_CLS', '00')).replace('.0', '').strip().zfill(2)
+                dev_categ = str(dev_info.get('DEV_CATEG', '00_00'))
 
+                order = _round_order_qty(int(order), dev_cls, dev_categ)
 
-   
+                threshold_rows.append({
+                    'STOCK_MONTH_LIMIT_PRE_ID': stock_id,
+                    'PRE_YEAR': year,
+                    'PRE_MONTH': month,
+                    'ORG_NO': wh.city_code,
+                    'DEV_CLS': dev_cls,
+                    'DEV_CATEG': dev_categ,
+                    'DEV_CODE': item.dev_code,
+                    'BASE_LIMIT': int(demand),
+                    'PRE_TIME': pretime,
+                    'GLOBAL_SCHEME_ID': int(tag)
+                })
+
+                order_rows.append({
+                    'PLAN_MONTH_IAS_PRE_ID': stock_id,
+                    'PRE_YEAR': year,
+                    'PRE_MONTH': month,
+                    'REC_ORG_NO': wh.city_code,
+                    'DEV_CLS': dev_cls,
+                    'DEV_CATEG': dev_categ,
+                    'DEV_CODE': item.dev_code,
+                    'PLAN_IAS_NUM': int(order),
+                    'GLOBAL_SCHEME_ID': int(tag)
+                })
+
+                stock_id += 1
+
+        InventoryThreshold = pd.DataFrame(threshold_rows)
+        InventoryOrder = pd.DataFrame(order_rows)
+
+        total_order = int(InventoryOrder['PLAN_IAS_NUM'].sum()) if not InventoryOrder.empty else 0
+        total_threshold = int(InventoryThreshold['BASE_LIMIT'].sum()) if not InventoryThreshold.empty else 0
+        total_init_stock = sum(
+            item.initial_inventory for wh in local_warehouses for item in wh.items.values()
+        )
+        print(f'[GA] 总阈值={total_threshold}, 总补货量={total_order}, 总初始库存={total_init_stock:.0f}', flush=True)
+
+        print(f'生成阈值数据{len(InventoryThreshold)}条，补货量数据{len(InventoryOrder)}条', flush=True)
+        return InventoryThreshold, InventoryOrder
+
     except Exception as e:
         raise

@@ -408,7 +408,7 @@ class InventoryOptimizer:
         return costs
     
     @staticmethod
-    def objective_function(*args,context):
+    def objective_function(*args, context, target_ym=202601, end_ym=202612):
         """目标函数：将入参解包为满足率，运行仿真并计算总成本"""
         alpha_tuple = tuple(args)
         alpha_dict = InventoryOptimizer._build_alpha_dict(alpha_tuple[0],context=context)
@@ -416,7 +416,7 @@ class InventoryOptimizer:
         for local_warehouse in context.local_warehouses:
             local_warehouse.reset_inventory()
         context.central_warehouse.reset_inventory()
-        InventoryOptimizer.simulate(202601, 202612,context)
+        InventoryOptimizer.simulate(target_ym, end_ym, context)
         costs = InventoryOptimizer.calculate_costs(context)
         total_alpha = InventoryOptimizer.calculate_weighted_alpha(context)
         return costs,total_alpha
@@ -439,24 +439,39 @@ class InventoryOptimizer:
     
     @staticmethod
     def _get_unique_categories(context):
-        """获取所有地方仓库中的唯一类别"""
+        """获取所有地方仓库中的唯一类别（遍历全部仓库）"""
         if not context.local_warehouses:
             return set()
-        sample_warehouse = context.local_warehouses[0]
-        return {item.cls for item in sample_warehouse.items.values()}
+        categories = set()
+        for wh in context.local_warehouses:
+            for item in wh.items.values():
+                if item.cls:
+                    categories.add(item.cls)
+        return categories
 
     @staticmethod
     def fitness_func(ga_instance, solution, solution_idx):
-        costs,total_alpha = InventoryOptimizer.objective_function(solution,context = ga_instance.context)
+        target_ym = getattr(ga_instance, 'target_ym', 202601)
+        end_ym = getattr(ga_instance, 'end_ym', 202612)
+        costs,total_alpha = InventoryOptimizer.objective_function(
+            solution, context=ga_instance.context,
+            target_ym=target_ym, end_ym=end_ym)
         if total_alpha > ga_instance.expect_alpha:
             return -costs['总计']['total_cost']
         else:
             return -1e20
     
-    def optimize_alpha(self, n_iter=50, pop_size=200,epsilon = 0.95,n_processor = 1):
-        """使用遗传算法优化满足率"""
+    def optimize_alpha(self, n_iter=50, pop_size=200, epsilon=0.95, n_processor=1,
+                       target_ym=202601, end_ym=202612, verbose=False):
+        """使用遗传算法优化满足率
+
+        Args:
+            target_ym: 仿真起始年月 (YYYYMM)，挂在 GA 实例上以兼容多进程 pickle
+            end_ym:    仿真结束年月 (YYYYMM)
+            verbose:   是否打印每代结果
+        """
         import pygad
-        
+
         context = SimpleNamespace()
         context.local_warehouses = self.local_warehouses
         context.central_warehouse = self.central_warehouse
@@ -465,8 +480,8 @@ class InventoryOptimizer:
         categories = sorted(InventoryOptimizer._get_unique_categories(context))
         warehouses = sorted([w.city_code for w in self.local_warehouses])
         n_dim = len(categories) * len(warehouses)
-             
-        ga = pygad.GA(
+
+        ga_kwargs = dict(
             num_generations=n_iter,
             num_parents_mating=pop_size // 2,
             fitness_func=InventoryOptimizer.fitness_func,
@@ -475,30 +490,39 @@ class InventoryOptimizer:
             gene_type=float,
             gene_space=[{'low': epsilon, 'high': 0.9999,'step':0.0001} for _ in range(n_dim)],
             mutation_type="random",
-            on_generation = InventoryOptimizer.on_generation,
             mutation_percent_genes=10,
             parallel_processing=['process', n_processor]
         )
+        if verbose:
+            ga_kwargs['on_generation'] = InventoryOptimizer.on_generation
+
+        ga = pygad.GA(**ga_kwargs)
         ga.total_alpha = 0
         ga.expect_alpha = epsilon
         ga.context = context
+        ga.target_ym = target_ym    # 挂在 GA 实例上，多进程 pickle 可保留
+        ga.end_ym = end_ym
 
         ga.run()
-        
+
         best_solution = ga.best_solution()[0]
         best_cost = -ga.best_solution()[1]
-        
+
         print(f'最佳参数组合为:{best_solution}')
         print(f'最低成本为:{best_cost}')
         self.best_cost = best_cost
         self.best_solution = best_solution
-        
+
         return best_solution, best_cost
 
     @staticmethod
     def on_generation(ga):
         """回调函数，每代结束后调用"""
         best_solution = ga.best_solution()[0]
-        costs, best_alpha = InventoryOptimizer.objective_function(best_solution,context=ga.context)
+        target_ym = getattr(ga, 'target_ym', 202601)
+        end_ym = getattr(ga, 'end_ym', 202612)
+        costs, best_alpha = InventoryOptimizer.objective_function(
+            best_solution, context=ga.context,
+            target_ym=target_ym, end_ym=end_ym)
         best_cost = costs['总计']['total_cost']
         print(f"Gen {ga.generations_completed}: alpha={best_solution}, cost={best_cost:.2f}, total_alpha={best_alpha:.4f}")

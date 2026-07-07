@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import datetime
 from backend.global_optimization.logger import logger
-from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
+from backend.inventory_optimization.GaOptimization import GenerateMonthlyThresholdAndOrderGA
 import time
 
 def GenerateMutiOrderScheme(yearMonth:str):
@@ -52,12 +52,12 @@ def GenerateMutiOrderScheme(yearMonth:str):
     for idx, e in enumerate(epsilons, 1):
         logger.info(f'========== 方案{idx}/3 开始 (ε={e}, tag={tag}) ==========')
 
-        Threshold, Order,Demand_Pre = GenerateMonthlyThresholdAndOrder(
+        Threshold, Order,Demand_Pre = GenerateMonthlyThresholdAndOrderGA(
             year=year,
             month=month,
-            init_stock=init_stock,
+            init_stock=None,
             tag=tag,
-            alpha = e
+            alpha=e
         )
         tag_epsilon_map[tag] = e
         OrderSchemes[tag] = Order
@@ -65,9 +65,9 @@ def GenerateMutiOrderScheme(yearMonth:str):
         detail = PrepareDetail(Order,Threshold,init_stock,item_cost,Demand_Pre,monthly_holding_rate = monthly_holding_rate)
         detail = GetRunDurDetail(detail)
         logger.info('准备计算到货量和检定量')
-        detail, total_central_avg_inv = PrepareArrAndVerifQty(detail, yearMonth)
+        detail, total_central_avg_inv, total_central_unqua_avg_inv, total_central_unqua_end, total_central_qua_end = PrepareArrAndVerifQty(detail, yearMonth)
         logger.info('准备开始计算全局主表明细')
-        global_scheme_item,detail = GetGlobalSchemeItem(detail,tag,yearMonth,total_central_avg_inv)
+        global_scheme_item,detail = GetGlobalSchemeItem(detail,tag,yearMonth,total_central_avg_inv,total_central_unqua_avg_inv,total_central_unqua_end,total_central_qua_end)
         logger.info(f"[方案{tag}] 周转次数 PRE_ITT={global_scheme_item.iloc[0]['PRE_ITT']:.4f}, "
                     f"总成本 PRE_STAT_COST={global_scheme_item.iloc[0]['PRE_STAT_COST']:.2f}")
         logger.info('准备计算周转明细')
@@ -199,8 +199,12 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
     else:
         detail['PRE_NUM'] = 0
 
-    # 5. 月末库存 = 基准库存 - 预测量
-    detail['I_END'] = (detail['BASE_LIMIT'] - detail['PRE_NUM']).clip(lower=0)
+    # 5. 月末库存：月初 > 基准时用月初减，否则用基准减
+    detail['I_END'] = detail.apply(
+        lambda r: max(r['I0'] - r['PRE_NUM'], 0) if r['I0'] > r['BASE_LIMIT']
+                  else max(r['BASE_LIMIT'] - r['PRE_NUM'], 0),
+        axis=1
+    )
     # 6. 日均库存
     detail['AVG_INV'] = (detail['I0'] + detail['I_END']) / 2.0
 
@@ -219,7 +223,7 @@ def PrepareDetail(Order: pd.DataFrame, Threshold: pd.DataFrame, init_stock: pd.D
     return detail
 
 
-def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str, total_central_avg_inv: float = 0.0):
+def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str, total_central_avg_inv: float = 0.0, total_central_unqua_avg_inv: float = 0.0, total_central_unqua_end: float = 0.0, total_central_qua_end: float = 0.0):
     '''
     获得一条全局方案
     '''
@@ -273,14 +277,15 @@ def GetGlobalSchemeItem(detail: pd.DataFrame, scheme_no: str, yearMonth: str, to
     logger.info(f'单只成本分母 - 总需求量 total_demand: {total_demand}')
     pre_single_cost = pre_stat_cost / total_demand if total_demand > 0 else 0.0
     total_pre_num = detail['PRE_NUM'].sum()
-    total_avg_inv = detail['AVG_INV'].sum() + total_central_avg_inv
+    total_avg_inv = detail['AVG_INV'].sum() + total_central_avg_inv + total_central_unqua_avg_inv
     total_turnover = total_pre_num / total_avg_inv if total_avg_inv > 0 else 0.0
     logger.info(f'周转次数计算: total_pre_num={total_pre_num:.2f}, '
                 f'detail.AVG_INV.sum={detail["AVG_INV"].sum():.2f}, '
                 f'total_central_avg_inv={total_central_avg_inv:.2f}, '
+                f'total_central_unqua_avg_inv={total_central_unqua_avg_inv:.2f}, '
                 f'total_avg_inv={total_avg_inv:.2f}, '
                 f'total_turnover={total_turnover:.8f}')
-    cur_itr = round(detail['I_END'].sum() / detail['RUNNING_NUM'].sum(), 4) * 100 if detail['RUNNING_NUM'].sum() > 0 else 0.0
+    cur_itr = round((detail['I_END'].sum() + total_central_qua_end + total_central_unqua_end) / detail['RUNNING_NUM'].sum(), 4) * 100 if detail['RUNNING_NUM'].sum() > 0 else 0.0
     # 成本周转次数同比环比计算（历史值为空或0时结果为0）
     cost_tr = 0.0
     if cost_last_month and cost_last_month != 0:
@@ -820,15 +825,9 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
 
     logger.info(f'[到货/检定量] 开始读取省级库存数据, 目标月份: {yearMonth}')
 
-    # 合格品快照: 目标月往前推2个月
-    target_dt = datetime.strptime(yearMonth, '%Y%m')
-    prev_dt = target_dt - relativedelta(months=2)
-    qua_period = prev_dt.strftime('%Y%m')
-    logger.info(f'[到货/检定量] 合格品快照: {qua_period} (目标月-2)')
-
-    raw_qua = query_adam_qua_stock_sample_by_year_month(prev_dt.strftime('%Y'), prev_dt.strftime('%m'))
     raw_pend = query_adam_realtime_pend_stock()
 
+    target_dt = datetime.strptime(yearMonth, '%Y%m')
     target_start = target_dt.strftime('%Y-%m-%d 00:00:00')
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f'[到货/检定量] 区间范围: {now_str} → {target_start}')
@@ -851,9 +850,6 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
             result.rename(columns={val_col.upper(): output_col}, inplace=True)
         return result
 
-    df_qua = _clean_and_sum(raw_qua, 'QUA_STOCK_NUM', 'QUA_STOCK')
-    logger.info(f'[到货/检定量] 合格品快照: {len(df_qua)} 个设备码, 合计 {int(df_qua["QUA_STOCK"].sum())} 只')
-
     df_pend = _clean_and_sum(raw_pend, 'NOW_PEND_NUM')
     logger.info(f'[到货/检定量] 实时待检: {len(df_pend)} 个设备码, 合计 {int(df_pend["NOW_PEND_NUM"].sum())} 只')
 
@@ -872,22 +868,21 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     df_insp = _clean_and_sum(raw_insp, 'INSPECTED_NUM')
     logger.info(f'[到货/检定量] 已检定完工: {len(df_insp)} 个设备码, 合计 {int(df_insp["INSPECTED_NUM"].sum())} 只')
 
-    # 推算不合格品: 实时待检 + 区间到货 - 区间检定
+    # 推算本月末下月初不合格品: 实时待检 + 区间到货 - 区间检定
     df_unqua = df_pend.merge(df_arr, on='DEV_CODE', how='outer').merge(df_det, on='DEV_CODE', how='outer')
     df_unqua.fillna(0, inplace=True)
     df_unqua['UNQUA_STOCK'] = (df_unqua['NOW_PEND_NUM'] + df_unqua['ARR_NUM'] - df_unqua['DETECT_NUM']).clip(lower=0)
     df_unqua = df_unqua[['DEV_CODE', 'UNQUA_STOCK']]
     logger.info(f'[到货/检定量] 推算不合格品: {len(df_unqua)} 个设备码, 合计 {int(df_unqua["UNQUA_STOCK"].sum())} 只')
 
-    # 合并为库存总表 DF_stock: 每个 DEV_CODE 一行
-    DF_stock = df_qua.merge(df_unqua, on='DEV_CODE', how='outer') \
-                     .merge(df_rt_qua, on='DEV_CODE', how='outer') \
-                     .merge(df_det, on='DEV_CODE', how='outer') \
-                     .merge(df_deliv, on='DEV_CODE', how='outer') \
-                     .merge(df_insp, on='DEV_CODE', how='outer')
+    # 合并为库存总表 DF_stock: 每个 DEV_CODE 一行（以实时合格品为基准）
+    DF_stock = df_rt_qua.merge(df_unqua, on='DEV_CODE', how='outer') \
+                        .merge(df_det, on='DEV_CODE', how='outer') \
+                        .merge(df_deliv, on='DEV_CODE', how='outer') \
+                        .merge(df_insp, on='DEV_CODE', how='outer')
     DF_stock.fillna(0, inplace=True)
     logger.info(f'[到货/检定量] 库存总表合并完成: {len(DF_stock)} 个设备码')
-    # DF_stock 列: DEV_CODE, QUA_STOCK, UNQUA_STOCK, QUA_STOCK_RT, DETECT_NUM, DELIVERED_NUM, INSPECTED_NUM
+    # DF_stock 列: DEV_CODE, QUA_STOCK_RT, UNQUA_STOCK, DETECT_NUM, DELIVERED_NUM, INSPECTED_NUM
 
     # ========================================================================
     #  步骤2: 计算省级总量 DF_dev[D DEV_CODE, TOTAL_ARR, TOTAL_VERIF]
@@ -913,17 +908,29 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     DF_dev['TOTAL_ARR'] = (1.25 * (1.25 * DF_dev['TOTAL_DEMAND'] - DF_dev['QUA_STOCK_ADJ'])
                            - DF_dev['UNQUA_STOCK']).clip(lower=0).apply(math.ceil)
 
-    # 检定公式: 总需求 − 合格品_ADJ
-    DF_dev['TOTAL_VERIF'] = (DF_dev['TOTAL_DEMAND'] - DF_dev['QUA_STOCK_ADJ']).clip(lower=0)
+    # 检定公式: 5/6倍原始检定量
+    DF_dev['TOTAL_VERIF'] = (0.83*(1.25 * (1.25 * DF_dev['TOTAL_DEMAND'] - DF_dev['QUA_STOCK_ADJ'])).clip(lower=0)).apply(math.ceil)
 
     logger.info(f'[到货/检定量] 省级总量: 到货 {int(DF_dev["TOTAL_ARR"].sum())} 只, 检定 {int(DF_dev["TOTAL_VERIF"].sum())} 只')
 
-    # 省中心日均合格品 = (月初 + 月末) / 2
+    # 省中心日均合格品 = (月初 + 月末) / 2（使用实时推算的月初合格品）
     # 月末 = 月初 + 检定新增 - 配送出库
-    DF_dev['END_QUA'] = DF_dev['QUA_STOCK'] + DF_dev['TOTAL_VERIF'] - DF_dev['TOTAL_DEMAND']
-    DF_dev['CENTRAL_AVG_INV'] = ((DF_dev['QUA_STOCK'] + DF_dev['END_QUA']) / 2.0).clip(lower=0)
+    DF_dev['END_QUA'] = (DF_dev['QUA_STOCK_ADJ'] + DF_dev['TOTAL_VERIF'] - DF_dev['TOTAL_DEMAND']).clip(lower=0)
+    DF_dev['CENTRAL_AVG_INV'] = ((DF_dev['QUA_STOCK_ADJ'] + DF_dev['END_QUA']) / 2.0).clip(lower=0)
     total_central_avg_inv = DF_dev['CENTRAL_AVG_INV'].sum()
     logger.info(f'[到货/检定量] 省中心总日均合格品: {total_central_avg_inv:.1f}')
+
+    # 省中心月末合格品（已在上面 END_QUA 计算）
+    total_central_qua_end = DF_dev['END_QUA'].sum()
+
+    # 省中心非合格品库存: 月初 = UNQUA_STOCK, 月末 = 月初 + 到货 - 检定
+    DF_dev['UNQUA_STOCK_END'] = (DF_dev['UNQUA_STOCK'] + DF_dev['TOTAL_ARR'] - DF_dev['TOTAL_VERIF']).clip(lower=0)
+    DF_dev['CENTRAL_AVG_UNQUA'] = ((DF_dev['UNQUA_STOCK'] + DF_dev['UNQUA_STOCK_END']) / 2.0).clip(lower=0)
+    total_central_unqua_avg_inv = DF_dev['CENTRAL_AVG_UNQUA'].sum()
+    total_central_unqua_end = DF_dev['UNQUA_STOCK_END'].sum()
+    logger.info(f'[到货/检定量] 省中心合格品月末={int(total_central_qua_end)}, '
+                f'非合格品: 月初={int(DF_dev["UNQUA_STOCK"].sum())}, '
+                f'月末={int(total_central_unqua_end)}, 日均={total_central_unqua_avg_inv:.1f}')
 
     # DF_dev 列: DEV_CODE, TOTAL_DEMAND, TOTAL_ARR, TOTAL_VERIF (plus 库存中间列)
     DF_dev = DF_dev[['DEV_CODE', 'TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF']]
@@ -949,7 +956,7 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     # 清理
     detail.drop(columns=['TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF', 'RATIO'], inplace=True)
 
-    return detail, total_central_avg_inv
+    return detail, total_central_avg_inv, total_central_unqua_avg_inv, total_central_unqua_end, total_central_qua_end
 
 
 def GetGlobalSchemeLPS(detail: pd.DataFrame, scheme_id: str) -> pd.DataFrame:
@@ -1283,16 +1290,16 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
         items.append((tag, cost, itt, exec_ym))
         logger.info(f"方案 {tag}: 成本={cost}, 周转={itt:.4f}, 年月={exec_ym}")
 
-    # 按成本升序、周转降序排序
-    items_by_cost = sorted(items, key=lambda x: x[1])
+    # 按成本降序、周转降序排序
+    items_by_cost = sorted(items, key=lambda x: x[1], reverse=True)
     items_by_itt = sorted(items, key=lambda x: x[2], reverse=True)
 
     focus_map = {}
 
-    # 成本最低 → 01
+    # 成本最高 → 01
     cost_tag = items_by_cost[0][0]
     focus_map[cost_tag] = '01'
-    logger.info(f"方案 {cost_tag} 成本最低，设为成本优先(01)")
+    logger.info(f"方案 {cost_tag} 成本最高，设为成本优先(01)")
 
     # 剩余两个中周转最高 → 02
     remaining = [it for it in items if it[0] != cost_tag]

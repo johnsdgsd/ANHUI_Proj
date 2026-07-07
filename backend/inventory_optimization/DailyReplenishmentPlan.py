@@ -333,6 +333,16 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
     MainDf = pd.DataFrame(MainRows)[main_cols]
     DetailDf = pd.DataFrame(DetailRows)[detail_cols] if DetailRows else pd.DataFrame(columns=detail_cols)
 
+    # 用序列生成真实ID，替换时间戳ID
+    from backend.api.data_api.fetch_data import query_pk_next
+    old_main_ids = MainDf['DIST_SCHEME_ID'].tolist()
+    new_main_ids = [int(x) for x in query_pk_next("SEQ_ADAM_DIST_SCHEME", len(MainDf))]
+    new_det_ids = [int(x) for x in query_pk_next("SEQ_ADAM_DIST_SCHEME_DET", len(DetailDf))]
+    id_map = {old: new for old, new in zip(old_main_ids, new_main_ids)}
+    MainDf['DIST_SCHEME_ID'] = new_main_ids
+    DetailDf['DIST_SCHEME_ID'] = DetailDf['DIST_SCHEME_ID'].map(id_map)
+    DetailDf['DIST_SCHEME_DET_ID'] = new_det_ids
+
     # 重算装载率：互感器箱数 ×2.5 计算真实体积装载率
     if not DetailDf.empty:
         detail_box = DetailDf.copy()

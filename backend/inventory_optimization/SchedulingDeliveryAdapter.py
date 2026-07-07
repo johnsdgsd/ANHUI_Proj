@@ -182,8 +182,10 @@ def _v3_load_deliv_data(date: str):
     except Exception as e:
         logging.warning(f"查询距离矩阵失败: {e}，矩阵全为0！")
 
-    # 对称化：与 GetDelivPlan 内部处理一致，兼容方向性/上三角矩阵
-    DMAT_arr = np.maximum(DMAT_arr, DMAT_arr.T)
+    # 补全缺失方向：反向有数据而正向缺失时用反向填充，双向都有则各自保留方向性距离
+    mask_zero = (DMAT_arr == 0)
+    mask_rev_has = (DMAT_arr.T > 0)
+    DMAT_arr[mask_zero & mask_rev_has] = DMAT_arr.T[mask_zero & mask_rev_has]
 
     # 构建 org_labels 和 DMat DataFrame
     org_labels = [center_org] + list(tb1['ORG_NO'])
