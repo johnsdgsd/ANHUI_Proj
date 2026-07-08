@@ -75,6 +75,8 @@ def _round_order_qty(qty: int, dev_cls: str, dev_categ: str) -> int:
     elif dev_cls == '09':
         return ((qty + 19) // 20) * 20
     elif dev_cls == '01':
+        if str(dev_categ) == '01_04':
+            return qty
         return ((qty + 59) // 60) * 60 if str(dev_categ) == '01_01' else ((qty + 19) // 20) * 20
     return qty
 

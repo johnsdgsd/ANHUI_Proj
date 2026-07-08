@@ -1016,6 +1016,10 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
         logger.info(f'[到货/检定量] dev={r["DEV_CODE"]}, cat={r["DEV_CATEG"]}, 补库需求={int(r["TOTAL_DEMAND"])}, '
                     f'合格品={int(r["QUA_STOCK_ADJ"])}, 不合格品={int(r["UNQUA_STOCK"])}, '
                     f'原始到货需求={int(r["TOTAL_ARR"])}')
+        if str(r['DEV_CATEG']) == '01_04':
+            logger.info(f'[到货/检定量] [01_04] dev={r["DEV_CODE"]}, 本月补货量={int(r["TOTAL_DEMAND"])}, '
+                        f'合格品={int(r["QUA_STOCK_ADJ"])}, 不合格品={int(r["UNQUA_STOCK"])}, '
+                        f'原始到货需求={int(r["TOTAL_ARR"])}')
 
     # 按采购订单批次规格取整（仅对需取整的类别：01_01, 01_02, DEV_CLS=09）
     NEED_BATCH_CATEGS = {'01_01', '01_02'}
