@@ -448,7 +448,7 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str, cen
         RUNNING_SUM=('RUNNING_NUM', 'sum')
     )
     grouped['PRE_ITT'] = (grouped['PRE_NUM_SUM'] / grouped['AVG_INV_SUM']).fillna(0).round(4)
-    grouped['PRE_ITR'] = (grouped['I_END_SUM'] / grouped['RUNNING_SUM'] * 100).fillna(0)
+    grouped['PRE_ITR'] = (grouped['I_END_SUM'] / grouped['RUNNING_SUM'] * 100).replace([float('inf'), -float('inf')], 0).fillna(0)
     grouped.drop(columns=['PRE_NUM_SUM', 'AVG_INV_SUM', 'I_END_SUM', 'RUNNING_SUM'], inplace=True)
 
     # 2. 合并历史数据（使用左连接）
@@ -495,6 +495,7 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str, cen
     # 百分比字段自动缩容: NUMBER(5,2) max=999.99
     def scale_pct(col):
         col = col.copy()
+        col = col.replace([float('inf'), -float('inf')], 0.0).fillna(0.0)
         while (col.abs() > 999.99).any():
             col = col.where(col.abs() <= 999.99, col / 10)
         return col.round(2)
@@ -648,12 +649,12 @@ def GetStorageCost(detail: pd.DataFrame):
     # 二级市管理费: 410,000 / 12 = 34,166.67 元/月
     MONTHLY_MGMT_FEE = 410000.0 / 12.0
 
-    # 标记二级市 (ORG_NO 长度=5)
-    detail['IS_CITY'] = detail['ORG_NO'].astype(str).str.len() == 5
+    # 标记二级市 (ORG_NO 长度=5，排除省中心34101)
+    detail['IS_CITY'] = (detail['ORG_NO'].astype(str).str.len() == 5) & (detail['ORG_NO'].astype(str) != '34101')
 
-    # 资金占用: 设备单价 × (年利率/365) × 30天
+    # 资金占用: 设备单价 × (年利率/365) × 日均库存 × 30天
     detail['CAPITAL_COST'] = (
-        detail['UNIT_PRICE'] * (annual_rate / 365.0) * 30
+        detail['UNIT_PRICE'] * (annual_rate / 365.0) * detail['AVG_INV'] * 30
     ).round(2)
 
     # 管理费分摊: 每个二级市内部按 AVG_INV 占比分摊月度管理费
@@ -1067,6 +1068,9 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
     central_inv_by_cat['CENTRAL_END_TOTAL'] = central_inv_by_cat['CENTRAL_END_QUA'] + central_inv_by_cat['CENTRAL_END_UNQUA']
 
     # DF_dev 列: DEV_CODE, TOTAL_DEMAND, TOTAL_ARR, TOTAL_VERIF (plus 库存中间列)
+    # 保存完整 DF_dev（含省中心库存）用于后续追加省中心行
+    central_dev_df = DF_dev[['DEV_CODE', 'DEV_CLS', 'DEV_CATEG',
+                              'QUA_STOCK_ADJ', 'UNQUA_STOCK', 'END_QUA', 'UNQUA_STOCK_END']].copy()
     DF_dev = DF_dev[['DEV_CODE', 'TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF']]
 
     # ========================================================================
@@ -1089,6 +1093,43 @@ def PrepareArrAndVerifQty(detail: pd.DataFrame, yearMonth: str) -> pd.DataFrame:
 
     # 清理
     detail.drop(columns=['TOTAL_DEMAND', 'TOTAL_ARR', 'TOTAL_VERIF', 'RATIO'], inplace=True)
+
+    # ========================================================================
+    #  步骤4: 追加省中心行（ORG_NO='34101'）到明细表，供后续计算仓储成本
+    # ========================================================================
+    unit_price_map = detail.drop_duplicates(subset=['DEV_CODE']).set_index('DEV_CODE')['UNIT_PRICE']
+    central_rows = []
+    for _, r in central_dev_df.iterrows():
+        dev_code = r['DEV_CODE']
+        i0 = int(r['QUA_STOCK_ADJ'] + r['UNQUA_STOCK'])
+        i_end = int(r['END_QUA'] + r['UNQUA_STOCK_END'])
+        avg_inv = (i0 + i_end) / 2.0 if (i0 + i_end) > 0 else 0.0
+        unit_price = unit_price_map.get(dev_code, 0)
+        central_rows.append({
+            'ORG_NO': '34101',
+            'DEV_CODE': dev_code,
+            'DEV_CLS': r['DEV_CLS'],
+            'DEV_CATEG': r['DEV_CATEG'],
+            'DEMAND': 0,
+            'I0': i0,
+            'BASE_LIMIT': 0,
+            'PRE_NUM': 0,
+            'I_END': i_end,
+            'AVG_INV': avg_inv,
+            'UNIT_PRICE': unit_price,
+            'TURNOVER': 0.0,
+            'HOLDING_COST': 0.0,
+            'SHORTAGE_COST': 0.0,
+            'ARR_QTY': 0,
+            'VERIF_QTY': 0,
+            'RUNNING_NUM': 0,
+        })
+    if central_rows:
+        central_detail = pd.DataFrame(central_rows)
+        detail = pd.concat([detail, central_detail], ignore_index=True)
+        logger.info(f'[到货/检定量] 追加省中心行 {len(central_rows)} 条, '
+                    f'省中心月初库存合计={sum(r["I0"] for r in central_rows)}, '
+                    f'省中心日均库存合计={sum(r["AVG_INV"] for r in central_rows):.1f}')
 
     return detail, total_central_avg_inv, total_central_unqua_avg_inv, total_central_unqua_end, total_central_qua_end, central_inv_by_cat
 
@@ -1235,6 +1276,9 @@ def GetGlobalSchemeCost(detail: pd.DataFrame, scheme_id: str, yearMonth: str) ->
         dev_cls = row['DEV_CLS']
         dev_cat = row['DEV_CATEG']
         for link_type, cost_col, qty_col in link_mapping:
+            # 省中心只保留仓储环节(04)，跳过采购/到货/检定/配送
+            if str(org) == '34101' and link_type != '04':
+                continue
             total_cost = row[cost_col]
             qty = row[qty_col]
             single_cost = total_cost / qty if qty > 0 else 0.0

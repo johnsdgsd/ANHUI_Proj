@@ -214,7 +214,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
         is_realtime = (str(row.get('SOURCE_TYPE', '')).upper() == 'REALTIME')
         days_to_end = (month_end_dt - arr_dt).days
-        earliest_bgn = max(arr_dt + timedelta(days=1), sim_start_dt)
+        earliest_bgn = max(arr_dt + timedelta(days=2), sim_start_dt)
         last_dist_date = Last_Delivery_Date.get(sub_idx, sim_start_dt)
         is_actually_needed = (Inspect_Target[sub_idx] > 0) and (earliest_bgn <= last_dist_date)
 

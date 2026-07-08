@@ -97,9 +97,9 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         else:
             logging.info(f">>> [下月全局初始排程启动] 目标月份: {target_month}。将执行先删后增...")
 
-        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id = LoadDeliChcekData(
-            target_month, sim_start_date_str)
 
+        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id = LoadDeliChcekData(
+            target_month, sim_start_date_str, is_mid_month)
         old_month_plan_map = {}
         if is_mid_month:
             pending_detect_df = fetch_data("gk-adam-query_pending_detect_plans", {"target_month": target_month})

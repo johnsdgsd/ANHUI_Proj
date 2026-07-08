@@ -3,10 +3,12 @@ import numpy as np
 from geopy.distance import geodesic
 import logging
 import sys
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
-def LoadDeliChcekData(target_month, start_date_str):
 
-    from backend.Scheduling.Service_CheckDeliver import fetch_data
+def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
+    from Service_CheckDeliver import fetch_data
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     # ================= 0. 基础网点与设备属性初始化 =================
@@ -118,6 +120,54 @@ def LoadDeliChcekData(target_month, start_date_str):
             LotList = pd.concat([lot_with_id, lot_no_id], ignore_index=True)
             LotList = LotList.sort_values(by=['PLAN_DATE', 'SOURCE_TYPE'], ascending=[True, False]).reset_index(
                 drop=True)
+        logging.info(f"LotList去重后: {len(LotList)}行")
+
+    # ================= 3.5 【跨月扣减】下月初排时，扣除前月已排检定计划 =================
+    if not is_mid_month and not LotList.empty:
+        target_dt = datetime.strptime(target_month, '%Y%m')
+        prev_dt = target_dt - relativedelta(months=1)
+        prev_month = prev_dt.strftime('%Y%m')
+        logging.info(f">>> [跨月扣减] 下月初排模式，查询前月({prev_month})已排检定计划...")
+
+        df_prev_plan = fetch_data("gk-adam-query_pending_detect_plans", {"target_month": prev_month})
+        if not df_prev_plan.empty:
+            df_prev_plan.columns = [c.upper() for c in df_prev_plan.columns]
+            # 确保关键列存在
+            if 'BATCH_PLAN_ARR_ID' in df_prev_plan.columns and 'REMNUM' in df_prev_plan.columns:
+                # 清洗 BATCH_PLAN_ARR_ID
+                df_prev_plan['BATCH_PLAN_ARR_ID'] = df_prev_plan['BATCH_PLAN_ARR_ID'].fillna('').astype(str).str.strip()
+                df_prev_plan['BATCH_PLAN_ARR_ID'] = df_prev_plan['BATCH_PLAN_ARR_ID'].replace(
+                    {'nan': '', 'None': '', '<NA>': '', '0.0': '', '0': ''})
+                df_prev_plan = df_prev_plan[df_prev_plan['BATCH_PLAN_ARR_ID'] != '']
+
+                if not df_prev_plan.empty:
+                    prev_plan_ids = set(df_prev_plan['BATCH_PLAN_ARR_ID'].unique())
+                    # 统计扣减量：按 DEV_CODE 汇总（列名可能是 DEV_CODE_NO 或 DEV_CODE）
+                    dev_col = 'DEV_CODE_NO' if 'DEV_CODE_NO' in df_prev_plan.columns else 'DEV_CODE'
+                    prev_plan_dev_sum = df_prev_plan.groupby(dev_col)['REMNUM'].sum()
+
+                    # 从 LotList 中过滤掉前月已排的批次
+                    before_count = len(LotList)
+                    before_remnum = LotList['RemNum'].sum()
+                    LotList = LotList[~LotList['BATCH_PLAN_ARR_ID'].isin(prev_plan_ids)]
+                    after_count = len(LotList)
+                    after_remnum = LotList['RemNum'].sum()
+
+                    # 将被扣减的量加入 InitQuaStock（前月检完后变成合格品）
+                    added_to_stock = 0
+                    for dev_code, remnum in prev_plan_dev_sum.items():
+                        j = dev_idx_map.get(str(dev_code).replace('.0', '').strip())
+                        if j is not None:
+                            InitQuaStock[j] += int(remnum)
+                            added_to_stock += int(remnum)
+
+                    logging.info(f"[跨月扣减] 前月{prev_month}已排{len(prev_plan_ids)}个批次, "
+                               f"LotList: {before_count}→{after_count}条({before_remnum}→{after_remnum}只), "
+                               f"InitQuaStock补充{added_to_stock}只")
+            else:
+                logging.warning(f"[跨月扣减] 前月计划缺少 BATCH_PLAN_ARR_ID 或 REMNUM 列，跳过")
+        else:
+            logging.info(f"[跨月扣减] 前月({prev_month})无已排检定计划，无需扣减")
 
     # ================= 4. 读取产线产能及距离矩阵 =================
     DeviceCaps = fetch_data("gk-adam-query_check_line")
@@ -169,8 +219,3 @@ def LoadDeliChcekData(target_month, start_date_str):
 
     # 【核心】：将 global_scheme_id 作为最后一个参数返回
     return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id
-
-
-
-
-    

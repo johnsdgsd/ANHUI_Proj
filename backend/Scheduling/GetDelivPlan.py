@@ -113,32 +113,39 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         return route
 
     def reassign_vehicles(routes):
+        """按车型月度配额分配，超配额路线拆回需求供 ALNS 重塞。返回 (assigned_routes, dropped_demand)"""
         monthly_quota = {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG}
+        total_quota = sum(monthly_quota.values())
         routes_sorted = sorted(routes, key=lambda r: sum(a for _, a in r['deliveries']), reverse=True)
+        assigned = []
+        dropped_demand = defaultdict(float)
         for r in routes_sorted:
             load = sum(a for _, a in r['deliveries'])
-            assigned = False
-
+            # 第一优先：找能装下且有月度配额的车型
+            best_cfg = None
             for cfg in VEHICLE_CONFIG:
                 if cfg['cap'] >= load and monthly_quota[cfg['type']] > 0:
-                    r['vehicle_type'] = cfg['type']
-                    monthly_quota[cfg['type']] -= 1
-                    assigned = True
+                    best_cfg = cfg
                     break
-
-            if not assigned:
-                for cfg in VEHICLE_CONFIG:
-                    if cfg['cap'] >= load:
-                        r['vehicle_type'] = cfg['type']
-                        monthly_quota[cfg['type']] -= 1
-                        assigned = True
+            # 降级：所有有配额车型都装不下 → 用仍有配额的最大车型
+            if best_cfg is None:
+                for cfg in reversed(VEHICLE_CONFIG):
+                    if monthly_quota[cfg['type']] > 0:
+                        best_cfg = cfg
                         break
-
-            if not assigned:
-                r['vehicle_type'] = VEHICLE_CONFIG[-1]['type']
-                monthly_quota[VEHICLE_CONFIG[-1]['type']] -= 1
-
-        return routes_sorted
+            if best_cfg is not None:
+                r['vehicle_type'] = best_cfg['type']
+                monthly_quota[best_cfg['type']] -= 1
+                assigned.append(r)
+            else:
+                # 配额用尽，拆回需求
+                for cid, amt in r['deliveries']:
+                    dropped_demand[cid] += amt
+        if dropped_demand:
+            logging.warning(f"[运力硬约束] 配额耗尽: {len(routes_sorted)}条路线 → {len(assigned)}条分配成功, "
+                          f"拆回需求{len(dropped_demand)}个网点, 总量{sum(dropped_demand.values()):.0f}箱, "
+                          f"各车型配额={ {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG} }")
+        return assigned, dict(dropped_demand)
 
     def generate_initial_solution(unassigned):
         routes = []
@@ -319,7 +326,15 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     '''3. 启发式算法：空间最优解 (ALNS)'''
     max_iter = 600
     best_sol = generate_initial_solution(unit_sum)
-    best_sol = reassign_vehicles(best_sol)
+    best_sol, dropped = reassign_vehicles(best_sol)
+    # 初排丢弃的需求重塞（最多 10 轮防止死循环）
+    retry = 0
+    while dropped and retry < 10:
+        best_sol = greedy_insertion(best_sol, dropped)
+        best_sol, dropped = reassign_vehicles(best_sol)
+        retry += 1
+    if dropped:
+        logging.error(f"[运力不足] 初排{retry}轮重塞后仍有{dropped}未分配，总量{sum(dropped.values()):.0f}")
     best_fitness = sum(eval_route_fitness(r) for r in best_sol)
 
     for i in range(max_iter):
@@ -328,18 +343,48 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         new_sol = greedy_insertion(destroyed, unassigned)
 
         new_sol = [r for r in new_sol if r['deliveries']]
-        new_sol = reassign_vehicles(new_sol)
+        new_sol, dropped = reassign_vehicles(new_sol)
+        # 配额超出的需求重新塞回路线（单轮最多 3 次）
+        retry_inner = 0
+        while dropped and retry_inner < 3:
+            new_sol = greedy_insertion(new_sol, dropped)
+            new_sol, dropped = reassign_vehicles(new_sol)
+            retry_inner += 1
+        if dropped:
+            new_sol = [r for r in new_sol if r['deliveries']]
         new_fitness = sum(eval_route_fitness(r) for r in new_sol)
 
         if new_fitness < best_fitness or math.exp((best_fitness - new_fitness) / 100) > random.random():
             best_sol, best_fitness = new_sol, new_fitness
 
-    best_sol = reassign_vehicles(best_sol)
+    best_sol, dropped = reassign_vehicles(best_sol)
+    # 最终兜底：还有丢弃的需求重塞（最多 10 轮）
+    retry = 0
+    while dropped and retry < 10:
+        best_sol = greedy_insertion(best_sol, dropped)
+        best_sol, dropped = reassign_vehicles(best_sol)
+        retry += 1
     best_sol = [r for r in best_sol if r['deliveries']]
+    if dropped:
+        logging.error(f"[运力不足] 最终{retry}轮重塞后仍有{dropped}未分配需求，总量{sum(dropped.values()):.0f}箱")
 
     '''4. 整数线性规划 Stage 2: 日期精确排程 (引入网点时间窗离散惩罚)'''
     num_routes = len(best_sol)
     if num_routes == 0: return []
+
+    # ---- 诊断日志：各车型路线数 vs 日配额 ----
+    type_count = defaultdict(int)
+    for r in best_sol:
+        type_count[int(r.get('vehicle_type', 1))] += 1
+    log_parts = []
+    for v in range(VeTypeNum):
+        vt = v + 1
+        cnt = type_count.get(vt, 0)
+        daily = VNums[v]
+        monthly = daily * DelivDay
+        log_parts.append(f"车型{vt}: {cnt}条路线, 日配额={daily}, 月配额={monthly}")
+    logging.info(f"[ILP诊断] 共{num_routes}条路线, DelivDay={DelivDay}天 | " + " | ".join(log_parts))
+    # ---- 诊断结束 ----
 
     prob2 = pulp.LpProblem("Minimize_Peak_Daily_And_Clustering", pulp.LpMinimize)
     x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
