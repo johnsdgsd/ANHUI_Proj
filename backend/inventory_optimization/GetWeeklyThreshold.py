@@ -121,7 +121,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
                     # 上限: 月度需求 × 1.5 (tn=0.5)
                     high = int(_math.ceil(_poisson.ppf(epsilon, monthly_lambda * 1.5)))
                     # 下限: 周度需求 × 0.467
-                    low = int(_math.ceil(_poisson.ppf(epsilon, weekly_lambda * 0.467)))
+                    low = int(_math.ceil(_poisson.ppf(epsilon, monthly_lambda * 0.467)))
                     # 基准 = (上限 + 下限) / 2
                     mid = int((high + low) / 2)
 

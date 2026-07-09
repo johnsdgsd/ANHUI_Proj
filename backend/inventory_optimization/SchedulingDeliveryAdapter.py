@@ -19,7 +19,7 @@ import requests
 from collections import defaultdict
 
 from backend.config.config import API_CONFIG
-from backend.Scheduling.GetDelivPlan import GetDelivPlan
+from backend.inventory_optimization.GetDelivPlan import GetDelivPlan
 
 
 # ==================== V3 数据加载 ====================
@@ -239,7 +239,8 @@ def _adjust_daily_delivery_v3_impl(date: str, max_stops: int, max_iter: int):
     from backend.api.data_api.fetch_data import (
         query_adam_dist_scheme_by_date_range,
         delete_adam_dist_scheme_det_by_scheme_id,
-        delete_adam_dist_scheme_by_id
+        delete_adam_dist_scheme_by_id,
+        query_pk_next
     )
 
     # ---- 0. 删除当天未确认的旧方案 ----
@@ -340,6 +341,18 @@ def _adjust_daily_delivery_v3_impl(date: str, max_stops: int, max_iter: int):
     # ---- 5. 核验：配送明细件数 == 需求件数 ----
     _v3_verify_delivery(Demands, DetailScheme, SubTypeList, org_labels)
 
+    # ---- 6. 替换时间戳ID为数据库序列ID ----
+    if not MainScheme.empty:
+        old_main_ids = MainScheme['DIST_SCHEME_ID'].tolist()
+        new_main_ids = [int(x) for x in query_pk_next("SEQ_ADAM_DIST_SCHEME", len(MainScheme))]
+        id_map = {old: new for old, new in zip(old_main_ids, new_main_ids)}
+        MainScheme['DIST_SCHEME_ID'] = new_main_ids
+        if not DetailScheme.empty:
+            new_det_ids = [int(x) for x in query_pk_next("SEQ_ADAM_DIST_SCHEME_DET", len(DetailScheme))]
+            DetailScheme['DIST_SCHEME_ID'] = DetailScheme['DIST_SCHEME_ID'].map(id_map)
+            DetailScheme['DIST_SCHEME_DET_ID'] = new_det_ids
+        logging.info(f"已替换为序列ID: 主表{len(new_main_ids)}条, 明细表{len(DetailScheme)}条")
+
     t_end = time.time()
     logging.info(f"V3 总耗时: {t_end - t_start:.1f}s")
     logging.info("=" * 60)
@@ -347,6 +360,29 @@ def _adjust_daily_delivery_v3_impl(date: str, max_stops: int, max_iter: int):
 
 
 # ==================== V3 主表生成（直接从 best_sol） ====================
+
+def _get_global_scheme_id(date: str) -> int:
+    """
+    获取 GLOBAL_SCHEME_ID：优先从审批通过的全局方案中查找，找不到则用日期。
+    """
+    from backend.config.scheme_config import get_approved_scheme_config
+
+    year_month = date[:7].replace('-', '')  # "2026-07-09" -> "202607"
+    fallback_id = int(date.replace('-', ''))
+
+    try:
+        global_scheme_id, _ = get_approved_scheme_config(year_month)
+    except Exception:
+        logging.info(f"获取审批方案异常，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
+        return fallback_id
+
+    # get_approved_scheme_config 未找到审批方案时返回时间戳(13位)作为默认值
+    if global_scheme_id > 10 ** 10:
+        logging.info(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
+        return fallback_id
+    logging.info(f"找到审批方案: GLOBAL_SCHEME_ID={global_scheme_id} (year_month={year_month})")
+    return global_scheme_id
+
 
 def _v3_generate_main_scheme(best_sol, VeCap, CarTypeStrList, date):
     """
@@ -356,7 +392,7 @@ def _v3_generate_main_scheme(best_sol, VeCap, CarTypeStrList, date):
         vehicle_type → CAR_TYPE、LOAD_RATE
         deliveries   → 体积箱合计 → LOAD_RATE
     """
-    GlobalSchemeId = int(date.replace('-', ''))
+    GlobalSchemeId = _get_global_scheme_id(date)
     CurrentDateStr = datetime.datetime.now().strftime('%Y-%m-%d')
     base_ts = int(time.time() * 1000)
 

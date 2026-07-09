@@ -147,33 +147,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                           f"各车型配额={ {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG} }")
         return assigned, dict(dropped_demand)
 
-    def generate_initial_solution(unassigned):
-        routes = []
-
-        # 【借鉴main copy: 极角扫描排序】
-        # 利用距离矩阵计算各网点相对于基准方向的cos角, 同方向网点聚在一起
-        nodes = list(unassigned.keys())
-        if len(nodes) >= 2:
-            # 取距省库最远的网点作为极轴参考方向
-            ref_node = max(nodes, key=lambda x: get_dist(0, x))
-            d0_ref = get_dist(0, ref_node)
-            polar_info = []
-            for cid in nodes:
-                d0_i = max(get_dist(0, cid), 0.001)
-                d_ref_i = get_dist(ref_node, cid)
-                cos_val = (d0_i**2 + d0_ref**2 - d_ref_i**2) / (2 * d0_i * d0_ref)
-                cos_val = max(-1.0, min(1.0, cos_val))
-                polar_info.append((cid, cos_val, unassigned[cid]))
-            # 先按cos角分组(同方向), 组内按需求量降序
-            polar_info.sort(key=lambda x: (-x[1], -x[2]))
-            pending = [(cid, amt) for cid, _, amt in polar_info]
-        else:
-            pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
-
+    def _build_routes(pending, routes):
+        """通用贪心构建：按 pending 顺序逐个网点插入已有路线或建新车"""
         for cid, total_amt in pending:
             amt = total_amt
             while amt > 0:
-                # Phase 1: 优先找能完整装下的路线（防拆分）
+                # Phase 1: best-fit — 评估所有能完整装下的路线，选剩余空间最小的（最大化装载率）
+                best_waste = float('inf')
                 best_route = None
                 for r in routes:
                     space = MAX_CAP - sum(a for _, a in r['deliveries'])
@@ -190,8 +170,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         temp['deliveries'].append((cid, amt))
                     temp = optimize_route_sequence(temp)
                     if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
-                        best_route = r
-                        break
+                        waste = space - amt
+                        # 同网点路线大幅优先（防止需求被拆散到其他路线）
+                        if has_cid:
+                            waste *= 0.3
+                        if waste < best_waste:
+                            best_waste = waste
+                            best_route = r
                 if best_route is not None:
                     has_cid = any(c == cid for c, _ in best_route['deliveries'])
                     if has_cid:
@@ -203,9 +188,9 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     amt = 0
                     continue
 
-                # Phase 2: 拆分插入 — 选能装最多的路线, 最小化拆分碎片
-                best_space = 0
-                best_route = None
+                # Phase 2: 拆分插入 — 选能装最多且剩余空间最小的路线
+                best_score = float('inf')  # 综合评分 = waste - 0.5*space, 空间大+浪费小
+                best_action = None
                 for r in routes:
                     space = MAX_CAP - sum(a for _, a in r['deliveries'])
                     if space <= 0: continue
@@ -222,27 +207,194 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         temp['deliveries'].append((cid, take))
                     temp = optimize_route_sequence(temp)
                     if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
-                        if space > best_space:
-                            best_space = space
-                            best_route = r
+                        waste = space - take
+                        score = waste - 0.3 * space  # 空间大也加分
+                        if has_cid:
+                            score *= 0.5
+                        if score < best_score:
+                            best_score = score
+                            best_action = (r, take, temp['deliveries'])
 
-                if best_route is not None:
-                    take = min(amt, best_space)
-                    has_cid = any(c == cid for c, _ in best_route['deliveries'])
-                    if has_cid:
-                        for i, (c, a) in enumerate(best_route['deliveries']):
-                            if c == cid: best_route['deliveries'][i] = (c, a + take); break
-                    else:
-                        best_route['deliveries'].append((cid, take))
-                    best_route = optimize_route_sequence(best_route)
+                if best_action is not None:
+                    r, take, new_dels = best_action
+                    r['deliveries'] = new_dels
                     amt -= take
                     continue
 
-                # Phase 3: 新建路线 — 优先大车, 留空间给后续合并
-                cfg = VEHICLE_CONFIG[-1]
+                # Phase 3: 新建路线 — 选最小能装下的车型+留20%余量
                 load = min(amt, MAX_CAP)
+                cfg = VEHICLE_CONFIG[-1]
+                for c in VEHICLE_CONFIG:
+                    if c['cap'] >= load * 1.2:
+                        cfg = c
+                        break
+                if cfg['cap'] < load:
+                    for c in VEHICLE_CONFIG:
+                        if c['cap'] >= load:
+                            cfg = c
+                            break
                 routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
                 amt -= load
+
+    def generate_initial_solution(unassigned):
+        """Multi-start: 3 种排序策略各建一个初解，返回最优的"""
+        nodes = list(unassigned.keys())
+        if len(nodes) <= 1:
+            pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
+            routes = []
+            _build_routes(pending, routes)
+            return _merge_small_routes(routes)
+
+        # 预计算各网点极坐标
+        ref_node = max(nodes, key=lambda x: get_dist(0, x))
+        d0_ref = get_dist(0, ref_node)
+        polar_info = []
+        for cid in nodes:
+            d0_i = max(get_dist(0, cid), 0.001)
+            d_ref_i = get_dist(ref_node, cid)
+            cos_val = (d0_i**2 + d0_ref**2 - d_ref_i**2) / (2 * d0_i * d0_ref)
+            cos_val = max(-1.0, min(1.0, cos_val))
+            polar_info.append((cid, cos_val, get_dist(0, cid), unassigned[cid]))
+
+        # 策略定义: (名称, 排序键)
+        strategies = [
+            ('polar_demand',   lambda x: (-x[1], -x[3])),   # 同方向+需求量降序
+            ('polar_dist',     lambda x: (-x[1], x[2])),     # 同方向+距省库升序(近及远)
+            ('demand_desc',    lambda x: (-x[3], -x[1])),    # 纯需求量降序+同方向
+        ]
+
+        best_routes = None
+        best_fit = float('inf')
+
+        for name, sort_key in strategies:
+            polar_info.sort(key=sort_key)
+            pending = [(cid, amt) for cid, _, _, amt in polar_info]
+            routes = []
+            _build_routes(pending, routes)
+            routes = _merge_small_routes(routes)
+
+            # 快速 relocation 局部搜索
+            routes = _relocate_improve(routes, max_passes=3)
+
+            fit = sum(eval_route_fitness(r) for r in routes)
+            if fit < best_fit:
+                best_fit = fit
+                best_routes = routes
+                logging.info(f"[初解] 策略 '{name}': {len(routes)}条路线, cost={fit:,.0f} ✓最优")
+
+        return best_routes
+
+    def _relocate_improve(routes, max_passes=3):
+        """局部搜索: 尝试把 delivery 从一条路线迁移到另一条路线，降低总成本"""
+        for _ in range(max_passes):
+            improved = False
+            n = len(routes)
+            for ri in range(n):
+                if improved: break
+                for pi, (cid, amt) in enumerate(routes[ri]['deliveries']):
+                    if improved: break
+                    best_saving = 0
+                    best_move = None
+                    old_cost_i = eval_route_fitness(routes[ri])
+
+                    for rj in range(n):
+                        if rj == ri: continue
+                        has_cid = any(c == cid for c, _ in routes[rj]['deliveries'])
+                        if not has_cid and len(routes[rj]['deliveries']) >= 3: continue
+                        if not has_cid:
+                            if not all(check_angle_constraint(cid, ec) for ec, _ in routes[rj]['deliveries']): continue
+
+                        space = MAX_CAP - sum(a for _, a in routes[rj]['deliveries'])
+                        if space < amt: continue
+
+                        old_cost_j = eval_route_fitness(routes[rj])
+                        temp_i = copy.deepcopy(routes[ri])
+                        temp_j = copy.deepcopy(routes[rj])
+                        temp_i['deliveries'].pop(pi)
+                        if has_cid:
+                            for k, (c, a) in enumerate(temp_j['deliveries']):
+                                if c == cid:
+                                    temp_j['deliveries'][k] = (c, a + amt)
+                                    break
+                        else:
+                            temp_j['deliveries'].append((cid, amt))
+                        temp_i = optimize_route_sequence(temp_i)
+                        temp_j = optimize_route_sequence(temp_j)
+
+                        if calc_route_distance(temp_i['deliveries']) <= MAX_ROUTE_DIST and \
+                           calc_route_distance(temp_j['deliveries']) <= MAX_ROUTE_DIST:
+                            new_cost = eval_route_fitness(temp_i) + eval_route_fitness(temp_j)
+                            saving = (old_cost_i + old_cost_j) - new_cost
+                            if saving > best_saving:
+                                best_saving = saving
+                                best_move = (ri, rj, temp_i['deliveries'], temp_j['deliveries'])
+
+                    if best_move:
+                        ri2, rj2, new_i_dels, new_j_dels = best_move
+                        routes[ri2]['deliveries'] = new_i_dels
+                        routes[rj2]['deliveries'] = new_j_dels
+                        improved = True
+
+            if not improved:
+                break
+        return [r for r in routes if r['deliveries']]
+
+    def _merge_small_routes(routes):
+        """贪心合并低装载率的兼容路线，减少车辆使用数"""
+        improved = True
+        while improved:
+            improved = False
+            n = len(routes)
+            # 按装载量升序排列，优先从小路线合并
+            idx_by_load = sorted(range(n), key=lambda i: sum(a for _, a in routes[i]['deliveries']))
+            for ii in range(n):
+                if improved:
+                    break
+                i = idx_by_load[ii]
+                for jj in range(ii + 1, n):
+                    j = idx_by_load[jj]
+                    load_i = sum(a for _, a in routes[i]['deliveries'])
+                    load_j = sum(a for _, a in routes[j]['deliveries'])
+                    total_load = load_i + load_j
+
+                    # 找出能装下合并量的最小车型
+                    fit_cfg = None
+                    for cfg in VEHICLE_CONFIG:
+                        if cfg['cap'] >= total_load:
+                            fit_cfg = cfg
+                            break
+                    if fit_cfg is None:
+                        continue
+
+                    combined = routes[i]['deliveries'] + routes[j]['deliveries']
+                    unique_nodes = set(c for c, _ in combined)
+                    if len(unique_nodes) > 3:
+                        continue
+
+                    # 角度约束
+                    nodes_lst = list(unique_nodes)
+                    angle_ok = True
+                    for ni in range(len(nodes_lst)):
+                        for nj in range(ni + 1, len(nodes_lst)):
+                            if not check_angle_constraint(nodes_lst[ni], nodes_lst[nj]):
+                                angle_ok = False
+                                break
+                        if not angle_ok:
+                            break
+                    if not angle_ok:
+                        continue
+
+                    # 距离约束
+                    merged = {'vehicle_type': fit_cfg['type'], 'deliveries': combined}
+                    merged = optimize_route_sequence(merged)
+                    if calc_route_distance(merged['deliveries']) <= MAX_ROUTE_DIST:
+                        old_cost = eval_route_fitness(routes[i]) + eval_route_fitness(routes[j])
+                        new_cost = eval_route_fitness(merged)
+                        if new_cost < old_cost:
+                            routes[i] = merged
+                            routes.pop(j)
+                            improved = True
+                            break
         return routes
 
     def random_removal(solution, num_remove=3):
@@ -257,6 +409,90 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 cid, amt = route['deliveries'].pop(pi)
                 unassigned[cid] += amt
             if not route['deliveries']: sol_copy.pop(ri)
+        return sol_copy, unassigned
+
+    def worst_removal(solution, num_remove=3):
+        """移除单位成本最高的路线中的 delivery，优先优化低效拼车"""
+        sol_copy = copy.deepcopy(solution)
+        unassigned = defaultdict(float)
+
+        delivery_costs = []
+        for ri, route in enumerate(sol_copy):
+            if not route['deliveries']:
+                continue
+            route_fitness = eval_route_fitness(route)
+            route_load = sum(amt for _, amt in route['deliveries'])
+            unit_cost = route_fitness / route_load if route_load > 0 else float('inf')
+            for pi, (cid, amt) in enumerate(route['deliveries']):
+                noise = random.uniform(0.8, 1.2)  # 随机扰动避免死板
+                delivery_costs.append((unit_cost * noise, ri, pi, cid, amt))
+
+        delivery_costs.sort(key=lambda x: x[0], reverse=True)
+        removed = 0
+        for _, ri, pi, cid, amt in delivery_costs:
+            if removed >= num_remove:
+                break
+            if pi < len(sol_copy[ri]['deliveries']) and sol_copy[ri]['deliveries'][pi][0] == cid:
+                sol_copy[ri]['deliveries'].pop(pi)
+                unassigned[cid] += amt
+                removed += 1
+
+        sol_copy = [r for r in sol_copy if r['deliveries']]
+        return sol_copy, unassigned
+
+    def shaw_removal(solution, num_remove=3):
+        """Shaw 破坏：移除方向/距离相似的 delivery 集合，让 repair 重新组合拼车"""
+        sol_copy = copy.deepcopy(solution)
+        unassigned = defaultdict(float)
+
+        if not sol_copy:
+            return sol_copy, unassigned
+
+        all_deliveries = []
+        for ri, route in enumerate(sol_copy):
+            for pi, (cid, amt) in enumerate(route['deliveries']):
+                all_deliveries.append((ri, pi, cid, amt))
+
+        if len(all_deliveries) <= 1:
+            # 只有一个 delivery，直接随机移除
+            return random_removal(solution, num_remove)
+
+        # 随机选种子
+        seed = random.choice(all_deliveries)
+        seed_cid = seed[2]
+        seed_cos = node_cos.get(seed_cid, 1.0)
+        seed_d0 = get_dist(0, seed_cid)
+
+        # 计算其他 delivery 与种子的相似度（越小越相似）
+        relatedness = []
+        for ri, pi, cid, amt in all_deliveries:
+            if ri == seed[0] and pi == seed[1]:
+                continue
+            d0_i = get_dist(0, cid)
+            cos_i = node_cos.get(cid, 1.0)
+            dir_diff = abs(cos_i - seed_cos)          # 方向差异
+            dist_diff = abs(d0_i - seed_d0) / max_d0  # 距省库远近差异（归一化）
+            rel = 0.6 * dir_diff + 0.4 * dist_diff
+            rel *= random.uniform(0.9, 1.3)           # 随机扰动
+            relatedness.append((rel, ri, pi, cid, amt))
+
+        # 最相似的 num_remove-1 个 + 种子
+        relatedness.sort(key=lambda x: x[0])
+        to_remove = [(seed[0], seed[1], seed[2], seed[3])]
+        to_remove += [(r[1], r[2], r[3], r[4]) for r in relatedness[:num_remove - 1]]
+
+        # 按索引降序删除（避免错位）
+        remove_set = {}
+        for ri, pi, cid, amt in to_remove:
+            remove_set[(ri, pi)] = (cid, amt)
+
+        for (ri, pi), (cid, amt) in sorted(remove_set.items(), key=lambda x: (-x[0][0], -x[0][1])):
+            if ri < len(sol_copy) and pi < len(sol_copy[ri]['deliveries']):
+                if sol_copy[ri]['deliveries'][pi][0] == cid:
+                    sol_copy[ri]['deliveries'].pop(pi)
+                    unassigned[cid] += amt
+
+        sol_copy = [r for r in sol_copy if r['deliveries']]
         return sol_copy, unassigned
 
     def greedy_insertion(routes, unassigned):
@@ -323,42 +559,356 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     amt -= best_action[2]
         return [r for r in routes if r['deliveries']]
 
-    '''3. 启发式算法：空间最优解 (ALNS)'''
-    max_iter = 600
+    def regret2_insertion(routes, unassigned):
+        """Regret-2 插入：优先处理 best 与 2nd-best 差距最大的 delivery，避免最后无路可走"""
+        pending = dict(unassigned)
+
+        while pending:
+            best_regret = -1.0
+            best_insertion = None  # (cid, action_tuple)
+
+            for cid, amt in list(pending.items()):
+                costs = []  # [(fitness, action_type, arg1, ins_amt, deliveries), ...]
+
+                # 检查所有已有的路线
+                for ri, route in enumerate(routes):
+                    has_cid = any(c == cid for c, _ in route['deliveries'])
+                    if not has_cid and len(route['deliveries']) >= 3:
+                        continue
+                    if not has_cid:
+                        if not all(check_angle_constraint(cid, ec) for ec, _ in route['deliveries']):
+                            continue
+
+                    space = MAX_CAP - sum(a for _, a in route['deliveries'])
+                    if space <= 0:
+                        continue
+
+                    ins_amt = min(amt, space)
+                    temp = copy.deepcopy(route)
+                    if has_cid:
+                        for k, (c, a) in enumerate(temp['deliveries']):
+                            if c == cid:
+                                temp['deliveries'][k] = (c, a + ins_amt)
+                                break
+                    else:
+                        temp['deliveries'].append((cid, ins_amt))
+                    temp = optimize_route_sequence(temp)
+
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        fit = eval_route_fitness(temp)
+                        if has_cid:
+                            fit *= 0.5
+                        if ins_amt < amt - 0.001:
+                            fit *= 1.5
+                        costs.append((fit, 'insert', ri, ins_amt, temp['deliveries']))
+
+                # 新建路线作为兜底
+                cfg = VEHICLE_CONFIG[-1]
+                ins_amt = min(amt, MAX_CAP)
+                temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
+                costs.append((eval_route_fitness(temp), 'new', cfg['type'], ins_amt, temp['deliveries']))
+
+                if not costs:
+                    continue
+
+                costs.sort(key=lambda x: x[0])
+
+                regret = (costs[1][0] - costs[0][0]) if len(costs) >= 2 else 1e9
+
+                if regret > best_regret:
+                    best_regret = regret
+                    best_insertion = (cid, costs[0])
+
+            if best_insertion is None:
+                break
+
+            cid, (_, action_type, arg1, ins_amt, deliveries) = best_insertion
+
+            if action_type == 'insert':
+                routes[arg1]['deliveries'] = deliveries
+            else:
+                routes.append({'vehicle_type': arg1, 'deliveries': deliveries})
+
+            remaining = pending[cid] - ins_amt
+            if remaining > 0.0001:
+                pending[cid] = remaining
+            else:
+                del pending[cid]
+
+        return [r for r in routes if r['deliveries']]
+
+    def merge_repair(routes, unassigned):
+        """合并修复算子：先贪心塞入未分配需求，再拆散低装载率路线并入其他路线"""
+        # Step 1: 贪心处理未分配需求
+        if unassigned:
+            routes = greedy_insertion(routes, unassigned)
+
+        MIN_LOAD_RATE = 0.40
+
+        improved = True
+        while improved:
+            improved = False
+            n = len(routes)
+
+            # 计算每条路线的装载率，按升序排列
+            route_data = []
+            for ri, route in enumerate(routes):
+                load = sum(a for _, a in route['deliveries'])
+                best_cap = MAX_CAP
+                for cfg in VEHICLE_CONFIG:
+                    if cfg['cap'] >= load:
+                        best_cap = cfg['cap']
+                        break
+                route_data.append((ri, load / best_cap if best_cap > 0 else 0, load, route))
+
+            route_data.sort(key=lambda x: x[1])  # 装载率升序
+
+            for ri, lr, load, route in route_data:
+                if lr >= MIN_LOAD_RATE:
+                    break  # 后面的都高于阈值，不用处理了
+
+                # 尝试把这条路线的每个 delivery 塞进其他路线
+                deliveries_to_move = list(route['deliveries'])
+                all_moved = True
+
+                for cid, amt in deliveries_to_move:
+                    moved = False
+                    for rj in range(n):
+                        if rj == ri:
+                            continue
+                        other = routes[rj]
+
+                        has_cid = any(c == cid for c, _ in other['deliveries'])
+                        if not has_cid and len(other['deliveries']) >= 3:
+                            continue
+
+                        # 角度约束
+                        if not has_cid:
+                            if not all(check_angle_constraint(cid, ec) for ec, _ in other['deliveries']):
+                                continue
+
+                        space = MAX_CAP - sum(a for _, a in other['deliveries'])
+                        if space < amt:
+                            continue
+
+                        # 尝试插入
+                        temp = copy.deepcopy(other)
+                        if has_cid:
+                            for k, (c, a) in enumerate(temp['deliveries']):
+                                if c == cid:
+                                    temp['deliveries'][k] = (c, a + amt)
+                                    break
+                        else:
+                            temp['deliveries'].append((cid, amt))
+                        temp = optimize_route_sequence(temp)
+
+                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                            routes[rj]['deliveries'] = temp['deliveries']
+                            moved = True
+                            break
+
+                    if not moved:
+                        all_moved = False
+                        break
+
+                if all_moved:
+                    # 全部移走 → 删除空路线
+                    routes.pop(ri)
+                    improved = True
+                    break  # 重头扫描
+
+        return [r for r in routes if r['deliveries']]
+
+    '''3. 自适应大邻域搜索算法 (Adaptive ALNS)'''
+
+    # ---- 3.0 预计算：各网点方向角（供 Shaw Removal 使用） ----
+    nodes_list = list(unit_sum.keys())
+    if len(nodes_list) >= 2:
+        ref_node = max(nodes_list, key=lambda x: get_dist(0, x))
+        d0_ref = get_dist(0, ref_node)
+        node_cos = {}
+        for cid in nodes_list:
+            d0_i = max(get_dist(0, cid), 0.001)
+            d_ref_i = get_dist(ref_node, cid)
+            cos_val = (d0_i**2 + d0_ref**2 - d_ref_i**2) / (2 * d0_i * d0_ref)
+            node_cos[cid] = max(-1.0, min(1.0, cos_val))
+    else:
+        node_cos = {cid: 1.0 for cid in nodes_list}
+    max_d0 = max(get_dist(0, cid) for cid in nodes_list) if nodes_list else 1.0
+
+    # ---- 3.1 算子定义 ----
+    DESTROY_OPS = ['random', 'worst', 'shaw']
+    REPAIR_OPS = ['greedy', 'regret2', 'merge']
+
+    # ---- 3.2 权重追踪 ----
+    weights = {d: {r: 1.0 for r in REPAIR_OPS} for d in DESTROY_OPS}
+    scores = {d: {r: 0.0 for r in REPAIR_OPS} for d in DESTROY_OPS}
+    uses = {d: {r: 0 for r in REPAIR_OPS} for d in DESTROY_OPS}
+    SCORE_NEW_BEST = 30
+    SCORE_BETTER = 10
+    SCORE_ACCEPTED = 5
+    WEIGHT_UPDATE_INTERVAL = 50
+
+    # ---- 3.3 模拟退火 ----
+    T = 200.0
+    COOLING_RATE = 0.9975
+    T_MIN = 1.0
+
+    # ---- 3.4 自适应破坏力度 ----
+    base_remove_ratio = 0.20
+    stuck_counter = 0
+    STUCK_THRESHOLD = 50
+
+    # ---- 3.5 算子选择（轮盘赌） ----
+    def select_destroy_op():
+        w = [sum(weights[d][r] for r in REPAIR_OPS) for d in DESTROY_OPS]
+        total = sum(w)
+        if total <= 0:
+            return random.choice(DESTROY_OPS)
+        rnd = random.random() * total
+        cum = 0
+        for i, d in enumerate(DESTROY_OPS):
+            cum += w[i]
+            if rnd <= cum:
+                return d
+        return DESTROY_OPS[-1]
+
+    def select_repair_op(d_op):
+        w = [weights[d_op][r] for r in REPAIR_OPS]
+        total = sum(w)
+        if total <= 0:
+            return random.choice(REPAIR_OPS)
+        rnd = random.random() * total
+        cum = 0
+        for i, r in enumerate(REPAIR_OPS):
+            cum += w[i]
+            if rnd <= cum:
+                return r
+        return REPAIR_OPS[-1]
+
+    def update_weights():
+        for d in DESTROY_OPS:
+            for r in REPAIR_OPS:
+                if uses[d][r] > 0:
+                    weights[d][r] = 0.9 * weights[d][r] + 0.1 * (scores[d][r] / uses[d][r])
+                scores[d][r] = 0.0
+                uses[d][r] = 0
+
+    def run_repair(routes, unassigned, r_op):
+        if r_op == 'greedy':
+            return greedy_insertion(routes, unassigned)
+        elif r_op == 'regret2':
+            return regret2_insertion(routes, unassigned)
+        else:
+            return merge_repair(routes, unassigned)
+
+    def run_destroy(solution, num_remove, d_op):
+        if d_op == 'random':
+            return random_removal(solution, num_remove)
+        elif d_op == 'worst':
+            return worst_removal(solution, num_remove)
+        else:
+            return shaw_removal(solution, num_remove)
+
+    # ---- 3.7 构建初解 ----
+    max_iter = 40000
     best_sol = generate_initial_solution(unit_sum)
     best_sol, dropped = reassign_vehicles(best_sol)
-    # 初排丢弃的需求重塞（最多 10 轮防止死循环）
     retry = 0
     while dropped and retry < 10:
         best_sol = greedy_insertion(best_sol, dropped)
         best_sol, dropped = reassign_vehicles(best_sol)
         retry += 1
     if dropped:
-        logging.error(f"[运力不足] 初排{retry}轮重塞后仍有{dropped}未分配，总量{sum(dropped.values()):.0f}")
+        logging.error(f"[运力不足] 初排{retry}轮重塞后仍有未分配，总量{sum(dropped.values()):.0f}")
     best_fitness = sum(eval_route_fitness(r) for r in best_sol)
+    global_best_fitness = best_fitness
+    no_improve_counter = 0
+    NO_IMPROVE_LIMIT = 4000
+    logging.info(f"[ALNS初始] 路线={len(best_sol)}, 成本={best_fitness:,.0f}, "
+                 f"T₀={T:.0f}, 力度={base_remove_ratio*100:.0f}%, 早停阈值={NO_IMPROVE_LIMIT}")
 
-    for i in range(max_iter):
-        remove_cnt = max(2, int(len(unit_sum) * 0.3))
-        destroyed, unassigned = random_removal(best_sol, num_remove=remove_cnt)
-        new_sol = greedy_insertion(destroyed, unassigned)
+    # ---- 3.8 ALNS 主循环 ----
+    for iteration in range(max_iter):
+        # 自适应破坏力度：连续卡壳 → 加倍破坏
+        if stuck_counter >= STUCK_THRESHOLD:
+            remove_ratio = min(0.50, base_remove_ratio * 2)
+        else:
+            remove_ratio = base_remove_ratio
+        remove_cnt = max(2, int(len(unit_sum) * remove_ratio))
+
+        # 选择算子组合
+        d_op = select_destroy_op()
+        r_op = select_repair_op(d_op)
+        uses[d_op][r_op] += 1
+
+        # 执行 destroy + repair
+        destroyed, unassigned = run_destroy(best_sol, remove_cnt, d_op)
+        new_sol = run_repair(destroyed, unassigned, r_op)
 
         new_sol = [r for r in new_sol if r['deliveries']]
         new_sol, dropped = reassign_vehicles(new_sol)
-        # 配额超出的需求重新塞回路线（单轮最多 3 次）
         retry_inner = 0
         while dropped and retry_inner < 3:
-            new_sol = greedy_insertion(new_sol, dropped)
+            new_sol = run_repair(new_sol, dropped, r_op)
             new_sol, dropped = reassign_vehicles(new_sol)
             retry_inner += 1
         if dropped:
             new_sol = [r for r in new_sol if r['deliveries']]
         new_fitness = sum(eval_route_fitness(r) for r in new_sol)
 
-        if new_fitness < best_fitness or math.exp((best_fitness - new_fitness) / 100) > random.random():
+        # 接受判断
+        accepted = False
+        if new_fitness < best_fitness:
             best_sol, best_fitness = new_sol, new_fitness
+            accepted = True
+            stuck_counter = 0
+            if new_fitness < global_best_fitness:
+                global_best_fitness = new_fitness
+                no_improve_counter = 0
+                scores[d_op][r_op] += SCORE_NEW_BEST
+            else:
+                scores[d_op][r_op] += SCORE_BETTER
+        elif T > 0 and math.exp((best_fitness - new_fitness) / T) > random.random():
+            best_sol, best_fitness = new_sol, new_fitness
+            accepted = True
+            stuck_counter = 0
+            scores[d_op][r_op] += SCORE_ACCEPTED
+        else:
+            stuck_counter += 1
 
+        no_improve_counter += 1
+
+        # 早停：连续 N 步全局最优未改进
+        if no_improve_counter >= NO_IMPROVE_LIMIT:
+            logging.info(f"[ALNS早停] 连续{NO_IMPROVE_LIMIT}轮全局最优未改进，第{iteration}轮退出")
+            break
+
+        # 降温
+        T = max(T * COOLING_RATE, T_MIN)
+
+        # 定期更新权重
+        if (iteration + 1) % WEIGHT_UPDATE_INTERVAL == 0:
+            update_weights()
+
+        # 日志输出
+        if iteration % 100 == 0 or accepted:
+            flag = "✓" if accepted else " "
+            stuck_mark = f" ⚠卡壳{stuck_counter}" if stuck_counter >= STUCK_THRESHOLD else ""
+            logging.info(f"[ALNS {iteration:4d}/{max_iter}] {flag} {d_op}/{r_op} T={T:5.0f} "
+                         f"当前={new_fitness:,.0f} 最佳={best_fitness:,.0f} "
+                         f"路线={len(new_sol)} 力度={remove_ratio*100:.0f}%{stuck_mark}")
+
+        # 每 500 轮打印算子权重
+        if iteration % 500 == 0 and iteration > 0:
+            w_parts = []
+            for d in DESTROY_OPS:
+                for r in REPAIR_OPS:
+                    w_parts.append(f"{d}/{r}={weights[d][r]:.2f}")
+            logging.info(f"[ALNS权重] {' | '.join(w_parts)}")
+
+    # ---- 3.9 最终整理 ----
     best_sol, dropped = reassign_vehicles(best_sol)
-    # 最终兜底：还有丢弃的需求重塞（最多 10 轮）
     retry = 0
     while dropped and retry < 10:
         best_sol = greedy_insertion(best_sol, dropped)
@@ -366,7 +916,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         retry += 1
     best_sol = [r for r in best_sol if r['deliveries']]
     if dropped:
-        logging.error(f"[运力不足] 最终{retry}轮重塞后仍有{dropped}未分配需求，总量{sum(dropped.values()):.0f}箱")
+        logging.error(f"[运力不足] 最终{retry}轮重塞后仍有未分配需求，总量{sum(dropped.values()):.0f}箱")
+    logging.info(f"[ALNS完成] 最终成本={best_fitness:,.0f}, 路线={len(best_sol)}, 全局最优={global_best_fitness:,.0f}")
 
     '''4. 整数线性规划 Stage 2: 日期精确排程 (引入网点时间窗离散惩罚)'''
     num_routes = len(best_sol)

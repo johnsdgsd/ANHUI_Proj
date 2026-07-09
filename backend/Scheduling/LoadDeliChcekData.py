@@ -8,7 +8,7 @@ from dateutil.relativedelta import relativedelta
 
 
 def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
-    from Service_CheckDeliver import fetch_data
+    from backend.Scheduling.Service_CheckDeliver import fetch_data
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     # ================= 0. 基础网点与设备属性初始化 =================

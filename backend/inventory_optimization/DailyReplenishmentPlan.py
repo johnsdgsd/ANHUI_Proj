@@ -238,8 +238,22 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
         MainDf   : 主表 DataFrame
         DetailDf : 明细表 DataFrame
     """
-    # 生成全局方案标识（基于日期，去掉 '-' 转为整数）
-    GlobalSchemeId = int(PlanDate.replace('-', ''))
+    # 生成全局方案标识：优先从审批方案查找，找不到则用日期
+    year_month = PlanDate[:7].replace('-', '')
+    fallback_id = int(PlanDate.replace('-', ''))
+    try:
+        from backend.config.scheme_config import get_approved_scheme_config
+        global_scheme_id, _ = get_approved_scheme_config(year_month)
+        # 未找到审批方案时返回时间戳(13位)作为默认值
+        if global_scheme_id > 10 ** 10:
+            print(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
+            GlobalSchemeId = fallback_id
+        else:
+            print(f"找到审批方案: GLOBAL_SCHEME_ID={global_scheme_id} (year_month={year_month})")
+            GlobalSchemeId = global_scheme_id
+    except Exception:
+        print(f"获取审批方案异常，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
+        GlobalSchemeId = fallback_id
     CurrentDateStr = datetime.datetime.now().strftime('%Y-%m-%d')
 
     MainRows = []
