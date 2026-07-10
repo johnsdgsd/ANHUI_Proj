@@ -81,7 +81,7 @@ def _v3_load_deliv_data(date: str):
 
     if tb2.empty:
         logging.warning(f'当日 ({date}) 无补库计划，返回空需求')
-        VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf()
+        VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf(date)
         Demands = pd.DataFrame(np.zeros((LocationNum, SubTypeNum)))
         org_labels = [center_org] + list(tb1['ORG_NO'])
         DMat = pd.DataFrame(np.zeros((LocationNum + 1, LocationNum + 1)),
@@ -106,7 +106,7 @@ def _v3_load_deliv_data(date: str):
     MaxLen = 3 if len(set(LocationInd)) >= 3 else 2
 
     # ---- 5. 车辆配置 ----
-    VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf()
+    VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf(date)
 
     # ---- 6. 扣除已确认配送计划的需求和车辆 ----
     from backend.api.data_api.fetch_data import (
@@ -365,23 +365,22 @@ def _get_global_scheme_id(date: str) -> int:
     """
     获取 GLOBAL_SCHEME_ID：优先从审批通过的全局方案中查找，找不到则用日期。
     """
-    from backend.config.scheme_config import get_approved_scheme_config
-
     year_month = date[:7].replace('-', '')  # "2026-07-09" -> "202607"
     fallback_id = int(date.replace('-', ''))
 
     try:
-        global_scheme_id, _ = get_approved_scheme_config(year_month)
+        from backend.api.data_api.fetch_data import query_adam_glob_strategy_scheme_by_month
+        df = query_adam_glob_strategy_scheme_by_month(year_month)
+        if df is not None and not df.empty:
+            approved = df[df['APPR_RSLT'] == '01']
+            if not approved.empty:
+                scheme_id = int(approved.iloc[0]['SCHEME_ID'])
+                logging.info(f"找到审批方案: GLOBAL_SCHEME_ID={scheme_id} (year_month={year_month})")
+                return scheme_id
+        logging.info(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
     except Exception:
         logging.info(f"获取审批方案异常，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
-        return fallback_id
-
-    # get_approved_scheme_config 未找到审批方案时返回时间戳(13位)作为默认值
-    if global_scheme_id > 10 ** 10:
-        logging.info(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
-        return fallback_id
-    logging.info(f"找到审批方案: GLOBAL_SCHEME_ID={global_scheme_id} (year_month={year_month})")
-    return global_scheme_id
+    return fallback_id
 
 
 def _v3_generate_main_scheme(best_sol, VeCap, CarTypeStrList, date):

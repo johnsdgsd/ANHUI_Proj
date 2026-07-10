@@ -68,7 +68,7 @@ def LoadDelivData(date: str, adjust_pack_box: bool = True):
                      f'03(日常补库)= {type_counts.get("03", 0)}')
     if tb2.empty:
         logging.warning(f'当日 ({date}) 无补库计划，返回空需求')
-        VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf()
+        VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf(date)
         Demands = pd.DataFrame(np.zeros((LocationNum, SubTypeNum)))
         labels = ["中心"] + list(tb1['ORG_NO'])
         DMat = pd.DataFrame(np.zeros((LocationNum + 1, LocationNum + 1)), index=labels, columns=labels)
@@ -94,7 +94,7 @@ def LoadDelivData(date: str, adjust_pack_box: bool = True):
     # 最多三个地点
     MaxLen = 3 if len(set(LocationInd)) >=3 else 2
     #车辆信息（从数据库车型配置表读取）
-    VeCap, VNums, VeUnitPrice, VeTypeNum,VeType = query_vehicle_conf()
+    VeCap, VNums, VeUnitPrice, VeTypeNum,VeType = query_vehicle_conf(date)
 
     # 扣除已确认配送计划(DIST_FLAG='02')的需求和车辆
     from backend.api.data_api.fetch_data import (
@@ -242,15 +242,19 @@ def GenerateSchemeTables(DelivPlan, PlanDate, SubTypeList, VeCap, CarTypeStrList
     year_month = PlanDate[:7].replace('-', '')
     fallback_id = int(PlanDate.replace('-', ''))
     try:
-        from backend.config.scheme_config import get_approved_scheme_config
-        global_scheme_id, _ = get_approved_scheme_config(year_month)
-        # 未找到审批方案时返回时间戳(13位)作为默认值
-        if global_scheme_id > 10 ** 10:
+        from backend.api.data_api.fetch_data import query_adam_glob_strategy_scheme_by_month
+        df = query_adam_glob_strategy_scheme_by_month(year_month)
+        if df is not None and not df.empty:
+            approved = df[df['APPR_RSLT'] == '01']
+            if not approved.empty:
+                GlobalSchemeId = int(approved.iloc[0]['SCHEME_ID'])
+                print(f"找到审批方案: GLOBAL_SCHEME_ID={GlobalSchemeId} (year_month={year_month})")
+            else:
+                print(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
+                GlobalSchemeId = fallback_id
+        else:
             print(f"未找到审批方案，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
             GlobalSchemeId = fallback_id
-        else:
-            print(f"找到审批方案: GLOBAL_SCHEME_ID={global_scheme_id} (year_month={year_month})")
-            GlobalSchemeId = global_scheme_id
     except Exception:
         print(f"获取审批方案异常，使用日期 fallback: GLOBAL_SCHEME_ID={fallback_id}")
         GlobalSchemeId = fallback_id

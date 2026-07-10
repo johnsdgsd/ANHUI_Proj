@@ -220,7 +220,7 @@ def run_emergency_replenishment(
         days_in_month=30,
         threshold_percentile=0.5,
         target_percentile=0.9,
-        max_lead_time=5
+        max_lead_time=7
     )
 
     if emergency_df.empty:

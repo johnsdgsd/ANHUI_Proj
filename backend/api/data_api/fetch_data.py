@@ -1545,7 +1545,7 @@ def insert_into_adam_glob_strategy_scheme(df: pd.DataFrame):
             - SCHEME_ID: 方案标识
             - SCHEME_NO: 方案编号
             - SCHEME_NAME: 方案名称
-            - SCHEME_FOCUS: 方案侧重(01成本优先,02库存周转优先,03均衡分布)
+            - SCHEME_FOCUS: 方案侧重(01资金入账优先,02库存周转优先,03均衡分布)
             - EXEC_YM: 方案执行年月
             - PRE_STAT_COST: 预期综合总成本
             - PRE_SINGLE_COST: 预期平均单只成本
@@ -2127,51 +2127,88 @@ def query_adam_plan_day_ias_pre_by_month(data_month: str):
         raise
 
 
-def query_vehicle_conf():
-    """查询车型配置信息，返回 VeCap, VNums, VeUnitPrice, VeTypeNum。
-    数据库查询为空时使用默认配置。
+def _query_carrier_by_date(date_str: str) -> int:
+    """根据当前日期查找物流承运商编号。
+    调用 gk-adam_query_log_carrier_by_curr_date，无数据时抛出异常。
+    """
+    host = API_CONFIG["database"]["host"]
+    port = API_CONFIG["database"]["port"]
+    endpoint = '/exec/gk-adam_query_log_carrier_by_curr_date'
+    url = f"http://{host}:{port}{endpoint}"
 
-    Returns:
-        tuple: (VeCap, VNums, VeUnitPrice, VeTypeNum)
+    response = session.post(url, json={"query_date": date_str})
+    response.raise_for_status()
+
+    data = response.json()
+    if not data or (isinstance(data, list) and len(data) == 0):
+        raise ValueError(f"给定日期 {date_str} 找不到承运商")
+
+    # 返回数据格式: 列表含单行字典，取第一行的第一个值即为承运商编号
+    if isinstance(data, list):
+        row = data[0]
+        if isinstance(row, dict):
+            return int(list(row.values())[0])
+        return int(row)
+    if isinstance(data, dict):
+        return int(list(data.values())[0])
+    return int(data)
+
+
+def _query_carrier_vehicle_conf(lcc_id: int):
+    """根据承运商编号查询车型配置。
+    返回格式与旧 query_vehicle_conf 一致：VeCap, VNums, VeUnitPrice, VeTypeNum, VeType
     """
     import numpy as np
 
-    try:
-        host = API_CONFIG["database"]["host"]
-        port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/gk-adam-query_vehicle_conf'
-        url = f"http://{host}:{port}{endpoint}"
+    host = API_CONFIG["database"]["host"]
+    port = API_CONFIG["database"]["port"]
+    endpoint = '/exec/gk-adam_query_log_car_van_conf_by_lccid'
+    url = f"http://{host}:{port}{endpoint}"
 
-        response = session.post(url, json={})
-        response.raise_for_status()
+    response = session.post(url, json={"lcc_id": lcc_id})
+    response.raise_for_status()
 
-        data = response.json()
+    data = response.json()
+    if not data or (isinstance(data, list) and len(data) == 0):
+        raise ValueError(f"承运商 {lcc_id} 无车型配置数据")
 
-        if not data or (isinstance(data, list) and len(data) == 0):
-            VeCap = np.array([459, 901, 1071])
-            VNums = np.array([9, 10, 6])
-            VeUnitPrice = np.array([0.0695, 0.0695, 0.0695])
-            VeTypeNum = 3
-            VeType = ['01','02','03']
-        else:
-            if isinstance(data, list):
-                df = pd.DataFrame(data)
-            else:
-                df = pd.DataFrame([data])
+    if isinstance(data, list):
+        df = pd.DataFrame(data)
+    else:
+        df = pd.DataFrame([data])
 
-            df.columns = [c.upper() for c in df.columns]
-            VeCap = df['VEHICLE_CAP'].astype(int).values
-            VNums = df['VEHICLE_NUM'].astype(int).values
-            VeUnitPrice = df['VEHICLE_CARRI'].astype(float).values
-            VeType = df['CAR_TYPE']
-            VeTypeNum = len(df)
+    df.columns = [c.upper() for c in df.columns]
+    VeCap = df['VEHICLE_CAP'].astype(int).values
+    VNums = df['VEHICLE_NUM'].astype(int).values
+    VeUnitPrice = df['VEHICLE_CARRI'].astype(float).values
+    VeType = df['CAR_TYPE']
+    VeTypeNum = len(df)
 
-        return VeCap, VNums, VeUnitPrice, VeTypeNum,VeType
+    comp_name = df['COMP_NAME'].iloc[0] if 'COMP_NAME' in df.columns else '未知'
+    logging.info(f"[承运商] LCC_ID={lcc_id}, 名称={comp_name}, 车型数={VeTypeNum}")
+    for i in range(VeTypeNum):
+        logging.info(f"  车型={VeType.iloc[i]}, 容量={VeCap[i]}, 数量={VNums[i]}, 运价={VeUnitPrice[i]}")
 
-    except requests.exceptions.RequestException as e:
-        raise
-    except Exception as e:
-        raise
+    return VeCap, VNums, VeUnitPrice, VeTypeNum, VeType
+
+
+def query_vehicle_conf(date_str: str = None):
+    """查询车型配置信息。
+    按当前日期确定承运商 → 查询承运商车型容量和运价。
+
+    Args:
+        date_str: 日期字符串 'YYYY-MM-DD'，默认今天
+
+    Returns:
+        tuple: (VeCap, VNums, VeUnitPrice, VeTypeNum, VeType)
+    """
+    import datetime
+
+    if date_str is None:
+        date_str = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    lcc_id = _query_carrier_by_date(date_str)
+    return _query_carrier_vehicle_conf(lcc_id)
 
 
 def delete_adam_dist_scheme_det_by_scheme_id(scheme_id):

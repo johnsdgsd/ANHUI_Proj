@@ -77,11 +77,6 @@ def GenerateMutiOrderScheme(yearMonth:str):
         logger.info('准备计算成本明细')
         global_scheme_cost = GetGlobalSchemeCost(detail,tag,yearMonth)
 
-        cond1 = global_shceme_lps['PRE_STAT_NUM'] != 0
-        cond2 = global_scheme_cost['PRE_STAT_COST'] == 0
-        condition = cond1 & cond2
-        global_scheme_cost.loc[condition, 'PRE_STAT_COST'] = 50 + global_shceme_lps.loc[condition, 'PRE_STAT_NUM'] * 0.1
-        #
         global_scheme_cost['PRE_SINGLE_COST'] = global_scheme_cost['PRE_STAT_COST'].div(
             global_shceme_lps['PRE_STAT_NUM'], fill_value=0).replace([float('inf'), -float('inf')], 0)
 
@@ -1477,7 +1472,7 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
     # 成本最高 → 01
     cost_tag = items_by_cost[0][0]
     focus_map[cost_tag] = '01'
-    logger.info(f"方案 {cost_tag} 成本最高，设为成本优先(01)")
+    logger.info(f"方案 {cost_tag} 成本最高，设为资金入账优先(01)")
 
     # 剩余两个中周转最高 → 02
     remaining = [it for it in items if it[0] != cost_tag]
@@ -1508,7 +1503,7 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
 
         # 生成方案名
         if focus == '01':
-            scheme_name = f"{exec_ym}成本优先方案"
+            scheme_name = f"{exec_ym}资金入账优先方案"
         elif focus == '02':
             scheme_name = f"{exec_ym}周转优先方案"
         else:
@@ -1543,7 +1538,7 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
     # 输出最终分配
     logger.info("最终侧重分配:")
     for tag, focus in focus_map.items():
-        focus_name = {'01': '成本优先', '02': '周转优先', '03': '均衡分布'}.get(focus, '未知')
+        focus_name = {'01': '资金入账优先', '02': '周转优先', '03': '均衡分布'}.get(focus, '未知')
         logger.info(f"  方案 {tag}: {focus_name} ({focus})")
 
     return scheme_items
