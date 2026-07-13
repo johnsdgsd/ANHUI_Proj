@@ -97,9 +97,9 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         else:
             logging.info(f">>> [下月全局初始排程启动] 目标月份: {target_month}。将执行先删后增...")
 
-
-        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id = LoadDeliChcekData(
+        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast = LoadDeliChcekData(
             target_month, sim_start_date_str, is_mid_month)
+
         old_month_plan_map = {}
         if is_mid_month:
             pending_detect_df = fetch_data("gk-adam-query_pending_detect_plans", {"target_month": target_month})
@@ -136,7 +136,8 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
 
         df_detect, GlobalDelivPlan, df_work_arrange = GetCheckDeliverPlan(
             Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT,
-            LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, preTime, locations
+            LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, preTime, locations,
+            org_priority, dev_stock, dev_forecast
         )
 
         detect_db_list = []
@@ -249,7 +250,7 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                         "dev_code": str(d['DEV_CODE']).replace('.0', '').strip(), "dev_cls": str(d['DEV_CLS']),
                         "dev_categ": str(d['DEV_CATEG']), "dist_seq": d['DIST_SEQ'], "load_seq": d['LOAD_SEQ'],
                         "plan_dist_num": int(d['PLAN_DIST_NUM']), "plan_box_num": real_box_num, "dist_exp": dist_exp,
-                        "est_tot_dist_mist": d.get('DIST_SEGMENT', 0.0), "global_scheme_id": global_scheme_id
+                        "est_tot_dist_mist": round(d.get('DIST_SEGMENT', 0.0), 2), "global_scheme_id": global_scheme_id
                     })
                     det_idx += 1
 
@@ -275,6 +276,7 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         }
 
         if is_mid_month:
+            logging.info(f"日检定: UPDATE{len(detect_update_list)}条, INSERT{len(detect_db_list)}条")
             if detect_update_list:
                 execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
             if detect_db_list:
@@ -309,7 +311,7 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
         logging.info(f">>> [成功] {target_month} 检定与配送联动排程完毕，数据已落库。")
         DailyReplenishmentPlan(start_date, end_date)
         update_pre_conc_status(preConcId, '03')
-
+        logging.info(f">>> 日补库数据已经落库。")
     except Exception as e:
         logging.error(f">>> [排程错误] {str(e)}", exc_info=True)
         update_pre_conc_status(preConcId, '04')

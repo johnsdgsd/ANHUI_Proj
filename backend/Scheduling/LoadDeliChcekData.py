@@ -3,8 +3,150 @@ import numpy as np
 from geopy.distance import geodesic
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+import calendar
 from dateutil.relativedelta import relativedelta
+
+
+def query_future_14day_dmd_pre(start_date: str, end_date: str):
+    """
+    查询未来14天日预测需求合计（pretype='05'）。
+
+    从 ADAM_WD_DMD_PRE 表取指定日期区间内 pretype='05' 的日预测值之和，
+    按 ORG_NO + DEV_CODE 聚合。
+
+    参数:
+        start_date: 起始日期，格式 YYYYMMDD
+        end_date:   结束日期，格式 YYYYMMDD
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, DEV_CODE, PRE_14DAY_NUM（空 DataFrame 若无数据）
+    """
+    from backend.Scheduling.Service_CheckDeliver import fetch_data
+
+    df = fetch_data("gk-adam-query_future_14day_dmd_pre", {
+        "pre_type": "05",
+        "start_date": start_date,
+        "end_date": end_date
+    })
+    if not df.empty:
+        df.columns = [c.upper() for c in df.columns]
+    return df
+
+
+def _get_realtime_stocknum():
+    """
+    获取地市实时库存（按 ORG_NO × DEV_CODE 维度）。
+
+    调用 SQL 模板 gk-adam-query-realtime-stocknum，
+    复用 Service_CheckDeliver.fetch_data。
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, ORG_NAME, DEV_CODE, STOCK_NUM
+    """
+    from backend.Scheduling.Service_CheckDeliver import fetch_data
+
+    df = fetch_data("gk-adam-query-realtime-stocknum")
+    if not df.empty:
+        df.columns = [c.upper() for c in df.columns]
+    return df
+
+
+def _get_estimated_stock(target_month: str):
+    """
+    推算目标月初库存（模仿 fetch_data.py 的 query_adam_org_stock_sample_estimated）。
+
+    公式:
+        目标月初库存 = 实时库存 + 上月未来待配送 − 上月剩余需求
+        上月剩余需求 = 上月需求预测 × (上月剩余天数 / 上月总天数)
+
+    参数:
+        target_month: 目标月份，格式 YYYYMM，上月必须 >= 当前月份
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, ORG_NAME, DEV_CODE, STOCK_NUM
+    """
+    from backend.Scheduling.Service_CheckDeliver import fetch_data
+
+    if not isinstance(target_month, str) or len(target_month) != 6 or not target_month.isdigit():
+        raise ValueError(f"target_month 格式错误，需为 YYYYMM，实际: {target_month}")
+
+    target_dt = datetime.strptime(target_month, '%Y%m')
+    prev_dt = target_dt - relativedelta(months=1)
+    prev_month = prev_dt.strftime('%Y%m')
+    today = datetime.now()
+    current_month = today.strftime('%Y%m')
+
+    if prev_month < current_month:
+        raise ValueError(
+            f"无法推算: 目标月={target_month}, 上月={prev_month}, "
+            f"上月早于当前月={current_month}，无法用实时库存推算"
+        )
+
+    logging.info(f'推算目标月初库存: target={target_month}, 上月={prev_month}, 当前={current_month}')
+
+    # 1. 获取地市实时库存
+    df_realtime = _get_realtime_stocknum()
+    rt = df_realtime[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']].copy()
+    rt.rename(columns={'STOCK_NUM': 'RT_STOCK'}, inplace=True)
+
+    # 2. 获取上月需求预测
+    year = prev_month[:4]
+    month = prev_month[4:6]
+    demand = fetch_data("gk-adam-query_adam_yqm_dmd_pre_by_year_month", {"year": year, "month": month})
+    if demand.empty:
+        demand = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PRE_NUM'])
+    else:
+        demand.columns = [c.upper() for c in demand.columns]
+    demand = demand[['ORG_NO', 'DEV_CODE', 'PRE_NUM']].copy()
+    demand.rename(columns={'PRE_NUM': 'MONTHLY_DEMAND'}, inplace=True)
+
+    # 3. 计算上月剩余需求
+    days_in_prev = calendar.monthrange(prev_dt.year, prev_dt.month)[1]
+    if today.year == prev_dt.year and today.month == prev_dt.month:
+        remaining_days = days_in_prev - today.day + 1
+    elif today > prev_dt:
+        remaining_days = 0
+    else:
+        remaining_days = days_in_prev
+    ratio = remaining_days / days_in_prev
+    demand['REMAIN_DEMAND'] = demand['MONTHLY_DEMAND'] * ratio
+
+    # 4. 获取上月未来待配送
+    df_plan = fetch_data("gk-adam-query_adam_plan_day_ias_pre_by_month", {"data_month": prev_month})
+    if df_plan.empty:
+        df_delivery = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PENDING_DELIVERY'])
+    else:
+        df_plan.columns = [c.upper() for c in df_plan.columns]
+        df_plan['PRE_DATE'] = pd.to_datetime(df_plan['PRE_DATE'], errors='coerce')
+        if df_plan['PRE_DATE'].dt.tz is not None:
+            df_plan['PRE_DATE'] = df_plan['PRE_DATE'].dt.tz_convert(None)
+        today_date = pd.Timestamp(today.date())
+        last_day_of_prev = pd.Timestamp(prev_dt.year, prev_dt.month, days_in_prev)
+        mask_future = (df_plan['PRE_DATE'] >= today_date) & (df_plan['PRE_DATE'] <= last_day_of_prev)
+        df_future = df_plan[mask_future]
+        if df_future.empty:
+            df_delivery = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PENDING_DELIVERY'])
+        else:
+            df_delivery = df_future.groupby(['REC_ORG_NO', 'DEV_CODE'], as_index=False)['PLAN_IAS_NUM'].sum()
+            df_delivery.rename(columns={'REC_ORG_NO': 'ORG_NO', 'PLAN_IAS_NUM': 'PENDING_DELIVERY'}, inplace=True)
+
+    # 5. 合并三表，计算推算月初库存
+    result = rt.merge(demand, on=['ORG_NO', 'DEV_CODE'], how='outer') \
+               .merge(df_delivery, on=['ORG_NO', 'DEV_CODE'], how='left')
+    num_cols = ['RT_STOCK', 'MONTHLY_DEMAND', 'REMAIN_DEMAND', 'PENDING_DELIVERY']
+    for c in num_cols:
+        if c in result.columns:
+            result[c] = result[c].fillna(0)
+
+    result['STOCK_NUM'] = (result['RT_STOCK'] + result['PENDING_DELIVERY']
+                           - result['REMAIN_DEMAND']).clip(lower=0).round(0)
+
+    logging.info(f'推算目标月初库存完成: 实时={len(rt)}条, 需求={len(demand)}条, '
+                 f'配送={len(df_delivery)}条, 结果={len(result)}条, '
+                 f'上月={prev_month}, 剩余{remaining_days}/{days_in_prev}天')
+
+    return result[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']]
 
 
 def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
@@ -217,5 +359,95 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
         VeUnitPrice = np.array([0.0695, 0.0695, 0.0695])
         VeTypeNum = 3
 
-    # 【核心】：将 global_scheme_id 作为最后一个参数返回
-    return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id
+    # ================= 6. 计算网点缺货优先级 =================
+    logging.info(">>> 开始计算各网点缺货优先级...")
+
+    # 6.1 计算 14 天预测窗口
+    start_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
+    _, last_day = calendar.monthrange(start_dt.year, start_dt.month)
+    month_end_dt = datetime(start_dt.year, start_dt.month, last_day)
+    remaining_days = (month_end_dt - start_dt).days + 1
+
+    if remaining_days >= 14:
+        window_start = start_dt
+        window_end = start_dt + timedelta(days=13)
+    else:
+        window_end = month_end_dt
+        window_start = month_end_dt - timedelta(days=13)
+
+    window_start_str = window_start.strftime('%Y%m%d')
+    window_end_str = window_end.strftime('%Y%m%d')
+    logging.info(f"14天预测窗口: {window_start_str} ~ {window_end_str} (当月剩余{remaining_days}天)")
+
+    # 6.2 根据模式读取库存
+    if is_mid_month:
+        logging.info("库存模式: 重排 → 读实时库存")
+        df_stock = _get_realtime_stocknum()
+    else:
+        logging.info(f"库存模式: 初排 → 推算{target_month}月初库存")
+        df_stock = _get_estimated_stock(target_month)
+
+    if df_stock.empty:
+        logging.warning("库存数据为空，所有网点缺货概率设为 1.0")
+        raw_stock = pd.DataFrame(columns=['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM'])
+    else:
+        raw_stock = df_stock[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']].copy()
+
+    # 6.3 读取 14 天日预测
+    df_forecast = query_future_14day_dmd_pre(window_start_str, window_end_str)
+    if df_forecast.empty:
+        logging.warning("14天日预测数据为空，所有缺货概率设为 1.0")
+        raw_forecast = pd.DataFrame(columns=['ORG_NO', 'DEV_CODE', 'PRE_14DAY_NUM'])
+    else:
+        raw_forecast = df_forecast[['ORG_NO', 'DEV_CODE', 'PRE_14DAY_NUM']].copy()
+
+    # 6.4 库存 LEFT JOIN 预测 → 缺货概率逐(网点,设备码)计算
+    if raw_stock.empty:
+        merged = raw_forecast.copy()
+        merged['STOCK_NUM'] = 0.0
+    else:
+        merged = raw_stock.merge(raw_forecast, on=['ORG_NO', 'DEV_CODE'], how='left')
+
+    merged['PRE_14DAY_NUM'] = merged['PRE_14DAY_NUM'].fillna(0.0)
+    merged['STOCK_NUM'] = merged['STOCK_NUM'].fillna(0.0)
+
+    # 14天需求 < 5 的设备码跳过，不参与缺货概率计算
+    low_demand_mask = merged['PRE_14DAY_NUM'] < 5
+    low_demand_count = low_demand_mask.sum()
+    if low_demand_count > 0:
+        logging.info(f"过滤14天需求<5的设备码: {low_demand_count} 条")
+    merged = merged[~low_demand_mask].copy()
+
+    if merged.empty:
+        logging.warning("过滤低需求后无有效设备码，所有网点缺货概率设为默认值")
+        org_priority = {}
+        dev_stock = {}
+        dev_forecast = {}
+    else:
+        def calc_prob(stock, forecast):
+            if forecast <= 0:
+                return 1.0
+            return max(0.0, 1.0 - stock / forecast)
+
+        merged['PROB'] = merged.apply(lambda r: calc_prob(r['STOCK_NUM'], r['PRE_14DAY_NUM']), axis=1)
+
+        # 6.5 提取设备码级数据（供装箱优先级排序使用）
+        dev_stock = {}
+        dev_forecast = {}
+        for _, r in merged.iterrows():
+            key = (str(r['ORG_NO']).strip(), str(r['DEV_CODE']).strip())
+            dev_stock[key] = float(r['STOCK_NUM'])
+            dev_forecast[key] = float(r['PRE_14DAY_NUM'])
+        logging.info(f"设备码级数据: {len(dev_stock)} 条 (STOCK) + {len(dev_forecast)} 条 (FORECAST)")
+
+        # 6.6 网点聚合：取该网点所有设备码的最大缺货概率
+        org_max_prob = merged.groupby('ORG_NO')['PROB'].max().reset_index()
+        org_priority = dict(zip(org_max_prob['ORG_NO'], org_max_prob['PROB']))
+
+    logging.info(f"缺货优先级计算完成: {len(org_priority)} 个网点")
+    if org_priority:
+        top5 = sorted(org_priority.items(), key=lambda x: x[1], reverse=True)[:5]
+        logging.info(f"缺货概率 TOP5: {top5}")
+
+    # 【核心】：将 global_scheme_id、org_priority、设备码级数据作为最后参数返回
+    return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast
