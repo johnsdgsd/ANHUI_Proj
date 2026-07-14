@@ -10,7 +10,7 @@ import logging
 import sys
 
 
-def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT):
+def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     '''1. 提取基础参数与箱数转换'''
@@ -33,12 +33,40 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         return []
 
     '''2. 全局配置'''
-    VEHICLE_CONFIG = sorted([{'type': i + 1, 'cap': VeCap[i], 'daily_max': VNums[i]} for i in range(VeTypeNum)],
+    if vehicle_types is None:
+        vehicle_types = list(range(1, VeTypeNum + 1))
+    VEHICLE_CONFIG = sorted([{'type': vehicle_types[i], 'cap': VeCap[i], 'daily_max': VNums[i]} for i in range(VeTypeNum)],
                             key=lambda x: x['cap'])
     MAX_CAP = VEHICLE_CONFIG[-1]['cap']
 
+    def _route_cap(route):
+        """获取路线实际分配的车型容量（被 reassign_vehicles 可能换了车型），未分配时兜底 MAX_CAP"""
+        vt = route.get('vehicle_type')
+        if vt is not None:
+            v_idx = int(vt) - 1
+            if 0 <= v_idx < len(VEHICLE_CONFIG):
+                return VEHICLE_CONFIG[v_idx]['cap']
+        return MAX_CAP
+
     # 【新增全局红线】：单条路线的闭环最大行驶里程
     MAX_ROUTE_DIST = 750
+
+    def pick_best_vehicle(load, quotas):
+        """选能装下load且还有配额的最小车型，无可用车型返回None"""
+        for cfg in VEHICLE_CONFIG:
+            if cfg['cap'] >= load and quotas[cfg['type']] > 0:
+                return cfg
+        return None
+
+    def _get_monthly_quota():
+        """根据每日车辆配额或固定配置计算各车型月总配额"""
+        if daily_vehicle_limits:
+            quota = {}
+            for cfg in VEHICLE_CONFIG:
+                vt = cfg['type']
+                quota[vt] = sum(daily_vehicle_limits[d].get(vt, 0) for d in range(DelivDay))
+            return quota
+        return {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG}
 
     DMAT_arr = DMAT.values if isinstance(DMAT, pd.DataFrame) else DMAT
     # 使用 np.maximum 完美兼容：
@@ -83,7 +111,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         dist += get_dist(prev_node, 0)
         return dist
 
-    def eval_route_fitness(route, all_routes=None):
+    def eval_route_fitness(route):
         real_cost = calc_route_cost(route)
         if not route['deliveries']: return real_cost
 
@@ -101,18 +129,29 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         if load_rate < 0.70:
             penalty = 12000 * ((0.70 - load_rate) ** 2)
 
-        # 【同网点跨路线惩罚】：同一网点出现在多条路线中，每出现一次加罚
-        split_penalty = 0
-        if all_routes:
-            for cid, _ in route['deliveries']:
-                for other in all_routes:
-                    if other is route:
-                        continue
-                    if any(c == cid for c, _ in other['deliveries']):
-                        split_penalty += 50000
-                        break  # 每个网点只计一次
+        return real_cost + dist_penalty + penalty
 
-        return real_cost + dist_penalty + penalty + split_penalty
+    def _solution_fitness(solution, dropped=None):
+        """解适应度 = 路线成本之和 + 丢需求惩罚（每箱200000）"""
+        base = sum(eval_route_fitness(r) for r in solution)
+        if dropped:
+            dropped_boxes = sum(dropped.values())
+            base += dropped_boxes * 200000
+        return base
+
+    def _compute_dropped(solution):
+        """需求会计：对比 unit_sum 和实际配送量，返回真正的丢需求 dict。
+        不受 reassign_vehicles/reapir 算子静默丢需求的影响。"""
+        delivered = defaultdict(float)
+        for r in solution:
+            for cid, amt in r['deliveries']:
+                delivered[cid] += amt
+        dropped = {}
+        for cid, need in unit_sum.items():
+            got = delivered.get(cid, 0)
+            if got < need - 0.01:
+                dropped[cid] = need - got
+        return dropped
 
     # ====================================================================
     # 【核心约束 2】：终极防绕路（强制由近及远顺路卸货）
@@ -125,7 +164,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
     def reassign_vehicles(routes):
         """按车型月度配额分配，超配额路线拆回需求供 ALNS 重塞。返回 (assigned_routes, dropped_demand)"""
-        monthly_quota = {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG}
+        monthly_quota = _get_monthly_quota()
         total_quota = sum(monthly_quota.values())
         routes_sorted = sorted(routes, key=lambda r: sum(a for _, a in r['deliveries']), reverse=True)
         assigned = []
@@ -147,19 +186,81 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             if best_cfg is not None:
                 r['vehicle_type'] = best_cfg['type']
                 monthly_quota[best_cfg['type']] -= 1
+                # 车型容量不够：截断到容量，超出的拆回 dropped_demand 让 ALNS 重塞
+                if best_cfg['cap'] < load:
+                    excess = load - best_cfg['cap']
+                    trim_remaining = excess
+                    for i, (cid, amt) in enumerate(r['deliveries']):
+                        if trim_remaining <= 0:
+                            break
+                        trim = min(amt, trim_remaining)
+                        r['deliveries'][i] = (cid, amt - trim)
+                        dropped_demand[cid] += trim
+                        trim_remaining -= trim
+                    r['deliveries'] = [(c, a) for c, a in r['deliveries'] if a > 0.001]
                 assigned.append(r)
             else:
-                # 配额用尽，拆回需求
+                # 配额用尽，拆回需求供 ALNS 重塞
                 for cid, amt in r['deliveries']:
                     dropped_demand[cid] += amt
-        if dropped_demand:
-            logging.warning(f"[运力硬约束] 配额耗尽: {len(routes_sorted)}条路线 → {len(assigned)}条分配成功, "
-                          f"拆回需求{len(dropped_demand)}个网点, 总量{sum(dropped_demand.values()):.0f}箱, "
-                          f"各车型配额={ {cfg['type']: cfg['daily_max'] * DelivDay for cfg in VEHICLE_CONFIG} }")
         return assigned, dict(dropped_demand)
 
+    def optimize_vehicle_types(routes):
+        """交换车型算子：遍历路线对，交换车型以减少容量浪费。
+        例如：2站路线用小车型 → 换大车型后可接第3站，释放小车型给其他路线。"""
+        if len(routes) < 2:
+            return routes
+
+        improved = True
+        swaps = 0
+        while improved:
+            improved = False
+            n = len(routes)
+            for i in range(n):
+                if improved:
+                    break
+                for j in range(i + 1, n):
+                    vt_i = int(routes[i].get('vehicle_type', 1))
+                    vt_j = int(routes[j].get('vehicle_type', 1))
+                    if vt_i == vt_j:
+                        continue
+
+                    load_i = sum(a for _, a in routes[i]['deliveries'])
+                    load_j = sum(a for _, a in routes[j]['deliveries'])
+                    cap_i = _route_cap(routes[i])
+                    cap_j = _route_cap(routes[j])
+
+                    # 交换后容量检查
+                    if load_i > cap_j or load_j > cap_i:
+                        continue
+
+                    # 计算交换前后的浪费（浪费 = 容量 - 装载量）
+                    waste_before = (cap_i - load_i) + (cap_j - load_j)
+                    waste_after = (cap_j - load_i) + (cap_i - load_j)
+
+                    if waste_after < waste_before - 0.01:
+                        # 执行交换
+                        routes[i]['vehicle_type'], routes[j]['vehicle_type'] = vt_j, vt_i
+                        swaps += 1
+                        improved = True
+                        logging.info(f"[swap_types] 路线{i}(装载{load_i:.0f}, {cap_i}→{cap_j}) "
+                                     f"↔ 路线{j}(装载{load_j:.0f}, {cap_j}→{cap_i}), "
+                                     f"浪费{cap_i - load_i:.0f}+{cap_j - load_j:.0f}→"
+                                     f"{cap_j - load_i:.0f}+{cap_i - load_j:.0f}")
+                        break  # 从头开始新一轮扫描
+
+        if swaps > 0:
+            logging.info(f"[swap_types] 完成{swaps}次车型交换")
+        return routes
+
     def _build_routes(pending, routes):
-        """通用贪心构建：按 pending 顺序逐个网点插入已有路线或建新车"""
+        """通用贪心构建：按 pending 顺序逐个网点插入已有路线或建新车
+        返回未分配需求 dict {cid: amt}"""
+        monthly_quota = _get_monthly_quota()
+        used_types = defaultdict(int)
+        unassigned = defaultdict(float)
+        for r in routes:
+            used_types[int(r.get('vehicle_type', 1))] += 1
         for cid, total_amt in pending:
             amt = total_amt
             while amt > 0:
@@ -167,7 +268,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 best_waste = float('inf')
                 best_route = None
                 for r in routes:
-                    space = MAX_CAP - sum(a for _, a in r['deliveries'])
+                    space = _route_cap(r) - sum(a for _, a in r['deliveries'])
                     if space < amt: continue
                     has_cid = any(c == cid for c, _ in r['deliveries'])
                     if not has_cid and len(r['deliveries']) >= 3: continue
@@ -203,7 +304,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 best_score = float('inf')  # 综合评分 = waste - 0.5*space, 空间大+浪费小
                 best_action = None
                 for r in routes:
-                    space = MAX_CAP - sum(a for _, a in r['deliveries'])
+                    space = _route_cap(r) - sum(a for _, a in r['deliveries'])
                     if space <= 0: continue
                     has_cid = any(c == cid for c, _ in r['deliveries'])
                     if not has_cid and len(r['deliveries']) >= 3: continue
@@ -232,20 +333,20 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     amt -= take
                     continue
 
-                # Phase 3: 新建路线 — 选最小能装下的车型+留20%余量
+                # Phase 3: 新建路线 — 选有配额的最小能装下的车型
                 load = min(amt, MAX_CAP)
-                cfg = VEHICLE_CONFIG[-1]
+                cfg = None
                 for c in VEHICLE_CONFIG:
-                    if c['cap'] >= load * 1.2:
+                    if c['cap'] >= load and used_types[c['type']] < monthly_quota[c['type']]:
                         cfg = c
                         break
-                if cfg['cap'] < load:
-                    for c in VEHICLE_CONFIG:
-                        if c['cap'] >= load:
-                            cfg = c
-                            break
+                if cfg is None:
+                    unassigned[cid] += amt  # 记录未配送需求
+                    break
+                used_types[cfg['type']] += 1
                 routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, load)]})
                 amt -= load
+        return dict(unassigned)
 
     def generate_initial_solution(unassigned):
         """Multi-start: 3 种排序策略各建一个初解，返回最优的"""
@@ -276,24 +377,32 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
         best_routes = None
         best_fit = float('inf')
+        best_unassigned = None
 
         for name, sort_key in strategies:
             polar_info.sort(key=sort_key)
             pending = [(cid, amt) for cid, _, _, amt in polar_info]
             routes = []
-            _build_routes(pending, routes)
+            unasgn = _build_routes(pending, routes)
             routes = _merge_small_routes(routes)
 
             # 快速 relocation 局部搜索
             routes = _relocate_improve(routes, max_passes=3)
 
-            fit = sum(eval_route_fitness(r, routes) for r in routes)
+            # _merge_small_routes 可能合并路线释放车型，用闲置车型给未分配需求建新车
+            if unasgn:
+                routes, unasgn = greedy_insertion(routes, unasgn)
+
+            fit = sum(eval_route_fitness(r) for r in routes)
             if fit < best_fit:
                 best_fit = fit
                 best_routes = routes
-                logging.info(f"[初解] 策略 '{name}': {len(routes)}条路线, cost={fit:,.0f} ✓最优")
+                best_unassigned = unasgn
+                unasgn_boxes = sum(unasgn.values()) if unasgn else 0
+                logging.info(f"[初解] 策略 '{name}': {len(routes)}条路线, cost={fit:,.0f}, "
+                             f"未分配{unasgn_boxes:.0f}箱 ✓最优")
 
-        return best_routes
+        return best_routes, (best_unassigned or {})
 
     def _relocate_improve(routes, max_passes=3):
         """局部搜索: 尝试把 delivery 从一条路线迁移到另一条路线，降低总成本"""
@@ -315,7 +424,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         if not has_cid:
                             if not all(check_angle_constraint(cid, ec) for ec, _ in routes[rj]['deliveries']): continue
 
-                        space = MAX_CAP - sum(a for _, a in routes[rj]['deliveries'])
+                        space = _route_cap(routes[rj]) - sum(a for _, a in routes[rj]['deliveries'])
                         if space < amt: continue
 
                         old_cost_j = eval_route_fitness(routes[rj])
@@ -470,7 +579,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     current_nodes = set()
 
                     for cid in nodes_sorted:
-                        amt = next(a for c, a in all_deliveries if c == cid)
+                        amt = sum(a for c, a in all_deliveries if c == cid)
                         temp_nodes = current_nodes | {cid}
                         temp_load = current_load + amt
                         
@@ -521,7 +630,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     if not valid:
                         continue
 
-                    new_cost = sum(eval_route_fitness(r, new_route_objs) for r in new_route_objs)
+                    new_cost = sum(eval_route_fitness(r) for r in new_route_objs)
                     gain = old_cost - new_cost
                     if gain > best_gain:
                         best_gain = gain
@@ -692,7 +801,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             if not all(check_angle_constraint(cid, ec) for ec, _ in other['deliveries']):
                                 continue
                         # 容量校验
-                        space = MAX_CAP - sum(a for _, a in other['deliveries'])
+                        space = _route_cap(other) - sum(a for _, a in other['deliveries'])
                         if space < amt:
                             continue
                         # 构造临时路线并校验
@@ -822,7 +931,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         return sol_copy, unassigned
 
     def greedy_insertion(routes, unassigned):
+        """贪心插入，返回 (routes, remaining_unassigned)"""
         pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
+        mq = _get_monthly_quota()
+        used_types = defaultdict(int)
+        remaining = defaultdict(float)
+        for r in routes:
+            used_types[int(r.get('vehicle_type', 1))] += 1
         for cid, amt in pending:
             while amt > 0:
                 best_fit = float('inf')
@@ -840,7 +955,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                                 break
                     if not direction_ok: continue
 
-                    space = MAX_CAP - sum(a for _, a in route['deliveries'])
+                    space = _route_cap(route) - sum(a for _, a in route['deliveries'])
                     if space > 0:
                         ins_amt = min(amt, space)
                         temp = copy.deepcopy(route)
@@ -859,15 +974,23 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             if has_cid:
                                 fit *= 0.5
                             if ins_amt < (amt - 0.001):
-                                fit *= 100.0
+                                fit *= 5000
                             if fit < best_fit:
                                 best_fit = fit
                                 best_action = ('insert', ri, ins_amt, temp['deliveries'])
 
                 if best_action is None:
-                    # 优先大车: 留空间给后续合并
-                    cfg = VEHICLE_CONFIG[-1]
+                    # 新建路线：找有配额的最小车型
                     ins_amt = min(amt, MAX_CAP)
+                    cfg = None
+                    for c in VEHICLE_CONFIG:
+                        if c['cap'] >= ins_amt and used_types[c['type']] < mq[c['type']]:
+                            cfg = c
+                            break
+                    if cfg is None:
+                        remaining[cid] += amt  # 记录未能插入的剩余需求
+                        break
+                    used_types[cfg['type']] += 1
                     temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
                     best_action = ('new', cfg['type'], ins_amt, temp['deliveries'])
 
@@ -877,11 +1000,15 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 else:
                     routes.append({'vehicle_type': best_action[1], 'deliveries': best_action[3]})
                     amt -= best_action[2]
-        return [r for r in routes if r['deliveries']]
+        return [r for r in routes if r['deliveries']], dict(remaining)
 
     def regret2_insertion(routes, unassigned):
         """Regret-2 插入：优先处理 best 与 2nd-best 差距最大的 delivery，避免最后无路可走"""
         pending = dict(unassigned)
+        mq = _get_monthly_quota()
+        used_types = defaultdict(int)
+        for r in routes:
+            used_types[int(r.get('vehicle_type', 1))] += 1
 
         while pending:
             best_regret = -1.0
@@ -899,7 +1026,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         if not all(check_angle_constraint(cid, ec) for ec, _ in route['deliveries']):
                             continue
 
-                    space = MAX_CAP - sum(a for _, a in route['deliveries'])
+                    space = _route_cap(route) - sum(a for _, a in route['deliveries'])
                     if space <= 0:
                         continue
 
@@ -919,14 +1046,19 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         if has_cid:
                             fit *= 0.5
                         if ins_amt < amt - 0.001:
-                            fit *= 100.0
+                            fit *= 1.5
                         costs.append((fit, 'insert', ri, ins_amt, temp['deliveries']))
 
-                # 新建路线作为兜底
-                cfg = VEHICLE_CONFIG[-1]
+                # 新建路线作为兜底：找有配额的最小车型
                 ins_amt = min(amt, MAX_CAP)
-                temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
-                costs.append((eval_route_fitness(temp), 'new', cfg['type'], ins_amt, temp['deliveries']))
+                cfg = None
+                for c in VEHICLE_CONFIG:
+                    if c['cap'] >= ins_amt and used_types[c['type']] < mq[c['type']]:
+                        cfg = c
+                        break
+                if cfg is not None:
+                    temp = {'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]}
+                    costs.append((eval_route_fitness(temp), 'new', cfg['type'], ins_amt, temp['deliveries']))
 
                 if not costs:
                     continue
@@ -948,6 +1080,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 routes[arg1]['deliveries'] = deliveries
             else:
                 routes.append({'vehicle_type': arg1, 'deliveries': deliveries})
+                used_types[arg1] += 1
 
             remaining = pending[cid] - ins_amt
             if remaining > 0.0001:
@@ -961,7 +1094,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         """合并修复算子：先贪心塞入未分配需求，再拆散低装载率路线并入其他路线"""
         # Step 1: 贪心处理未分配需求
         if unassigned:
-            routes = greedy_insertion(routes, unassigned)
+            routes, _ = greedy_insertion(routes, unassigned)
 
         MIN_LOAD_RATE = 0.40
 
@@ -1007,7 +1140,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             if not all(check_angle_constraint(cid, ec) for ec, _ in other['deliveries']):
                                 continue
 
-                        space = MAX_CAP - sum(a for _, a in other['deliveries'])
+                        space = _route_cap(other) - sum(a for _, a in other['deliveries'])
                         if space < amt:
                             continue
 
@@ -1039,6 +1172,52 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
         return [r for r in routes if r['deliveries']]
 
+    def add_routes_repair(routes, unassigned):
+        """增加路线修复算子：利用闲置车型配额为未配送需求建新路线。
+        优先用小车型装小需求，大车型装大需求，最大化配额利用率。"""
+        if not unassigned:
+            return routes
+
+        mq = _get_monthly_quota()
+        used_types = defaultdict(int)
+        for r in routes:
+            used_types[int(r.get('vehicle_type', 1))] += 1
+
+        # 找出还有配额的车型，按容量升序
+        idle_cfgs = [c for c in VEHICLE_CONFIG if used_types[c['type']] < mq[c['type']]]
+        if not idle_cfgs:
+            return routes
+
+        # 按需求量降序排列
+        pending = sorted(unassigned.items(), key=lambda x: x[1], reverse=True)
+        added = 0
+
+        for cid, amt in pending:
+            while amt > 0.001:
+                # 重新计算当前闲置车型（可能已被前面的分配消耗）
+                idle_cfgs = [c for c in VEHICLE_CONFIG if used_types[c['type']] < mq[c['type']]]
+                if not idle_cfgs:
+                    return routes
+
+                ins_amt = min(amt, MAX_CAP)
+                # 找能装下且有配额的最小车型
+                cfg = None
+                for c in idle_cfgs:
+                    if c['cap'] >= ins_amt:
+                        cfg = c
+                        break
+                if cfg is None:
+                    # 所有闲置车型都装不下，用最大闲置车型截断
+                    cfg = idle_cfgs[-1]
+                    ins_amt = min(amt, cfg['cap'])
+
+                used_types[cfg['type']] += 1
+                routes.append({'vehicle_type': cfg['type'], 'deliveries': [(cid, ins_amt)]})
+                amt -= ins_amt
+                added += 1
+
+        return routes
+
     '''3. 自适应大邻域搜索算法 (Adaptive ALNS)'''
 
     # ---- 3.0 预计算：各网点方向角（供 Shaw Removal 使用） ----
@@ -1058,7 +1237,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
     # ---- 3.1 算子定义（新增 dismantle 修复算子） ----
     DESTROY_OPS = ['random', 'worst', 'shaw']
-    REPAIR_OPS = ['greedy', 'regret2', 'merge', 'dismantle']
+    REPAIR_OPS = ['greedy', 'regret2', 'merge', 'dismantle', 'add_routes']
 
     # ---- 3.2 权重追踪 ----
     weights = {d: {r: 1.0 for r in REPAIR_OPS} for d in DESTROY_OPS}
@@ -1116,13 +1295,16 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
     def run_repair(routes, unassigned, r_op):
         if r_op == 'greedy':
-            return greedy_insertion(routes, unassigned)
+            routes, _ = greedy_insertion(routes, unassigned)
+            return routes
         elif r_op == 'regret2':
             return regret2_insertion(routes, unassigned)
         elif r_op == 'merge':
             return merge_repair(routes, unassigned)
+        elif r_op == 'add_routes':
+            return add_routes_repair(routes, unassigned)
         else:  # dismantle 修复：先插入再拆解低载路线
-            routes = greedy_insertion(routes, unassigned)
+            routes, _ = greedy_insertion(routes, unassigned)
             return dismantle_low_load_routes(routes, min_load_rate=0.5)
 
     def run_destroy(solution, num_remove, d_op):
@@ -1134,21 +1316,105 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             return shaw_removal(solution, num_remove)
 
     # ---- 3.7 构建初解 ----
+    # 运力校验：总需求 > 总运力 → 直接报错，避免无限重试
+    total_demand_boxes = sum(unit_sum.values())
+    mq_check = _get_monthly_quota()
+    total_capacity_boxes = sum(mq_check[cfg['type']] * cfg['cap'] for cfg in VEHICLE_CONFIG)
+    if total_demand_boxes > total_capacity_boxes:
+        raise ValueError(
+            f"【运力严重不足】总需求 {total_demand_boxes:,.0f} 箱 > "
+            f"总运力 {total_capacity_boxes:,.0f} 箱 "
+            f"(缺口 {total_demand_boxes - total_capacity_boxes:,.0f} 箱)，无法排程！"
+        )
     max_iter = 40000
-    best_sol = generate_initial_solution(unit_sum)
+    best_sol, init_unassigned = generate_initial_solution(unit_sum)
     best_sol, dropped = reassign_vehicles(best_sol)
+    # 合并初解构建阶段未分配的需求（_build_routes 配额不足导致）
+    dropped = dict(dropped)  # 确保是普通 dict
+    for cid, amt in init_unassigned.items():
+        dropped[cid] = dropped.get(cid, 0) + amt
+    if init_unassigned:
+        logging.info(f"[初解] _build_routes 未分配: {sum(init_unassigned.values()):.0f}箱, "
+                     f"合并后 dropped={sum(dropped.values()):.0f}箱")
     retry = 0
-    while dropped and retry < 10:
-        best_sol = greedy_insertion(best_sol, dropped)
+    while dropped:
+        prev_dropped_sum = sum(dropped.values())
+        best_sol, remaining = greedy_insertion(best_sol, dropped)
         best_sol, dropped = reassign_vehicles(best_sol)
+        # 合并 greedy_insertion 未能插入的需求
+        for cid, amt in remaining.items():
+            dropped[cid] = dropped.get(cid, 0) + amt
+        dropped = {c: a for c, a in dropped.items() if a > 0.001}
         retry += 1
-    if dropped:
-        logging.error(f"[运力不足] 初排{retry}轮重塞后仍有未分配，总量{sum(dropped.values()):.0f}")
-    best_fitness = sum(eval_route_fitness(r, best_sol) for r in best_sol)
+        if retry % 500 == 0:
+            logging.info(f"[初解重塞] 第{retry}轮, 仍有{len(dropped)}个网点, 总量{sum(dropped.values()):.0f}箱")
+        # 无进展检测：greedy_insertion 完全无法插入任何需求
+        if sum(dropped.values()) >= prev_dropped_sum - 0.01:
+            logging.warning(
+                f"[初解重塞] 无进展! 第{retry}轮, "
+                f"剩余{sum(dropped.values()):.0f}箱(≥前轮{prev_dropped_sum:.0f}箱), 接受丢需求"
+            )
+            break
+        if retry >= 5000:
+            logging.warning(
+                f"[初解重塞] 重试{retry}轮仍未清空! "
+                f"剩余{sum(dropped.values()):.0f}箱, 网点{list(dropped.keys())[:10]}, 接受丢需求"
+            )
+            break
+
+    # ---- 初解硬约束校验 ----
+    mq = _get_monthly_quota()
+    total_quota = sum(mq.values())
+    type_used = defaultdict(int)
+    delivered = defaultdict(float)
+    violations = []
+    for ri, r in enumerate(best_sol):
+        dels = r['deliveries']
+        vt = int(r.get('vehicle_type', 1))
+        type_used[vt] += 1
+        for cid, amt in dels:
+            delivered[cid] += amt
+        load_r = sum(a for _, a in dels)
+        cap_r = VEHICLE_CONFIG[vt - 1]['cap']
+        stops = len(set(c for c, _ in dels))
+        dist_r = calc_route_distance(dels)
+        if stops > 3:
+            violations.append(f"路线{ri}: {stops}个站点(>3)")
+        if dist_r > MAX_ROUTE_DIST:
+            violations.append(f"路线{ri}: 距离{dist_r:.0f}(>{MAX_ROUTE_DIST})")
+        if load_r > cap_r + 0.01:
+            violations.append(f"路线{ri}: 装载{load_r:.0f}>{cap_r}(车型{vt})")
+    for vt, cnt in type_used.items():
+        if cnt > mq[vt]:
+            violations.append(f"车型{vt}: 使用{cnt}>{mq[vt]}(配额)")
+    delivered_boxes = sum(delivered.values())
+    real_dropped = _compute_dropped(best_sol)
+    dropped_boxes = sum(real_dropped.values())
+    if abs(delivered_boxes + dropped_boxes - total_demand_boxes) > 0.1:
+        violations.append(f"需求不守恒: 配送{delivered_boxes:.0f}+丢{dropped_boxes:.0f}≠需求{total_demand_boxes:.0f}")
+
+    if violations:
+        logging.error(f"[初解校验] ❌ {len(violations)}项违规: {'; '.join(violations)}")
+    else:
+        logging.info(f"[初解校验] ✓ 全部硬约束满足: "
+                     f"{len(best_sol)}条路线(≤总配额{total_quota}), "
+                     f"配送{delivered_boxes:.0f}箱, "
+                     f"丢需求{dropped_boxes:.0f}箱({dropped_boxes/total_demand_boxes*100:.1f}%)")
+
+    # 初解车型交换优化
+    best_sol = optimize_vehicle_types(best_sol)
+
+    best_fitness = _solution_fitness(best_sol, dropped)
+    best_dropped_boxes = sum(_compute_dropped(best_sol).values())
+    # 追踪丢需求最少的解（最终回退目标）
+    min_dropped_boxes = best_dropped_boxes
+    min_dropped_sol = copy.deepcopy(best_sol)
+    min_dropped_fitness = best_fitness
     global_best_fitness = best_fitness
     no_improve_counter = 0
     NO_IMPROVE_LIMIT = 4000
     logging.info(f"[ALNS初始] 路线={len(best_sol)}, 成本={best_fitness:,.0f}, "
+                 f"丢需求={best_dropped_boxes:.0f}箱, "
                  f"T₀={T:.0f}, 力度={base_remove_ratio*100:.0f}%, 早停阈值={NO_IMPROVE_LIMIT}")
 
     # ---- 3.8 ALNS 主循环 ----
@@ -1172,18 +1438,40 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         new_sol = [r for r in new_sol if r['deliveries']]
         new_sol, dropped = reassign_vehicles(new_sol)
         retry_inner = 0
-        while dropped and retry_inner < 3:
+        while dropped:
             new_sol = run_repair(new_sol, dropped, r_op)
             new_sol, dropped = reassign_vehicles(new_sol)
             retry_inner += 1
-        if dropped:
-            new_sol = [r for r in new_sol if r['deliveries']]
-        new_fitness = sum(eval_route_fitness(r, new_sol) for r in new_sol)
+            if retry_inner >= 500:
+                logging.warning(
+                    f"[ALNS内环] 重试{retry_inner}轮仍未清空! "
+                    f"剩余{sum(dropped.values()):.0f}箱, 网点{list(dropped.keys())[:10]}, 接受丢需求"
+                )
+                break
+        # 需求会计：用 _compute_dropped 算真正的丢需求
+        true_dropped = _compute_dropped(new_sol)
+        new_dropped_boxes = sum(true_dropped.values())
+        new_fitness = _solution_fitness(new_sol, true_dropped)
+
+        # 追踪丢需求最少的解（最终回退目标）
+        if new_dropped_boxes < min_dropped_boxes - 0.01:
+            min_dropped_boxes = new_dropped_boxes
+            min_dropped_sol = copy.deepcopy(new_sol)
+            min_dropped_fitness = new_fitness
+            logging.info(f"[ALNS {iteration:4d}] ★ 丢需求降至 {min_dropped_boxes:.0f}箱, "
+                         f"路线={len(new_sol)}, 成本={new_fitness:,.0f}")
 
         # 接受判断
         accepted = False
-        if new_fitness < best_fitness:
+        # 硬约束：有丢需求的解绝不接受
+        if new_dropped_boxes > 0.01:
+            stuck_counter += 1
+        # 丢需求不超过当前最优，且适应度更好 → 接受
+        elif new_dropped_boxes > best_dropped_boxes + 0.01:
+            stuck_counter += 1
+        elif new_fitness < best_fitness:
             best_sol, best_fitness = new_sol, new_fitness
+            best_dropped_boxes = new_dropped_boxes
             accepted = True
             stuck_counter = 0
             if new_fitness < global_best_fitness:
@@ -1194,6 +1482,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                 scores[d_op][r_op] += SCORE_BETTER
         elif T > 0 and math.exp((best_fitness - new_fitness) / T) > random.random():
             best_sol, best_fitness = new_sol, new_fitness
+            best_dropped_boxes = new_dropped_boxes
             accepted = True
             stuck_counter = 0
             scores[d_op][r_op] += SCORE_ACCEPTED
@@ -1216,13 +1505,41 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
         # 定期深度合并优化：抵消破坏算子带来的路线碎片化
         if (iteration + 1) % 200 == 0:
+            pre_merge_sol = copy.deepcopy(best_sol)
+            pre_merge_dropped = best_dropped_boxes
             best_sol = batch_merge_routes(best_sol)
             best_sol = swap_merge_routes(best_sol)
             best_sol = dismantle_low_load_routes(best_sol, min_load_rate=0.45)
-            best_fitness = sum(eval_route_fitness(r, best_sol) for r in best_sol)
-            if best_fitness < global_best_fitness:
-                global_best_fitness = best_fitness
-                no_improve_counter = 0
+            best_sol = optimize_vehicle_types(best_sol)
+            # 需求会计：检测合并/拆解静默丢弃的需求
+            dropped_merge = _compute_dropped(best_sol)
+            retry_m = 0
+            while dropped_merge and retry_m < 100:
+                best_sol, remaining = greedy_insertion(best_sol, dropped_merge)
+                best_sol, dropped_merge = reassign_vehicles(best_sol)
+                for cid, amt in remaining.items():
+                    dropped_merge[cid] = dropped_merge.get(cid, 0) + amt
+                dropped_merge = {c: a for c, a in dropped_merge.items() if a > 0.001}
+                retry_m += 1
+            # 重塞后再用需求会计验证
+            dropped_merge = _compute_dropped(best_sol)
+            new_dropped_boxes = sum(dropped_merge.values())
+            if new_dropped_boxes > pre_merge_dropped + 0.01:
+                logging.warning(f"[深度合并] 丢需求恶化 {pre_merge_dropped:.0f}→{new_dropped_boxes:.0f}箱, 回退")
+                best_sol = pre_merge_sol
+            else:
+                best_fitness = _solution_fitness(best_sol, dropped_merge)
+                best_dropped_boxes = new_dropped_boxes
+                if new_dropped_boxes < min_dropped_boxes - 0.01:
+                    min_dropped_boxes = new_dropped_boxes
+                    min_dropped_sol = copy.deepcopy(best_sol)
+                    min_dropped_fitness = best_fitness
+                if dropped_merge:
+                    logging.warning(f"[深度合并] 丢需求{best_dropped_boxes:.0f}箱, "
+                                    f"fitness={best_fitness:,.0f}")
+                if best_fitness < global_best_fitness:
+                    global_best_fitness = best_fitness
+                    no_improve_counter = 0
 
         # 日志输出
         if iteration % 100 == 0 or accepted:
@@ -1240,24 +1557,127 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     w_parts.append(f"{d}/{r}={weights[d][r]:.2f}")
             logging.info(f"[ALNS权重] {' | '.join(w_parts)}")
 
-    # ---- 3.9 最终整理与强化优化 ----
+    # ---- 3.9 回退到丢需求最少的解 ----
+    if min_dropped_boxes < best_dropped_boxes - 0.01:
+        logging.warning(f"[ALNS回退] 当前解丢需求={best_dropped_boxes:.0f}箱 > "
+                        f"历史最优={min_dropped_boxes:.0f}箱, 回退到丢需求最少的解 "
+                        f"(路线={len(min_dropped_sol)}, 成本={min_dropped_fitness:,.0f})")
+        best_sol = min_dropped_sol
+        best_fitness = min_dropped_fitness
+        best_dropped_boxes = min_dropped_boxes
+        # 回退后校验车型和容量
+        best_sol, dropped = reassign_vehicles(best_sol)
+        retry_rb2 = 0
+        while dropped and retry_rb2 < 100:
+            best_sol, remaining = greedy_insertion(best_sol, dropped)
+            best_sol, dropped = reassign_vehicles(best_sol)
+            for cid, amt in remaining.items():
+                dropped[cid] = dropped.get(cid, 0) + amt
+            dropped = {c: a for c, a in dropped.items() if a > 0.001}
+            retry_rb2 += 1
+
+    # ---- 3.10 最终整理与强化优化 ----
     # 执行全量合并优化，确保最终输出方案装载率最优
     best_sol = batch_merge_routes(best_sol)
     best_sol = swap_merge_routes(best_sol)
     best_sol = dismantle_low_load_routes(best_sol, min_load_rate=0.5)
+    best_sol = optimize_vehicle_types(best_sol)
     best_sol = _relocate_improve(best_sol, max_passes=5)
 
-    best_sol, dropped = reassign_vehicles(best_sol)
+    # 需求会计：最终合并可能静默丢需求
+    dropped = _compute_dropped(best_sol)
     retry = 0
-    while dropped and retry < 10:
-        best_sol = greedy_insertion(best_sol, dropped)
+    while dropped:
+        prev_dropped_sum = sum(dropped.values())
+        best_sol, remaining = greedy_insertion(best_sol, dropped)
         best_sol, dropped = reassign_vehicles(best_sol)
+        for cid, amt in remaining.items():
+            dropped[cid] = dropped.get(cid, 0) + amt
+        dropped = {c: a for c, a in dropped.items() if a > 0.001}
         retry += 1
+        if retry % 500 == 0:
+            logging.info(f"[最终兜底] 第{retry}轮, 仍有{len(dropped)}个网点, 总量{sum(dropped.values()):.0f}箱")
+        if sum(dropped.values()) >= prev_dropped_sum - 0.01:
+            logging.warning(
+                f"[最终兜底] 无进展! 第{retry}轮, "
+                f"剩余{sum(dropped.values()):.0f}箱(≥前轮{prev_dropped_sum:.0f}箱), 接受丢需求"
+            )
+            break
+        if retry >= 5000:
+            logging.warning(
+                f"[最终兜底] 重试{retry}轮仍未清空! "
+                f"剩余{sum(dropped.values()):.0f}箱, 网点{list(dropped.keys())[:10]}, 接受丢需求"
+            )
+            break
     best_sol = [r for r in best_sol if r['deliveries']]
-    if dropped:
-        logging.error(f"[运力不足] 最终{retry}轮重塞后仍有未分配需求，总量{sum(dropped.values()):.0f}箱")
-    best_fitness = sum(eval_route_fitness(r, best_sol) for r in best_sol)
-    logging.info(f"[ALNS完成] 最终成本={best_fitness:,.0f}, 路线={len(best_sol)}, 全局最优={global_best_fitness:,.0f}")
+    best_fitness = _solution_fitness(best_sol, dropped)
+    # 重塞后再用需求会计验证，确保不遗漏
+    dropped = _compute_dropped(best_sol)
+    final_dropped_boxes = sum(dropped.values())
+
+    # 最终回退：如果最终清理把解弄坏了，回退到丢需求最少的解
+    if min_dropped_boxes < final_dropped_boxes - 0.01:
+        logging.warning(f"[最终回退] 最终清理后丢需求={final_dropped_boxes:.0f}箱 > "
+                        f"历史最优={min_dropped_boxes:.0f}箱, 回退! "
+                        f"(路线={len(min_dropped_sol)}, 成本={min_dropped_fitness:,.0f})")
+        best_sol = min_dropped_sol
+        best_fitness = min_dropped_fitness
+        # 回退后必须重新校验车型和容量
+        best_sol, dropped = reassign_vehicles(best_sol)
+        retry_rb = 0
+        while dropped and retry_rb < 100:
+            best_sol, remaining = greedy_insertion(best_sol, dropped)
+            best_sol, dropped = reassign_vehicles(best_sol)
+            for cid, amt in remaining.items():
+                dropped[cid] = dropped.get(cid, 0) + amt
+            dropped = {c: a for c, a in dropped.items() if a > 0.001}
+            retry_rb += 1
+        dropped = _compute_dropped(best_sol)
+        best_fitness = _solution_fitness(best_sol, dropped)
+
+    # 最终硬约束校验：不能有超载或超站点
+    violations = []
+    for ri, r in enumerate(best_sol):
+        load_r = sum(a for _, a in r['deliveries'])
+        vt = int(r.get('vehicle_type', 1))
+        cap_r = VEHICLE_CONFIG[vt - 1]['cap']
+        stops = len(set(c for c, _ in r['deliveries']))
+        if load_r > cap_r + 0.01:
+            violations.append(f"路线{ri}: 超载 {load_r:.0f}>{cap_r}(车型{vt})")
+        if stops > 3:
+            violations.append(f"路线{ri}: {stops}个站点>3")
+    if violations:
+        raise ValueError(f"【最终校验失败】硬约束违规: {'; '.join(violations)}")
+
+    logging.info(f"[ALNS完成] 最终成本={best_fitness:,.0f}, 路线={len(best_sol)}, "
+                 f"丢需求={sum(dropped.values()) if dropped else 0:.0f}箱, 全局最优={global_best_fitness:,.0f}")
+
+    # 打印最终路线概览
+    for ri, r in enumerate(best_sol):
+        vt = int(r.get('vehicle_type', 1))
+        cap_r = VEHICLE_CONFIG[vt - 1]['cap']
+        load_r = sum(a for _, a in r['deliveries'])
+        stops = len(r['deliveries'])
+        rate = load_r / cap_r * 100 if cap_r > 0 else 0
+        logging.info(f"  车型={vt}, 站点数={stops}, 体积箱数={load_r:.0f}, 满载率={rate:.1f}%")
+
+    # ---- 需求覆盖诊断：对比输入输出 ----
+    missing = _compute_dropped(best_sol)
+    if missing:
+        delivered_total = sum(sum(a for _, a in r['deliveries']) for r in best_sol)
+        gap = sum(missing.values())
+        total_cap = sum(_get_monthly_quota()[cfg['type']] * cfg['cap'] for cfg in VEHICLE_CONFIG)
+        gap_details = []
+        for cid, g in sorted(missing.items(), key=lambda x: x[1], reverse=True)[:10]:
+            need = unit_sum[cid]
+            gap_details.append(f"网点{cid}: 需求{need:.0f}箱→实际{need-g:.0f}箱, 缺口{g:.0f}箱")
+        raise ValueError(
+            f"【运力不足】总需求={total_demand_boxes:.0f}箱, 总运力={total_cap:.0f}箱, "
+            f"实际配送={delivered_total:.0f}箱, 缺口={gap:.0f}箱, "
+            f"涉及{len(missing)}个网点\n" + "\n".join(gap_details)
+        )
+    else:
+        logging.info(f"[ALNS缺口] 全部满足! 输出={sum(sum(a for _, a in r['deliveries']) for r in best_sol):.0f}箱 = 输入={total_demand_boxes:.0f}箱")
 
     '''4. 整数线性规划 Stage 2: 日期精确排程 (引入网点时间窗离散惩罚)'''
     num_routes = len(best_sol)
@@ -1272,9 +1692,14 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     for v in range(VeTypeNum):
         vt = v + 1
         cnt = type_count.get(vt, 0)
-        daily = VNums[v]
-        monthly = daily * DelivDay
-        log_parts.append(f"车型{vt}: {cnt}条路线, 日配额={daily}, 月配额={monthly}")
+        if daily_vehicle_limits:
+            daily = [daily_vehicle_limits[d].get(vt, 0) for d in range(DelivDay)]
+            monthly = sum(daily)
+            log_parts.append(f"车型{vt}: {cnt}条路线, 日配额={daily}, 月配额={monthly}")
+        else:
+            daily = VNums[v]
+            monthly = daily * DelivDay
+            log_parts.append(f"车型{vt}: {cnt}条路线, 日配额={daily}, 月配额={monthly}")
     logging.info(f"[ILP诊断] 共{num_routes}条路线, DelivDay={DelivDay}天 | " + " | ".join(log_parts))
     # ---- 诊断结束 ----
 
@@ -1282,8 +1707,22 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
-    ALPHA = 50000
+    ALPHA = 500  # 聚类惩罚权重（与 Z 可比）
+    BETA = 0.5     # 缺货优先级惩罚权重（与 Z 可比，乘 route_load 后量级相当）
 
+    # ---- 计算每条路线的优先级与装载量 ----
+    route_priority = np.zeros(num_routes)
+    route_load = np.zeros(num_routes)
+    for r in range(num_routes):
+        route_load[r] = sum(amt for _, amt in best_sol[r]['deliveries'])
+        if node_priority is not None:
+            for cid, _ in best_sol[r]['deliveries']:
+                if cid < len(node_priority):
+                    route_priority[r] = max(route_priority[r], node_priority[cid])
+
+    has_priority = node_priority is not None and np.any(route_priority > 0)
+
+    # ---- 同网点聚类惩罚 ----
     node_to_routes = defaultdict(list)
     for r in range(num_routes):
         for cid, _ in best_sol[r]['deliveries']:
@@ -1303,10 +1742,21 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             prob2 += p_var >= routes_in_window - 1
             penalties.append(p_var)
 
+    # ---- 目标函数：峰值最小化 + 聚类惩罚 + 优先级逆序惩罚 ----
+    obj_terms = [Z]
     if penalties:
-        prob2 += Z + ALPHA * pulp.lpSum(penalties)
-    else:
-        prob2 += Z
+        obj_terms.append(ALPHA * pulp.lpSum(penalties))
+    if has_priority:
+        priority_pen = pulp.lpSum(
+            route_priority[r] * d * route_load[r] * x[r, d]
+            for r in range(num_routes) for d in range(DelivDay)
+        )
+        obj_terms.append(BETA * priority_pen)
+        high_pri_routes = int(np.sum(route_priority > 0.5))
+        logging.info(f"[ILP优先级确认] 缺货概率>0.5的路线={high_pri_routes}/{num_routes}, "
+                     f"BETA={BETA}, 最大优先级={route_priority.max():.4f}, "
+                     f"平均={route_priority[route_priority>0].mean():.4f}")
+    prob2 += pulp.lpSum(obj_terms)
 
     for r in range(num_routes):
         prob2 += pulp.lpSum(x[r, d] for d in range(DelivDay)) == 1
@@ -1316,7 +1766,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             v_type = v + 1
             type_routes = [r for r in range(num_routes) if int(best_sol[r].get('vehicle_type', 1)) == v_type]
             if type_routes:
-                prob2 += pulp.lpSum(x[r, d] for r in type_routes) <= VNums[v]
+                daily_limit = daily_vehicle_limits.get(d, {}).get(v_type, VNums[v]) if daily_vehicle_limits else VNums[v]
+                prob2 += pulp.lpSum(x[r, d] for r in type_routes) <= daily_limit
 
     for d in range(DelivDay):
         prob2 += pulp.lpSum(x[r, d] * sum(amt for _, amt in best_sol[r]['deliveries']) for r in range(num_routes)) <= Z

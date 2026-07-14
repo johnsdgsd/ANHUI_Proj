@@ -338,8 +338,12 @@ def _adjust_daily_delivery_v3_impl(date: str, max_stops: int, max_iter: int):
     )
     logging.info(f"明细表: {len(DetailScheme)} 行")
 
-    # ---- 5. 核验：配送明细件数 == 需求件数 ----
-    _v3_verify_delivery(Demands, DetailScheme, SubTypeList, org_labels)
+    # ---- 5. 核验：配送明细件数 == 需求件数，失败不写库 ----
+    try:
+        _v3_verify_delivery(Demands, DetailScheme, SubTypeList, org_labels)
+    except ValueError as e:
+        logging.error(f"[V3核验失败] 配送与需求不一致，不写入数据库: {str(e)[:500]}")
+        return pd.DataFrame(columns=empty_cols['main']), pd.DataFrame(columns=empty_cols['detail'])
 
     # ---- 6. 替换时间戳ID为数据库序列ID ----
     if not MainScheme.empty:
@@ -476,10 +480,11 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
             sd = seg_dists[s_idx]
             if sd <= 0.001 and vol > 0:
                 prev_n = 0 if s_idx == 0 else deliveries[s_idx - 1][0]
-                logging.warning(f"⚠ 零距离段: 路线{r_idx}, 段{s_idx}, "
-                                f"prev_node={prev_n}→node={nid}, "
-                                f"ORG={org_labels[nid]}, vol_boxes={vol}, "
-                                f"DMAT[{prev_n},{nid}]={DMAT_arr[prev_n, nid]}")
+                if prev_n != nid:  # 同网点拆分配送是正常的，跳过
+                    logging.warning(f"⚠ 零距离段: 路线{r_idx}, 段{s_idx}, "
+                                    f"prev_node={prev_n}→node={nid}, "
+                                    f"ORG={org_labels[nid]}, vol_boxes={vol}, "
+                                    f"DMAT[{prev_n},{nid}]={DMAT_arr[prev_n, nid]}")
 
         for stop_idx, (node_id, vol_boxes_delivered) in enumerate(deliveries):
             loc_idx = node_id - 1
