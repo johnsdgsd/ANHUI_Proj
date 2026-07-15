@@ -10,7 +10,7 @@ import logging
 import sys
 
 
-def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None):
+def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None, near_center_nodes=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     '''1. 提取基础参数与箱数转换'''
@@ -81,6 +81,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     # ====================================================================
     def check_angle_constraint(cid1, cid2):
         if cid1 == cid2: return True
+        if near_center_nodes is not None and cid1 in near_center_nodes and cid2 in near_center_nodes:
+            return True
         d01 = get_dist(0, cid1)
         d02 = get_dist(0, cid2)
         d12 = get_dist(cid1, cid2)
@@ -1324,6 +1326,63 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     else:
         logging.info(f"[ALNS缺口] 全部满足! 输出={sum(delivered.values()):.0f}箱 = 输入={sum(unit_sum.values()):.0f}箱")
 
+    # ---- 同节点交付合并：修复 Phase 2/repair 造成的需求拆分 ----
+    # 对出现在多条路线中的节点，尝试把量合并到"该节点量最大"的那条路线
+    merged_count = 0
+    for cid in list(delivered.keys()):
+        # 找到所有含此节点的路线及其量（同路线多条目合并求和）
+        route_entries = []  # [(ridx, sum_amt_for_this_cid, total_load_of_route)]
+        seen_routes = set()
+        for ri, r in enumerate(best_sol):
+            if ri in seen_routes:
+                continue
+            cid_amt = sum(a for c, a in r['deliveries'] if c == cid)
+            if cid_amt > 0:
+                total_load = sum(amt for _, amt in r['deliveries'])
+                route_entries.append((ri, cid_amt, total_load))
+                seen_routes.add(ri)
+        if len(route_entries) <= 1:
+            continue
+
+        # 按该节点量降序：量最大的作为合并目标
+        route_entries.sort(key=lambda x: x[1], reverse=True)
+        main_ri, main_amt, main_total = route_entries[0]
+
+        for other_ri, other_amt, other_total in route_entries[1:]:
+            main_route = best_sol[main_ri]
+            other_route = best_sol[other_ri]
+            main_cap = _route_cap(main_route)
+            new_main_total = sum(amt for _, amt in main_route['deliveries']) + other_amt
+
+            if new_main_total <= main_cap:
+                # 合并到主路线
+                for i, (c, a) in enumerate(main_route['deliveries']):
+                    if c == cid:
+                        main_route['deliveries'][i] = (c, a + other_amt)
+                        break
+                # 从另一路线删除
+                other_route['deliveries'] = [(c, a) for c, a in other_route['deliveries'] if c != cid]
+                merged_count += 1
+            else:
+                # 容量不够，记录原因
+                logging.warning(f"[交付合并] 网点{cid}: 路线{other_ri}({other_amt:.0f}箱) → 路线{main_ri} "
+                               f"失败(容量={main_cap:.0f}, 合并后={new_main_total:.0f}, "
+                               f"当前载量={new_main_total - other_amt:.0f})")
+
+    if merged_count > 0:
+        # 删除被掏空的路线 + 重新统计
+        best_sol = [r for r in best_sol if r['deliveries']]
+        delivered2 = defaultdict(float)
+        for r in best_sol:
+            for cid, amt in r['deliveries']:
+                delivered2[cid] += amt
+        split_nodes = sum(1 for cid in delivered2 if sum(1 for r in best_sol if any(c == cid for c, _ in r['deliveries'])) >= 2)
+        logging.info(f"[交付合并] 成功合并{merged_count}条, 路线={len(best_sol)}, "
+                     f"仍拆分={split_nodes}个网点")
+    else:
+        logging.info(f"[交付合并] ✓ 无拆分需求可合并")
+    # ====================================================================
+
     '''4. 整数线性规划 Stage 2: 日期精确排程 (引入网点时间窗离散惩罚)'''
     num_routes = len(best_sol)
     if num_routes == 0:
@@ -1352,55 +1411,85 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
-    ALPHA = 500  # 聚类惩罚权重（与 Z 可比）
-    BETA = 0.5     # 缺货优先级惩罚权重（与 Z 可比，乘 route_load 后量级相当）
+    ALPHA = 1000000  # 聚类惩罚权重（拉开同网点配送间隔）
+    BETA =500   # 缺货优先级惩罚权重（只罚代表路线，不绑架其余路线）
 
-    # ---- 计算每条路线的优先级与装载量 ----
-    route_priority = np.zeros(num_routes)
-    route_load = np.zeros(num_routes)
+    # ---- 构建网点→路线映射 & 计算网点级数据 ----
+    node_routes_ilp = defaultdict(list)  # {cid: [route_idx, ...]}
+    node_load_ilp = defaultdict(float)   # {cid: 该网点在各路线中的总箱数}
     for r in range(num_routes):
-        route_load[r] = sum(amt for _, amt in best_sol[r]['deliveries'])
-        if node_priority is not None:
-            for cid, _ in best_sol[r]['deliveries']:
-                if cid < len(node_priority):
-                    route_priority[r] = max(route_priority[r], node_priority[cid])
+        for cid, amt in best_sol[r]['deliveries']:
+            node_routes_ilp[cid].append(r)
+            node_load_ilp[cid] += amt
 
-    has_priority = node_priority is not None and np.any(route_priority > 0)
+    # ---- 筛选有缺货优先级的网点 ----
+    priority_nodes = {}  # {cid: priority}
+    if node_priority is not None:
+        for cid in node_routes_ilp:
+            if cid < len(node_priority) and node_priority[cid] > 0:
+                priority_nodes[cid] = node_priority[cid]
 
-    # ---- 同网点聚类惩罚 ----
-    node_to_routes = defaultdict(list)
-    for r in range(num_routes):
-        for cid, _ in best_sol[r]['deliveries']:
-            node_to_routes[cid].append(r)
+    has_priority = len(priority_nodes) > 0
 
+    # ---- 每个缺货网点选一条"代表路线"（载量最小），只惩罚它的配送日 ----
+    # 其余路线不参与优先级惩罚，由 ALPHA 聚类惩罚自然拉开
+    priority_route_info = {}  # {cid: (rep_route_idx, rep_load)}
+    if has_priority:
+        for cid in priority_nodes:
+            r_list = node_routes_ilp[cid]
+            rep_r = min(r_list, key=lambda r: sum(a for _, a in best_sol[r]['deliveries']))
+            rep_load = sum(a for _, a in best_sol[rep_r]['deliveries'])
+            priority_route_info[cid] = (rep_r, rep_load)
+
+    # ---- 同网点聚类惩罚（分层累进：路线越集中在同一窗口罚得越重） ----
     penalties = []
-    for cid, r_list in node_to_routes.items():
+    for cid, r_list in node_routes_ilp.items():
         freq = len(r_list)
         if freq <= 1:
             continue
 
-        window_size = min(max(1, (DelivDay // freq) - 1), 5)
+        window_size = min(max(0, (DelivDay // freq) - 1), 5)
 
         for d in range(DelivDay - window_size):
             routes_in_window = pulp.lpSum(x[r, d + i] for r in r_list for i in range(window_size + 1))
-            p_var = pulp.LpVariable(f"Pen_Node_{cid}_Day_{d}", lowBound=0, cat='Continuous')
-            prob2 += p_var >= routes_in_window - 1
-            penalties.append(p_var)
+            # 分层惩罚：p2≥routes-1, p3≥routes-2, p4≥routes-3, ...
+            # n条路线的总惩罚 = ALPHA × (1+2+...+(n-1)) = ALPHA × n(n-1)/2
+            for tier in range(2, freq + 1):
+                pk = pulp.LpVariable(f"Pen_N{cid}_D{d}_T{tier}", lowBound=0, cat='Continuous')
+                prob2 += pk >= routes_in_window - (tier - 1)
+                penalties.append(pk)
+
+    # ---- 网点首次配送日变量与约束（只绑代表路线） ----
+    # earliest[cid] = 代表路线的配送日（载量最小的那条）
+    # BETA 只推这一条路线 → 其余路线靠 ALPHA 聚类惩罚自然拉开
+    earliest = {}
+    if has_priority:
+        for cid in priority_nodes:
+            earliest[cid] = pulp.LpVariable(f"Earliest_Node_{cid}",
+                                            lowBound=0, upBound=DelivDay - 1, cat='Continuous')
+            rep_r, _ = priority_route_info[cid]
+            for d in range(DelivDay):
+                prob2 += earliest[cid] >= d - DelivDay * (1 - x[rep_r, d])
 
     # ---- 目标函数：峰值最小化 + 聚类惩罚 + 优先级逆序惩罚 ----
     obj_terms = [Z]
     if penalties:
         obj_terms.append(ALPHA * pulp.lpSum(penalties))
     if has_priority:
+        # 只惩罚代表路线（载量最小的那条），避免全量网点箱数绑架BETA
+        # 缺货概率 × 首次配送日 × 代表路线载量
         priority_pen = pulp.lpSum(
-            route_priority[r] * d * route_load[r] * x[r, d]
-            for r in range(num_routes) for d in range(DelivDay)
+            priority_nodes[cid] * earliest[cid] * priority_route_info[cid][1]
+            for cid in priority_nodes
         )
         obj_terms.append(BETA * priority_pen)
-        high_pri_routes = int(np.sum(route_priority > 0.5))
-        logging.info(f"[ILP优先级确认] 缺货概率>0.5的路线={high_pri_routes}/{num_routes}, "
-                     f"BETA={BETA}, 最大优先级={route_priority.max():.4f}, "
-                     f"平均={route_priority[route_priority>0].mean():.4f}")
+        high_pri_nodes = sum(1 for cid in priority_nodes if priority_nodes[cid] > 0.5)
+        max_pri = max(priority_nodes.values())
+        avg_pri = sum(priority_nodes.values()) / len(priority_nodes)
+        total_rep_load = sum(v[1] for v in priority_route_info.values())
+        logging.info(f"[ILP首次配送] 缺货概率>0.5的网点={high_pri_nodes}/{len(priority_nodes)}, "
+                     f"BETA={BETA}, 代表路线总载量={total_rep_load:.0f}箱, "
+                     f"最大优先级={max_pri:.4f}, 平均={avg_pri:.4f}")
     prob2 += pulp.lpSum(obj_terms)
 
     for r in range(num_routes):
@@ -1413,6 +1502,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             if type_routes:
                 daily_limit = daily_vehicle_limits.get(d, {}).get(v_type, VNums[v]) if daily_vehicle_limits else VNums[v]
                 prob2 += pulp.lpSum(x[r, d] for r in type_routes) <= daily_limit
+
+    # 硬约束：禁止同网点同日多路线（同一网点每天最多1条路线）
+    for cid, r_list in node_routes_ilp.items():
+        unique_routes = list(set(r_list))
+        if len(unique_routes) > 1:
+            for d in range(DelivDay):
+                prob2 += pulp.lpSum(x[r, d] for r in unique_routes) <= 1
 
     for d in range(DelivDay):
         prob2 += pulp.lpSum(x[r, d] * sum(amt for _, amt in best_sol[r]['deliveries']) for r in range(num_routes)) <= Z
@@ -1429,5 +1525,110 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             if x[r, d].varValue and x[r, d].varValue >= 0.5:
                 best_sol[r]['schedule_day_idx'] = d
                 break
+
+    # ---- ILP 后诊断：高优先级网点的首次配送日期 ----
+    if has_priority:
+        logging.info("=" * 70)
+        logging.info(f"[首次配送诊断] 缺货优先级>0的网点共{len(priority_nodes)}个:")
+        # 按优先级降序排列
+        sorted_pri = sorted(priority_nodes.items(), key=lambda x: -x[1])
+        logging.info(f"{'排名':<4} {'网点':>6} {'缺货概率':>8} {'网点总箱数':>10} {'首次配送日':>10} {'路线数':>6}")
+        logging.info("-" * 70)
+        day_dist = defaultdict(int)
+        for rank, (cid, pri) in enumerate(sorted_pri, 1):
+            e_val = earliest[cid].varValue if earliest[cid].varValue is not None else -1
+            day_dist[int(e_val)] += 1
+            n_routes = len(set(node_routes_ilp[cid]))  # 去重：同路线多条目只算一次
+            logging.info(f"{rank:<4} {cid:>6} {pri:>8.4f} {node_load_ilp[cid]:>10.0f} "
+                         f"{'D'+str(int(e_val)):>9} {n_routes:>6}")
+        logging.info("-" * 70)
+        early_nodes = sum(1 for cid in priority_nodes
+                          if earliest[cid].varValue is not None and earliest[cid].varValue <= DelivDay * 0.25)
+        late_nodes = sum(1 for cid in priority_nodes
+                         if earliest[cid].varValue is not None and earliest[cid].varValue >= DelivDay * 0.75)
+        logging.info(f"月初25%天内的首次配送: {early_nodes}个网点, "
+                     f"月末25%天内的首次配送: {late_nodes}个网点")
+        if priority_nodes:
+            avg_first_day = sum(earliest[cid].varValue for cid in priority_nodes
+                                if earliest[cid].varValue is not None) / len(priority_nodes)
+            logging.info(f"加权平均首次配送日: {avg_first_day:.2f} / {DelivDay-1}天")
+        logging.info("=" * 70)
+
+    # ---- 每日车辆配额使用率诊断 ----
+    logging.info("=" * 70)
+    logging.info(f"[每日配额使用率] 共{DelivDay}天, {num_routes}条路线:")
+    for d in range(DelivDay):
+        parts = []
+        for v in range(VeTypeNum):
+            v_type = v + 1
+            type_routes = [r for r in range(num_routes) if int(best_sol[r].get('vehicle_type', 1)) == v_type]
+            daily_limit = daily_vehicle_limits.get(d, {}).get(v_type, VNums[v]) if daily_vehicle_limits else VNums[v]
+            scheduled = int(sum(1 for r in type_routes if x[r, d].varValue and x[r, d].varValue >= 0.5))
+            if daily_limit > 0:
+                pct = scheduled / daily_limit * 100
+                mark = " ←满!" if scheduled >= daily_limit else ""
+                parts.append(f"车型{v_type}:{scheduled}/{daily_limit}({pct:.0f}%){mark}")
+            elif scheduled > 0:
+                parts.append(f"车型{v_type}:{scheduled}/0 ⚠超配额!")
+        if parts:
+            logging.info(f"  D{d:>2}: " + " | ".join(parts))
+    logging.info("=" * 70)
+
+    # ---- 小需求拆分诊断：箱数少却被拆成多路线的网点 ----
+    fragmented = []
+    for cid, r_list in node_routes_ilp.items():
+        total = node_load_ilp[cid]
+        unique_routes = list(set(r_list))  # 去重：同一条路线同一网点出现两次只算一次
+        n = len(unique_routes)
+        if total < 100 and n >= 2:
+            route_details = []
+            for r in unique_routes:
+                day = best_sol[r]['schedule_day_idx']
+                # 该路线中此网点的总箱数（可能跨多个delivery条目）
+                load = sum(a for c, a in best_sol[r]['deliveries'] if c == cid)
+                other_nodes = list(set(c for c, _ in best_sol[r]['deliveries'] if c != cid))
+                route_details.append((r, day, load, other_nodes))
+            fragmented.append((cid, total, n, route_details))
+    if fragmented:
+        logging.warning(f"[小需求拆分] {len(fragmented)}个网点(总需求<100箱)被拆成≥2条路线:")
+        for cid, total, n, route_details in sorted(fragmented, key=lambda x: x[1]):
+            logging.warning(f"  网点{cid}: 总{total:.0f}箱 → {n}条路线:")
+            for r, day, load, others in route_details:
+                other_str = f" 拼网点{others}" if others else " 独立"
+                logging.warning(f"    路线{r} D{day}: {load:.0f}箱{other_str}")
+    else:
+        logging.info(f"[小需求拆分] ✓ 无小需求被拆分")
+    # ========================================================================
+
+    # ---- 同网点同日/连续日配送检查 ----
+    bad_nodes = []
+    for cid, r_list in node_routes_ilp.items():
+        unique_routes = set(r_list)
+        if len(unique_routes) <= 1:
+            continue
+        days = sorted(int(best_sol[r]['schedule_day_idx']) for r in unique_routes)
+        # 检查同日多路线
+        same_day = any(days.count(d) > 1 for d in set(days))
+        # 检查连续日
+        consecutive = any(days[i+1] - days[i] == 1 for i in range(len(days) - 1))
+        if same_day or consecutive:
+            bad_nodes.append((cid, days, len(unique_routes), same_day, consecutive))
+    if bad_nodes:
+        total_nodes = len(node_routes_ilp)
+        logging.warning(f"[配送间隔] {len(bad_nodes)}/{total_nodes} 个网点存在同日或连续日配送:")
+        same_count = sum(1 for _, _, _, s, _ in bad_nodes if s)
+        cons_count = sum(1 for _, _, _, _, c in bad_nodes if c)
+        logging.warning(f"  同日多路线: {same_count}个 | 连续工作日: {cons_count}个")
+        bad_nodes.sort(key=lambda x: -x[2])
+        for cid, days, n_routes, same, cons in bad_nodes[:10]:
+            tags = []
+            if same: tags.append("同日")
+            if cons: tags.append("连续")
+            logging.warning(f"  网点{cid}: {n_routes}条路线, 配送日={days} [{','.join(tags)}]")
+        if len(bad_nodes) > 10:
+            logging.warning(f"  ... 共{len(bad_nodes)}个网点")
+    else:
+        logging.info(f"[配送间隔] ✓ 所有网点配送日均已拉开，无同日或连续工作日配送")
+    # ========================================================================
 
     return best_sol

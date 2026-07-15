@@ -174,9 +174,21 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         logging.info(f"[每日运力] 车型{vt}: 日配额={daily_list}, 月总={sum(daily_list)}")
     # =========================================================================
 
+    # ---- 近中心网点：离省库很近的网点之间免角度约束 ----
+    NEAR_CENTER_ORGS = {'3440101', '3440102', '3440103', '3440105', '34401'}
+    near_center_nodes = set()
+    for i in range(LocationNum):
+        org_no = str(locations.loc[i + 1, 'ORG_NO'])
+        if org_no in NEAR_CENTER_ORGS:
+            near_center_nodes.add(i + 1)  # 1-based node ID
+    if near_center_nodes:
+        logging.info(f"[近中心豁免] 识别到{len(near_center_nodes)}个近中心网点: node={sorted(near_center_nodes)}")
+    # ====================================================================
+
     ScheduledRoutes = GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList,
                                    actual_deliv_days, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT,
-                                   node_priority, daily_vehicle_limits, vehicle_types=all_vehicle_types)
+                                   node_priority, daily_vehicle_limits, vehicle_types=all_vehicle_types,
+                                   near_center_nodes=near_center_nodes if near_center_nodes else None)
 
     # 【诊断】排程后装箱前：汇总 ALNS 配送结果
     sched_total_boxes = 0.0

@@ -1511,8 +1511,12 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             best_sol = swap_merge_routes(best_sol)
             best_sol = dismantle_low_load_routes(best_sol, min_load_rate=0.45)
             best_sol = optimize_vehicle_types(best_sol)
-            # 需求会计：检测合并/拆解静默丢弃的需求
-            dropped_merge = _compute_dropped(best_sol)
+            # 先修复超载，再需求会计抓缺口
+            best_sol, dropped_merge = reassign_vehicles(best_sol)
+            real_dropped = _compute_dropped(best_sol)
+            for cid, amt in real_dropped.items():
+                dropped_merge[cid] = dropped_merge.get(cid, 0) + amt
+            dropped_merge = {c: a for c, a in dropped_merge.items() if a > 0.001}
             retry_m = 0
             while dropped_merge and retry_m < 100:
                 best_sol, remaining = greedy_insertion(best_sol, dropped_merge)
@@ -1584,8 +1588,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     best_sol = optimize_vehicle_types(best_sol)
     best_sol = _relocate_improve(best_sol, max_passes=5)
 
-    # 需求会计：最终合并可能静默丢需求
-    dropped = _compute_dropped(best_sol)
+    # 先跑 reassign_vehicles 修复超载（合并操作可能导致路线超容）
+    best_sol, dropped = reassign_vehicles(best_sol)
+    # 再用需求会计抓出所有缺口（包括 reassign 截断的 + 静默丢失的）
+    real_dropped = _compute_dropped(best_sol)
+    for cid, amt in real_dropped.items():
+        dropped[cid] = dropped.get(cid, 0) + amt
+    dropped = {c: a for c, a in dropped.items() if a > 0.001}
     retry = 0
     while dropped:
         prev_dropped_sum = sum(dropped.values())
