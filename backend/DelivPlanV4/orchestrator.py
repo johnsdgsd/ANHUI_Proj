@@ -89,7 +89,10 @@ def run_deliv_plan_v4(date_str):
      ) = _v3_load_deliv_data(date_str)
 
     dmat_arr = dmat.values if isinstance(dmat, pd.DataFrame) else dmat
-    dmat_arr = np.maximum(dmat_arr, dmat_arr.T)
+    # 只补齐缺失方向，不覆盖已有数据（正反向距离可能不对称，取大值会丢失方向信息）
+    mask_zero = (dmat_arr == 0)
+    mask_rev_has = (dmat_arr.T > 0)
+    dmat_arr[mask_zero & mask_rev_has] = dmat_arr.T[mask_zero & mask_rev_has]
 
     timing['load'] = time.time() - t0
 
