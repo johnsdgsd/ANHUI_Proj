@@ -2569,3 +2569,439 @@ def query_adam_org_stock_sample_estimated(target_month: str):
                  f'上月={prev_month}, 剩余{remaining_days}/{days_in_prev}天')
 
     return result[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']]
+
+
+# ============================================================
+# 二阶段 (R,S) 补货算法 — 数据访问函数
+# ============================================================
+
+logger = logging.getLogger(__name__)
+
+
+def query_adam_sys_param():
+    """查询供电所补库系统参数（ADAM_SYS_PARAM）
+
+    Returns:
+        pd.DataFrame: 列 REC_ORG_NO, REPLEISHMENT_CYCLE, TARGET_CYCLE_SERVICE_LEVEL, CYCLE_BASE_START_DATE
+    """
+    logger.info("[RS] 查询 ADAM_SYS_PARAM...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sys-param'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("ADAM_SYS_PARAM 返回数据为空")
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        logger.info(f"[RS] ADAM_SYS_PARAM 查询成功: {len(df)} 条, "
+                    f"供电所 {len(df[df['REC_ORG_NO'] != '0000'])} 个 + 默认 1 条")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("[RS] ADAM_SYS_PARAM 查询网络异常")
+        raise
+    except Exception:
+        logger.exception("[RS] ADAM_SYS_PARAM 查询失败")
+        raise
+
+
+def query_adam_city_county_stock_sample(data_date: str):
+    """根据数据日期查询市县公司库存快照（ADAM_CITY_COUNTY_STOCK_SAMPLE）
+
+    Args:
+        data_date: 数据日期，格式 'YYYY-MM-DD'
+
+    Returns:
+        pd.DataFrame
+    """
+    logger.info(f"[RS] 查询 ADAM_CITY_COUNTY_STOCK_SAMPLE (DATA_DATE={data_date})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-city-county-stock-sample'
+        url = f"http://{host}:{port}{endpoint}"
+        json_data = {"data_date": data_date}
+        response = session.post(url, json=json_data)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            logger.warning(f"[RS] 市县库存快照返回数据为空 (DATA_DATE={data_date})")
+            return pd.DataFrame()
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        logger.info(f"[RS] 库存快照查询成功: {len(df)} 条, "
+                    f"供电所 {df['ORG_NO'].nunique()} 个")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception(f"[RS] 库存快照查询网络异常 (DATA_DATE={data_date})")
+        raise
+    except Exception:
+        logger.exception(f"[RS] 库存快照查询失败 (DATA_DATE={data_date})")
+        raise
+
+
+def query_adam_sub_dmd_pre(pre_type: str, start_date: str, end_date: str):
+    """查询供电所日需求预测（ADAM_SUB_DMD_PRE），按日期范围 + 预测类型筛选
+
+    Args:
+        pre_type: 预测类型，'05' 为日预测
+        start_date: 起始日期，格式 'YYYY-MM-DD'
+        end_date: 截止日期，格式 'YYYY-MM-DD'
+
+    Returns:
+        pd.DataFrame: 列 SUB_DMD_PRE_ID, PRE_TYPE, PRE_DATE, BUS_TYPE, ORG_NO, DEV_CODE, PRE_NUM 等
+    """
+    logger.info(f"[RS] 查询 ADAM_SUB_DMD_PRE (PRE_TYPE={pre_type}, {start_date} ~ {end_date})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sub-dmd-pre'
+        url = f"http://{host}:{port}{endpoint}"
+        json_data = {
+            "pre_type": pre_type,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        response = session.post(url, json=json_data)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            logger.warning(f"[RS] 供电所需求预测返回数据为空 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+            return pd.DataFrame()
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        logger.info(f"[RS] 需求预测查询成功: {len(df)} 条, "
+                    f"供电所 {df['ORG_NO'].nunique()} 个, "
+                    f"日期 {df['PRE_DATE'].nunique()} 天")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception(f"[RS] 需求预测查询网络异常 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+        raise
+    except Exception:
+        logger.exception(f"[RS] 需求预测查询失败 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+        raise
+
+
+def insert_into_adam_replenish_order(df: pd.DataFrame):
+    """批量插入补货建议数据到 ADAM_REPLENISH_ORDER 表
+
+    Args:
+        df: DataFrame，包含以下列：
+            - ORDER_ID: 主键
+            - ORG_NO: 供电所编码
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - DEV_CODE: 设备码
+            - REPLENISH_QTY: 建议补货量
+            - TARGET_STOCK_S: 基准库存 S
+            - CAL_DATE: 计算日期
+            - CREATE_TIME: 记录创建时间
+
+    Returns:
+        dict: 插入结果
+    """
+    import math
+    batch_size = 100
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert-into-adam-replenish-order'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # NaN/Inf 处理
+        df = df.astype(object).where(df.notna(), None)
+        records = df.rename(columns=str.lower).to_dict('records')
+        for r in records:
+            for k, v in r.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    r[k] = None
+
+        total = len(records)
+        batches = math.ceil(total / batch_size)
+        logger.info(f"[RS] 批量插入 ADAM_REPLENISH_ORDER: 共 {total} 条, 分 {batches} 批(每批 {batch_size} 条)")
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for i in range(0, total, batch_size):
+            chunk = records[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                response = session.post(url, json=chunk)
+                response.raise_for_status()
+                success_count += len(chunk)
+                logger.info(f"[RS] 批量插入 ADAM_REPLENISH_ORDER 第 {batch_no}/{batches} 批成功, {len(chunk)} 条")
+            except Exception as e:
+                failed_count += len(chunk)
+                errors.append({"batch": batch_no, "count": len(chunk), "error": str(e)})
+                logger.error(f"[RS] 批量插入 ADAM_REPLENISH_ORDER 第 {batch_no}/{batches} 批失败: {e}")
+
+        result = {
+            "success": failed_count == 0,
+            "message": f"补货建议批量插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "batches": batches,
+            "errors": errors if errors else None
+        }
+        logger.info(f"[RS] 补货建议插入完毕: 成功 {success_count}/{total} 条")
+        return result
+    except requests.exceptions.RequestException:
+        logger.exception("[RS] 批量插入 ADAM_REPLENISH_ORDER 网络异常")
+        raise
+    except Exception:
+        logger.exception("[RS] 批量插入 ADAM_REPLENISH_ORDER 失败")
+        raise
+
+
+def insert_into_adam_model_think_log(model_think_log_id: int, pre_conc_id: int,
+                                     model_no: str, think_log: str):
+    """插入单条模型思考日志到 ADAM_MODEL_THINK_LOG 表，自动补齐创建时间
+
+    Args:
+        model_think_log_id: 主键，模型思考日志唯一标识
+        pre_conc_id: 预测结论唯一标识（外键）
+        model_no: 模型编号
+        think_log: 思考日志内容（max 4000）
+
+    Returns:
+        dict: 插入结果
+    """
+    from datetime import datetime
+
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert-into-adam-model-think-log'
+        url = f"http://{host}:{port}{endpoint}"
+
+        json_data = {
+            "model_think_log_id": model_think_log_id,
+            "pre_conc_id": pre_conc_id,
+            "model_no": model_no,
+            "think_log": think_log,
+            "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        logger.info(f"插入 ADAM_MODEL_THINK_LOG: ID={model_think_log_id}, MODEL={model_no}")
+        response = session.post(url, json=json_data)
+        response.raise_for_status()
+        logger.info(f"ADAM_MODEL_THINK_LOG 插入成功: ID={model_think_log_id}")
+        return {"success": True, "message": f"模型思考日志插入成功, ID={model_think_log_id}"}
+
+    except requests.exceptions.RequestException:
+        logger.exception(f"插入 ADAM_MODEL_THINK_LOG 网络异常: ID={model_think_log_id}")
+        raise
+    except Exception:
+        logger.exception(f"插入 ADAM_MODEL_THINK_LOG 失败: ID={model_think_log_id}")
+        raise
+
+
+# ============================================================
+# 仓网布局优化 — 数据访问函数
+# ============================================================
+
+
+def query_adam_station_demand_mapped():
+    """查询供电所年需求（含新旧码映射、有效设备筛选、单价、规格）
+
+    Returns:
+        pd.DataFrame: STATION_ORG_CODE, DEV_CODE, DEV_CLS, DEV_CATEG,
+                      DEV_CODE_DESC, AVG_PRICE, ANNUAL_DEMAND
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-station-demand-mapped'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("年需求查询返回数据为空")
+        df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
+        logger.info(f"仓网布局-年需求(映射后): {len(df)} 行, "
+                     f"{df['DEV_CODE'].nunique()} 设备码, {df['STATION_ORG_CODE'].nunique()} 供电所")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-年需求查询网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-年需求查询失败")
+        raise
+
+
+def query_adam_warehouse_candidate():
+    """查询候选库房列表
+
+    Returns:
+        pd.DataFrame: WH_ID, ORG_NO, WH_NAME, WH_LON, WH_LAT,
+                      WH_ADDR, FIXED_COST_F, TRANS_DIST, IS_ACTIVE
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-warehouse-candidate'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("候选库房查询返回数据为空")
+        df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
+        logger.info(f"仓网布局-候选库房: {len(df)} 个")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-候选库房查询网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-候选库房查询失败")
+        raise
+
+
+def query_adam_power_station_active():
+    """查询活跃供电所列表
+
+    Returns:
+        pd.DataFrame: STATION_ID, STATION_ORG_CODE, STATION_NAME,
+                      STATION_ADDR, STATION_LON, STATION_LAT, ORG_NO, IS_ACTIVE
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-power-station-active'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("供电所查询返回数据为空")
+        df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
+        logger.info(f"仓网布局-活跃供电所: {len(df)} 个")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-供电所查询网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-供电所查询失败")
+        raise
+
+
+def query_adam_station_dist_mist():
+    """查询供电所与各市县距离矩阵
+
+    Returns:
+        pd.DataFrame: STATION_MIST_ID, ORG_NO, STATION_ORG_CODE, DISTANCE
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-station-dist-mist'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            raise ValueError("距离矩阵查询返回数据为空")
+        df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
+        logger.info(f"仓网布局-距离矩阵: {len(df)} 行, "
+                     f"{df['ORG_NO'].nunique()} 库房, {df['STATION_ORG_CODE'].nunique()} 供电所")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-距离矩阵查询网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-距离矩阵查询失败")
+        raise
+
+
+def insert_adam_layout_result(df: pd.DataFrame):
+    """插入仓网布局结果主表
+
+    Args:
+        df: DataFrame, 列 RESULT_ID, SCENARIO_CODE, WEIGHT,
+            OBJECTIVE_COST, OBJECTIVE_DIST, CREATE_TIME
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert-adam-layout-result'
+        url = f"http://{host}:{port}{endpoint}"
+        records = df.rename(columns=str.lower).to_dict('records')
+        success_count = 0
+        failed_count = 0
+        for record in records:
+            try:
+                response = session.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"仓网布局-结果主表插入失败: {e}")
+        logger.info(f"仓网布局-结果主表插入完成: 成功 {success_count}, 失败 {failed_count}")
+        return {
+            "success": failed_count == 0,
+            "message": f"结果主表插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+        }
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-结果主表插入网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-结果主表插入失败")
+        raise
+
+
+def insert_adam_layout_result_det(df: pd.DataFrame):
+    """插入仓网布局结果明细表
+
+    Args:
+        df: DataFrame, 列 RESULT_DET_ID, RESULT_ID, SCENARIO_CODE,
+            ORG_NO, STATION_ORG_CODE, CREATE_TIME
+
+    Returns:
+        dict: 插入结果
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert-adam-layout-result-det'
+        url = f"http://{host}:{port}{endpoint}"
+        records = df.rename(columns=str.lower).to_dict('records')
+        success_count = 0
+        failed_count = 0
+        for record in records:
+            try:
+                response = session.post(url, json=record)
+                response.raise_for_status()
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"仓网布局-结果明细插入失败: {e}")
+        logger.info(f"仓网布局-结果明细插入完成: 成功 {success_count}, 失败 {failed_count}")
+        return {
+            "success": failed_count == 0,
+            "message": f"结果明细插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+        }
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-结果明细插入网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-结果明细插入失败")
+        raise
