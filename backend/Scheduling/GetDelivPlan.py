@@ -10,7 +10,7 @@ import logging
 import sys
 
 
-def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None, near_center_nodes=None, work_days=None):
+def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None, near_center_nodes=None, work_days=None, node_org_map=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     '''1. 提取基础参数与箱数转换'''
@@ -77,6 +77,80 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         return DMAT_arr[id1, id2]
 
     # ====================================================================
+    # 【新增】合肥库房约束基础设施
+    # ====================================================================
+    HEFEI_ORGS = {'34401', '3440101', '3440102', '3440103'}
+    hefei_nodes = set()
+    _node_org = {}  # {node_id: org_no_str}
+    if node_org_map:
+        _node_org = node_org_map
+        for nid, org in node_org_map.items():
+            if str(org).strip() in HEFEI_ORGS:
+                hefei_nodes.add(nid)
+
+    def _same_city(nid1, nid2):
+        """两个 node 是否同市（ORG_NO 前5位相等）"""
+        o1 = str(_node_org.get(nid1, '')).strip()
+        o2 = str(_node_org.get(nid2, '')).strip()
+        if not o1 or not o2 or len(o1) < 5 or len(o2) < 5:
+            return False
+        return o1[:5] == o2[:5]
+
+    def _best_fitting_cap(load):
+        """找能装下 load 的最小车型容量"""
+        for cfg in VEHICLE_CONFIG:
+            if cfg['cap'] >= load:
+                return cfg['cap']
+        return VEHICLE_CONFIG[-1]['cap']
+
+    def _check_hefei_constraint(deliveries, new_cid=None, new_amt=0):
+        """
+        合肥约束检查，返回 (ok, reason)
+        约束2: Hefei 库房不能与 150km 内非 Hefei 库房拼车
+        约束3: Hefei 路线装载率 >= 70% 不能带非 Hefei
+        """
+        if not hefei_nodes:
+            return (True, '')
+        # 构建临时 deliveries 列表
+        tmp = list(deliveries)
+        if new_cid is not None:
+            # 合并同 cid 的条目
+            found = False
+            for i, (c, a) in enumerate(tmp):
+                if c == new_cid:
+                    tmp[i] = (c, a + new_amt)
+                    found = True
+                    break
+            if not found:
+                tmp.append((new_cid, new_amt))
+
+        has_hefei = any(c in hefei_nodes for c, _ in tmp)
+        if not has_hefei:
+            return (True, '')
+
+        # 约束2: Hefei 节点 150km 隔离
+        for cid, _ in tmp:
+            if cid not in hefei_nodes:
+                continue
+            for other, _ in tmp:
+                if other == cid or other in hefei_nodes:
+                    continue
+                d = get_dist(cid, other)
+                if d <= 150:
+                    return (False, f'Hefei{cid}与非Hefei{other}距{d:.0f}km≤150')
+
+        # 约束3: Hefei 路线装载率 >= 70% 隔离
+        total_load = sum(a for _, a in tmp)
+        cap = _best_fitting_cap(total_load)
+        load_rate = total_load / cap if cap > 0 else 0
+        if load_rate >= 0.70:
+            non_hefei = [c for c, _ in tmp if c not in hefei_nodes]
+            if non_hefei:
+                return (False, f'Hefei路线装载率{load_rate:.0%}≥70%含非Hefei{non_hefei}')
+
+        return (True, '')
+
+    # ====================================================================
     # 【核心约束 1】：8方向切分（利用余弦定理计算夹角，小于45度）
     # ====================================================================
     def check_angle_constraint(cid1, cid2):
@@ -139,7 +213,26 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     def optimize_route_sequence(route):
         deliveries = route['deliveries']
         if len(deliveries) <= 1: return route
-        route['deliveries'] = sorted(deliveries, key=lambda x: get_dist(0, x[0]))
+        # 1) 按距离省中心由近及远排列
+        deliveries = sorted(deliveries, key=lambda x: get_dist(0, x[0]))
+        # 2) 约束1: 同市库房 → 箱数最大的排最前面（全局，不限相邻）
+        if _node_org:
+            # 收集每个市的全部节点位置
+            city_positions = defaultdict(list)  # {city_prefix: [(idx, cid, boxes), ...]}
+            for idx, (cid, boxes) in enumerate(deliveries):
+                org = str(_node_org.get(cid, '')).strip()
+                if len(org) >= 5:
+                    city_positions[org[:5]].append((idx, cid, boxes))
+            # 对同市有多个节点的组，按箱数降序重排
+            for city, items in city_positions.items():
+                if len(items) <= 1:
+                    continue
+                # 按箱数降序
+                sorted_items = sorted(items, key=lambda x: -x[2])
+                # 保持 idx 位置不变，替换 cid/boxes
+                for pos, (orig_idx, _, _) in enumerate(items):
+                    deliveries[orig_idx] = (sorted_items[pos][1], sorted_items[pos][2])
+        route['deliveries'] = deliveries
         return route
 
     def reassign_vehicles(routes):
@@ -207,7 +300,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     else:
                         temp['deliveries'].append((cid, amt))
                     temp = optimize_route_sequence(temp)
-                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and \
+                       _check_hefei_constraint(temp['deliveries'])[0]:
                         waste = space - amt
                         # 同网点路线大幅优先（防止需求被拆散到其他路线）
                         if has_cid:
@@ -244,7 +338,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     else:
                         temp['deliveries'].append((cid, take))
                     temp = optimize_route_sequence(temp)
-                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and \
+                       _check_hefei_constraint(temp['deliveries'])[0]:
                         waste = space - take
                         score = waste - 0.3 * space  # 空间大也加分
                         if has_cid:
@@ -360,7 +455,9 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         temp_j = optimize_route_sequence(temp_j)
 
                         if calc_route_distance(temp_i['deliveries']) <= MAX_ROUTE_DIST and \
-                           calc_route_distance(temp_j['deliveries']) <= MAX_ROUTE_DIST:
+                           calc_route_distance(temp_j['deliveries']) <= MAX_ROUTE_DIST and \
+                           _check_hefei_constraint(temp_i['deliveries'])[0] and \
+                           _check_hefei_constraint(temp_j['deliveries'])[0]:
                             new_cost = eval_route_fitness(temp_i) + eval_route_fitness(temp_j)
                             saving = (old_cost_i + old_cost_j) - new_cost
                             if saving > best_saving:
@@ -429,7 +526,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                     # 距离约束
                     merged = {'vehicle_type': fit_cfg['type'], 'deliveries': combined}
                     merged = optimize_route_sequence(merged)
-                    if calc_route_distance(merged['deliveries']) <= MAX_ROUTE_DIST:
+                    if calc_route_distance(merged['deliveries']) <= MAX_ROUTE_DIST and \
+                       _check_hefei_constraint(merged['deliveries'])[0]:
                         old_cost = eval_route_fitness(routes[i]) + eval_route_fitness(routes[j])
                         new_cost = eval_route_fitness(merged)
                         if new_cost < old_cost:
@@ -664,7 +762,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                                 if len(combined_nodes) <= 3 and _check_route_angle(combined_nodes):
                                     merged = {'vehicle_type': fit_cfg['type'], 'deliveries': combined_dels}
                                     merged = optimize_route_sequence(merged)
-                                    if calc_route_distance(merged['deliveries']) <= MAX_ROUTE_DIST:
+                                    if calc_route_distance(merged['deliveries']) <= MAX_ROUTE_DIST and \
+                                       _check_hefei_constraint(merged['deliveries'])[0]:
                                         new_cost_merge = eval_route_fitness(merged)
                                         gain_merge = old_cost - new_cost_merge
                                         merged_route = merged
@@ -754,7 +853,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         else:
                             temp['deliveries'].append((cid, amt))
                         temp = optimize_route_sequence(temp)
-                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and                            _check_hefei_constraint(temp['deliveries'])[0]:
                             fit = eval_route_fitness(temp)
                             if fit < best_fit:
                                 best_fit = fit
@@ -903,7 +1002,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
 
                         temp = optimize_route_sequence(temp)
 
-                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and \
+                           _check_hefei_constraint(temp['deliveries'])[0]:
                             fit = eval_route_fitness(temp)
                             if has_cid:
                                 fit *= 0.5
@@ -963,7 +1063,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         temp['deliveries'].append((cid, ins_amt))
                     temp = optimize_route_sequence(temp)
 
-                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and                        _check_hefei_constraint(temp['deliveries'])[0]:
                         fit = eval_route_fitness(temp)
                         if has_cid:
                             fit *= 0.5
@@ -1071,7 +1171,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             temp['deliveries'].append((cid, amt))
                         temp = optimize_route_sequence(temp)
 
-                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST:
+                        if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and                            _check_hefei_constraint(temp['deliveries'])[0]:
                             routes[rj]['deliveries'] = temp['deliveries']
                             moved = True
                             break
@@ -1321,7 +1421,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         for cid, amt in r['deliveries']: merged[cid] += amt
         if len(merged) < len(r['deliveries']):
             dedup_count += len(r['deliveries']) - len(merged)
-            r['deliveries'] = [(c, a) for c, a in merged.items()]
+        r['deliveries'] = [(c, a) for c, a in merged.items()]
+        r = optimize_route_sequence(r)  # 去重后重新排序（约束1）
     if dedup_count > 0:
         logging.info(f"[最终去重] 合并了{dedup_count}条同网点重复记录")
 

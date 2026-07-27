@@ -84,10 +84,11 @@ def _v3_load_deliv_data(date: str):
         VeCap, VNums, VeUnitPrice, VeTypeNum, VeType = query_vehicle_conf(date)
         Demands = pd.DataFrame(np.zeros((LocationNum, SubTypeNum)))
         org_labels = [center_org] + list(tb1['ORG_NO'])
+        org_names = ['营销服务中心'] + list(tb1['STAT_NAME'])
         DMat = pd.DataFrame(np.zeros((LocationNum + 1, LocationNum + 1)),
                             index=org_labels, columns=org_labels)
         return Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMat, \
-            2, VeType, lons, lats, org_labels
+            2, VeType, lons, lats, org_labels, org_names
 
     # ---- 4. 构建需求矩阵 ----
     Location = tb1['ORG_NO']
@@ -188,7 +189,11 @@ def _v3_load_deliv_data(date: str):
     DMAT_arr[mask_zero & mask_rev_has] = DMAT_arr.T[mask_zero & mask_rev_has]
 
     # 构建 org_labels 和 DMat DataFrame
+    # org_labels: [中心ORG_NO, 站点1_ORG_NO, 站点2_ORG_NO, ...] — 与 DMAT_arr 行列顺序一致
+    # org_names:  [中心名称,   站点1名称,    站点2名称,    ...] — V4 用于识别合肥四库房
+    center_name = '营销服务中心'
     org_labels = [center_org] + list(tb1['ORG_NO'])
+    org_names = [center_name] + list(tb1['STAT_NAME'])
 
     # 诊断：检查中心(索引0)→各站点的距离是否缺失
     center_dists = DMAT_arr[0, 1:]
@@ -203,7 +208,7 @@ def _v3_load_deliv_data(date: str):
                  f"非零比={np.count_nonzero(DMAT_arr)/DMAT_arr.size*100:.1f}%")
 
     return Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMat, \
-        MaxLen, VeType, lons, lats, org_labels
+        MaxLen, VeType, lons, lats, org_labels, org_names
 
 
 # ==================== V3 主入口 ====================
@@ -261,7 +266,7 @@ def _adjust_daily_delivery_v3_impl(date: str, max_stops: int, max_iter: int):
     logging.info(f"V3 日配送开始: date={date}, max_stops={max_stops}, max_iter={max_iter}")
     t_start = time.time()
 
-    Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, _, CarTypeStrList, lons, lats, org_labels = \
+    Demands, LocationNum, SubTypeList, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, _, CarTypeStrList, lons, lats, org_labels, _org_names = \
         _v3_load_deliv_data(date)
     SubTypeNum = len(SubTypeList)
     logging.info(f"数据载入完成: {LocationNum} 个配送站点, {SubTypeNum} 种设备, {VeTypeNum} 种车型")

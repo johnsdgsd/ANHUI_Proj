@@ -85,7 +85,7 @@ def run_deliv_plan_v4(date_str):
     total_replenish_pieces, matrix_expected = _query_daily_replenish_total(date_str)
 
     (demands, location_num, sub_type_list, ve_unit_price, ve_type_num,
-     v_nums, ve_cap, dmat, _, car_type_str_list, _, _, org_labels
+     v_nums, ve_cap, dmat, _, car_type_str_list, _, _, org_labels, org_names
      ) = _v3_load_deliv_data(date_str)
 
     dmat_arr = dmat.values if isinstance(dmat, pd.DataFrame) else dmat
@@ -177,8 +177,41 @@ def run_deliv_plan_v4(date_str):
     # ---- 5. Stage 1: 候选路径枚举 ----
     t0 = time.time()
     logging.info(f"[V4] Step 5/6: Stage1 候选路径枚举...")
+
+    # ---- V4: 识别合肥四库房 + 构建城市分组 ----
+    # 合肥四库房 = 合肥本部, 肥东, 肥西, 长丰 (巢湖不算)
+    # 通过站点名称关键词匹配，从 org_names[node_id] 中识别
+    HEFEI_FOUR_KEYWORDS = ['合肥本部', '肥东', '肥西', '长丰']
+    hefei_node_ids = set()
+    node_to_group = {}  # {node_id: city_code}，城市编码 = ORG_NO 前5位
+    for i in range(1, len(org_labels)):
+        org = str(org_labels[i]).strip()
+        if len(org) >= 5:
+            node_to_group[i] = org[:5]  # i 即 node_id (1-indexed)
+        # 站点名称匹配：org_names[i] 包含合肥四库房关键词
+        if i < len(org_names):
+            name = str(org_names[i])
+            for kw in HEFEI_FOUR_KEYWORDS:
+                if kw in name:
+                    hefei_node_ids.add(i)
+                    break
+    if hefei_node_ids:
+        hefei_detail = ", ".join(
+            f"站点{n}({org_names[n] if n < len(org_names) else '?'})"
+            for n in sorted(hefei_node_ids)
+        )
+        logging.info(f"[V4] 识别到合肥四库房({len(hefei_node_ids)}个): {hefei_detail}")
+        if len(hefei_node_ids) != 4:
+            logging.warning(f"[V4] ⚠ 合肥四库房数量异常: 期望4个, 实际{len(hefei_node_ids)}个, "
+                            f"请检查关键词 {HEFEI_FOUR_KEYWORDS}")
+    else:
+        logging.warning("[V4] ⚠ 未识别到任何合肥四库房! "
+                        f"请检查站点名称中是否包含 {HEFEI_FOUR_KEYWORDS}")
+
     candidates = enumerate_candidate_paths(
-        demand_units, dmat_arr, max_cap, MAX_ROUTE_DIST
+        demand_units, dmat_arr, max_cap, MAX_ROUTE_DIST,
+        hefei_node_ids=hefei_node_ids if hefei_node_ids else None,
+        node_to_group=node_to_group if node_to_group else None
     )
     timing['stage1'] = time.time() - t0
 

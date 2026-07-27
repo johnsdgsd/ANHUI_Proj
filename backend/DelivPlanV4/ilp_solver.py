@@ -55,110 +55,174 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
         for uid in unit_ids:
             coverage[(r, uid)] = True
 
-    # ---- 3. 预计算车型兼容性 ----
-    compat = {}
-    compat_count_per_type = defaultdict(int)  # 每种车型兼容的路径数
+    # ---- 3. 预计算每条路线的最小可行车型 ----
+    # 优先选用小车：先尝试只开放最小车型，配额不够时逐步放开大车型
+    from backend.DelivPlanV4.config import HEFEI_DEDICATED_LOAD_RATE
+    route_min_type = {}  # {r: min_t}，每条路线能装下的最小车型索引
     for r in range(num_candidates):
         load = candidates[r]['load']
         for t in range(num_types):
             if vehicle_config[t]['cap'] >= load - 0.01:
+                route_min_type[r] = t
+                break
+        # 所有车型都装不下 → 不设 min_type，该路线不会进入 compat
+
+    # ---- 4. 多轮求解：逐步放开车型限制 ----
+    # extra_types=0: 只允许最小车型（最优装载率）
+    # extra_types=1: 允许最小+次小车型（小型车配额不够的兜底）
+    # extra_types=num_types-1: 允许全部车型（最终兜底，等价于原始行为）
+    last_error = None
+    last_error_detail = ""
+    x, prob, status_str, obj_val = None, None, None, None
+
+    for pass_idx, extra_types in enumerate([0, 1, num_types - 1]):
+        # ---- 4a. 构建本轮兼容矩阵 ----
+        compat = {}
+        compat_count_per_type = defaultdict(int)
+        constraint3_rejected = 0
+
+        for r in range(num_candidates):
+            min_t = route_min_type.get(r)
+            if min_t is None:
+                continue  # 所有车型都装不下，跳过
+            # 本轮允许的车型范围: [min_t, min(min_t + extra_types, num_types - 1)]
+            max_t = min(min_t + extra_types, num_types - 1)
+            load = candidates[r]['load']
+
+            for t in range(min_t, max_t + 1):
+                cap = vehicle_config[t]['cap']
+                if cap < load - 0.01:
+                    continue
+
+                # ---- V4 约束3: 合肥混合路线满载率 ≥70% 禁止 ----
+                has_hefei = candidates[r].get('has_hefei', False)
+                has_far = candidates[r].get('has_far_node', False)
+                if has_hefei and has_far and cap > 0:
+                    load_rate = load / cap
+                    if load_rate >= HEFEI_DEDICATED_LOAD_RATE - 0.001:
+                        constraint3_rejected += 1
+                        continue
+
                 compat[(r, t)] = True
                 compat_count_per_type[t] += 1
 
-    if not compat:
-        raise ValueError("ILP: 无任何路径-车型兼容组合，请检查容量配置")
-
-    logging.info(
-        f"[Stage2] 兼容矩阵: {len(compat)}个(r,t)组合, " +
-        " | ".join(
-            f"车型{vehicle_config[t]['type']}:{compat_count_per_type[t]}条路径"
-            for t in range(num_types)
+        # 日志：本轮车型限制说明
+        pass_desc = [
+            f"仅最小车型",
+            f"允许2种车型",
+            f"允许全部车型"
+        ][pass_idx]
+        logging.info(
+            f"[Stage2] Pass {pass_idx + 1}/3 ({pass_desc}): "
+            f"兼容矩阵 {len(compat)} 个(r,t)组合, " +
+            " | ".join(
+                f"车型{vehicle_config[t]['type']}:{compat_count_per_type.get(t, 0)}条路径"
+                for t in range(num_types)
+            )
         )
-    )
 
-    # ---- 4. 构建 ILP ----
-    prob = pulp.LpProblem("DelivPlanV4_SetPartition", pulp.LpMinimize)
-
-    # 决策变量: x[(r, t)] ∈ {0, 1}
-    x = {}
-    for (r, t), _ in compat.items():
-        var_name = f"x_{r}_{t}"
-        x[(r, t)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
-
-    logging.info(f"[Stage2] 决策变量: {len(x)}个")
-
-    # 目标函数: min Σ cost_r × price_type × x[(r, t)]
-    obj_terms = []
-    cost_samples = []  # 记录几个样本用于日志
-    for (r, t) in compat:
-        vt = vehicle_config[t]['type']
-        price = float(ve_unit_price[vt - 1])
-        cost_coef = candidates[r]['base_cost'] * price
-        obj_terms.append(cost_coef * x[(r, t)])
-        if len(cost_samples) < 5:
-            cost_samples.append((r, t, candidates[r]['load'], vehicle_config[t]['cap'], cost_coef))
-    prob += pulp.lpSum(obj_terms), "total_cost"
-
-    # 目标函数系数的样本日志
-    logging.info(f"[Stage2] 目标系数样本 (前5个):")
-    for r, t, load, cap, coeff in cost_samples:
-        logging.info(f"  r={r} t={vehicle_config[t]['type']} load={load:.0f} cap={cap:.0f} coeff={coeff:.1f}")
-
-    # 约束1: 每个 demand_unit 恰好覆盖一次
-    coverable_units = 0
-    for u in range(num_units):
-        covering = []
-        for r in range(num_candidates):
-            if coverage.get((r, u)):
-                for t in range(num_types):
-                    if compat.get((r, t)):
-                        covering.append(x[(r, t)])
-        if covering:
-            prob += pulp.lpSum(covering) == 1, f"cover_u{u}"
-            coverable_units += 1
-        else:
-            uid, nid, boxes = demand_units[u]
-            raise ValueError(
-                f"【运力不足，请增加车辆】demand_unit {u} (节点{nid}, {boxes:.0f}箱) "
-                f"无任何候选路径覆盖，当前车辆数无法满足全部需求"
+        if constraint3_rejected > 0:
+            logging.info(
+                f"[Stage2] 约束3: 排除 {constraint3_rejected} 个合肥混合满载(r,t)组合 "
+                f"(阈值={HEFEI_DEDICATED_LOAD_RATE*100:.0f}%)"
             )
 
-    # 约束2: 每车型使用数不超过日配额
-    for t in range(num_types):
-        type_vars = []
-        for r in range(num_candidates):
-            if compat.get((r, t)):
-                type_vars.append(x[(r, t)])
-        if type_vars:
-            quota = vehicle_config[t]['daily_max']
-            prob += pulp.lpSum(type_vars) <= quota, f"quota_type{vehicle_config[t]['type']}"
+        if not compat:
+            last_error_detail = "无任何路径-车型兼容组合"
+            continue
 
-    logging.info(
-        f"[Stage2] ILP规模: 变量={len(x)}, "
-        f"覆盖约束={coverable_units}/{num_units}, 配额约束={num_types}"
-    )
+        # ---- 4b. 构建 ILP ----
+        prob = pulp.LpProblem("DelivPlanV4_SetPartition", pulp.LpMinimize)
 
-    # ---- 5. 求解 ----
-    logging.info(f"[Stage2] 开始CBC求解 (超时{ILP_TIMEOUT_SEC}s, gap=1%)...")
-    solver = pulp.PULP_CBC_CMD(
-        msg=False,
-        options=[f'sec={ILP_TIMEOUT_SEC}', 'ratioGap=0.01']
-    )
-    status = prob.solve(solver)
-    status_str = pulp.LpStatus[status]
-    elapsed = time.time() - t_start
+        # 决策变量: x[(r, t)] ∈ {0, 1}
+        x = {}
+        for (r, t), _ in compat.items():
+            var_name = f"x_{r}_{t}"
+            x[(r, t)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
 
-    obj_val = pulp.value(prob.objective) if status_str in ('Optimal', 'Feasible') else None
-    if obj_val is not None:
+        logging.info(f"[Stage2] 决策变量: {len(x)}个")
+
+        # 目标函数: min Σ cost_r × price_type × x[(r, t)]
+        obj_terms = []
+        cost_samples = []
+        for (r, t) in compat:
+            vt = vehicle_config[t]['type']
+            price = float(ve_unit_price[vt - 1])
+            cost_coef = candidates[r]['base_cost'] * price
+            obj_terms.append(cost_coef * x[(r, t)])
+            if len(cost_samples) < 5:
+                cost_samples.append((r, t, candidates[r]['load'], vehicle_config[t]['cap'], cost_coef))
+        prob += pulp.lpSum(obj_terms), "total_cost"
+
+        logging.info(f"[Stage2] 目标系数样本 (前5个):")
+        for r, t, load, cap, coeff in cost_samples:
+            logging.info(f"  r={r} t={vehicle_config[t]['type']} load={load:.0f} cap={cap:.0f} coeff={coeff:.1f}")
+
+        # 约束1: 每个 demand_unit 恰好覆盖一次
+        coverable_units = 0
+        coverage_error = None
+        for u in range(num_units):
+            covering = []
+            for r in range(num_candidates):
+                if coverage.get((r, u)):
+                    for t in range(num_types):
+                        if compat.get((r, t)):
+                            covering.append(x[(r, t)])
+            if covering:
+                prob += pulp.lpSum(covering) == 1, f"cover_u{u}"
+                coverable_units += 1
+            else:
+                uid, nid, boxes = demand_units[u]
+                coverage_error = (
+                    f"demand_unit {u} (节点{nid}, {boxes:.0f}箱) "
+                    f"无任何候选路径覆盖，当前车辆数无法满足全部需求"
+                )
+
+        if coverage_error:
+            last_error_detail = coverage_error
+            logging.warning(f"[Stage2] Pass {pass_idx + 1}: {coverage_error}，扩大车型范围重试")
+            continue
+
+        # 约束2: 每车型使用数不超过日配额
+        for t in range(num_types):
+            type_vars = []
+            for r in range(num_candidates):
+                if compat.get((r, t)):
+                    type_vars.append(x[(r, t)])
+            if type_vars:
+                quota = vehicle_config[t]['daily_max']
+                prob += pulp.lpSum(type_vars) <= quota, f"quota_type{vehicle_config[t]['type']}"
+
         logging.info(
-            f"[Stage2] 求解完成: {status_str}, "
-            f"目标值={obj_val:.0f}, 耗时{elapsed:.1f}s"
-        )
-    else:
-        logging.error(
-            f"[Stage2] 求解失败: {status_str}, 耗时{elapsed:.1f}s"
+            f"[Stage2] ILP规模: 变量={len(x)}, "
+            f"覆盖约束={coverable_units}/{num_units}, 配额约束={num_types}"
         )
 
+        # ---- 4c. 求解 ----
+        logging.info(f"[Stage2] 开始CBC求解 (超时{ILP_TIMEOUT_SEC}s, gap=1%)...")
+        solver = pulp.PULP_CBC_CMD(
+            msg=False,
+            options=[f'sec={ILP_TIMEOUT_SEC}', 'ratioGap=0.01']
+        )
+        status = prob.solve(solver)
+        status_str = pulp.LpStatus[status]
+
+        obj_val = pulp.value(prob.objective) if status_str in ('Optimal', 'Feasible') else None
+        if obj_val is not None:
+            elapsed = time.time() - t_start
+            logging.info(
+                f"[Stage2] Pass {pass_idx + 1} 求解成功: {status_str}, "
+                f"目标值={obj_val:.0f}, 耗时{elapsed:.1f}s"
+            )
+            break  # 求解成功，退出循环
+        else:
+            last_error_detail = f"ILP状态={status_str}"
+            logging.warning(
+                f"[Stage2] Pass {pass_idx + 1} 求解失败: {status_str}，扩大车型范围重试"
+            )
+            continue
+
+    # ---- 5. 所有轮次均失败 → 报错 ----
     if status_str not in ('Optimal', 'Feasible'):
         total_dmd = sum(boxes for _, _, boxes in demand_units)
         total_veh_cap = sum(c['cap'] * c['daily_max'] for c in vehicle_config)
@@ -167,11 +231,11 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
             raise ValueError(
                 f"【运力不足，请增加车辆】总需求 {total_dmd:.0f} 箱 > "
                 f"总运力 {total_veh_cap:.0f} 箱, 缺口 {shortage:.0f} 箱, "
-                f"ILP状态={status_str}"
+                f"{last_error_detail}"
             )
         else:
             raise ValueError(
-                f"【运力不足，请增加车辆】ILP无可行解 (status={status_str}), "
+                f"【运力不足，请增加车辆】ILP无可行解 ({last_error_detail}), "
                 f"总需求={total_dmd:.0f}箱 ≤ 总运力={total_veh_cap:.0f}箱, "
                 f"但角度/距离/站点数约束导致无法覆盖全部需求, "
                 f"请增加车辆或放宽约束后重试"
@@ -179,7 +243,7 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
 
     # ---- 6. 提取结果 → best_sol ----
     best_sol = []
-    selected_routes = []  # 用于日志
+    selected_routes = []
     total_delivered_boxes = 0.0
     type_usage = defaultdict(int)
 

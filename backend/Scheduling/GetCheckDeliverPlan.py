@@ -185,11 +185,14 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         logging.info(f"[近中心豁免] 识别到{len(near_center_nodes)}个近中心网点: node={sorted(near_center_nodes)}")
     # ====================================================================
 
+    # 构造 node_org_map → 供 GetDelivPlan 合肥约束使用
+    node_org_map = {i + 1: str(locations.loc[i + 1, 'ORG_NO']).strip() for i in range(LocationNum)}
+
     ScheduledRoutes = GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList,
                                    actual_deliv_days, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT,
                                    node_priority, daily_vehicle_limits, vehicle_types=all_vehicle_types,
                                    near_center_nodes=near_center_nodes if near_center_nodes else None,
-                                   work_days=work_days_list)
+                                   work_days=work_days_list, node_org_map=node_org_map)
 
     # 【诊断】排程后装箱前：汇总 ALNS 配送结果
     sched_total_boxes = 0.0

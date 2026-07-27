@@ -11,7 +11,7 @@ import logging
 from backend.DelivPlanV4.config import ANGLE_COS_THRESHOLD, NEAR_DEPOT_DIST_THRESHOLD
 
 
-def compute_polar_angles(node_ids, dmat_arr):
+def compute_polar_angles(node_ids, dmat_arr, hefei_nodes=None):
     """
     极角代理：以最远网点为参考方向，计算每个网点相对于省库的 cos 值。
 
@@ -22,6 +22,7 @@ def compute_polar_angles(node_ids, dmat_arr):
     Args:
         node_ids: 网点 ID 列表 (1-indexed)
         dmat_arr: 距离矩阵 (numpy 2D array), dmat[0, :] 为省库到各网点距离
+        hefei_nodes: 合肥四库房 node_id 集合，用于日志输出（可选）
 
     Returns:
         list[tuple]: [(node_id, cos_val), ...]，按 cos 降序（角度升序）排列
@@ -42,20 +43,24 @@ def compute_polar_angles(node_ids, dmat_arr):
 
     # 角度分布摘要
     cos_vals = [c for _, c in polar]
-    near_nodes = [nid for nid in node_ids if dmat_arr[0, nid] <= NEAR_DEPOT_DIST_THRESHOLD]
+    # 角度豁免节点：优先使用 hefei_nodes（合肥四库房），否则用距离阈值兜底
+    if hefei_nodes is not None:
+        exempt_nodes = [nid for nid in node_ids if nid in hefei_nodes]
+    else:
+        exempt_nodes = [nid for nid in node_ids if dmat_arr[0, nid] <= NEAR_DEPOT_DIST_THRESHOLD]
     msg = (
         f"[极角] {len(polar)}个网点, "
         f"cos范围=[{min(cos_vals):.3f}, {max(cos_vals):.3f}], "
         f"cos中位数={cos_vals[len(cos_vals)//2]:.3f}"
     )
-    if near_nodes:
-        details = ", ".join(f"站点{n}(距省库{dmat_arr[0, n]:.0f})" for n in sorted(near_nodes))
-        msg += f", 库边网点({len(near_nodes)}个): {details}"
+    if exempt_nodes:
+        details = ", ".join(f"站点{n}(距省库{dmat_arr[0, n]:.0f})" for n in sorted(exempt_nodes))
+        msg += f", 角度豁免({len(exempt_nodes)}个): {details}"
     logging.info(msg)
     return polar
 
 
-def check_angle_constraint(n1, n2, dmat_arr):
+def check_angle_constraint(n1, n2, dmat_arr, hefei_nodes=None):
     """
     检查两网点从省库出发的夹角是否满足约束。
 
@@ -64,12 +69,14 @@ def check_angle_constraint(n1, n2, dmat_arr):
 
     特殊处理:
         - 同节点: 始终通过
-        - 距省库 ≤ NEAR_DEPOT_DIST_THRESHOLD: 视为库边网点，不受夹角约束
+        - 合肥四库房（hefei_nodes 集合中的节点）: 不受夹角约束
+        - hefei_nodes=None 时，回退距离阈值判定（向后兼容）
         - 距省库 ≤ 0.001: 距离数据缺失，始终通过
 
     Args:
         n1, n2: 网点 ID (1-indexed)
         dmat_arr: 距离矩阵
+        hefei_nodes: 合肥四库房 node_id 集合，None 时用距离阈值兜底
 
     Returns:
         bool: 是否满足角度约束
@@ -78,9 +85,15 @@ def check_angle_constraint(n1, n2, dmat_arr):
         return True
     d01 = dmat_arr[0, n1]
     d02 = dmat_arr[0, n2]
-    # 库边网点：距离省库很近，视为同方向，不限制夹角
-    if d01 <= NEAR_DEPOT_DIST_THRESHOLD or d02 <= NEAR_DEPOT_DIST_THRESHOLD:
-        return True
+    # 角度豁免判定：优先使用合肥四库房集合，否则用距离阈值兜底
+    if hefei_nodes is not None:
+        # V4: 合肥四库房（合肥本部/肥东/肥西/长丰）不受夹角约束
+        if n1 in hefei_nodes or n2 in hefei_nodes:
+            return True
+    else:
+        # 向后兼容：无 hefei_nodes 信息时，距省库 ≤ 阈值的站点不受约束
+        if d01 <= NEAR_DEPOT_DIST_THRESHOLD or d02 <= NEAR_DEPOT_DIST_THRESHOLD:
+            return True
     if d01 <= 0.001 or d02 <= 0.001:
         return True
     d12 = dmat_arr[n1, n2]
