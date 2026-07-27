@@ -4,14 +4,15 @@
 流程:
     对每个月 1..6:
         1. 准备当月 init_stock（上月期末库存 → 下月期初）
-        2. 加载当月需求预测（SMCP Excel，按类别汇总，分离 BUS_TYPE 01+02 和 03）
-        3. 调用 GA 优化 alpha（每个仓库 × DEV_CLS 独立）
-        4. 计算基准库存: S = Poisson_ppf(α, λ), λ = 预测01+02 + 真实03安装
-        5. 补货量 q = max(0, S - I₀)
-        6. 合并安装数据（供电所→县），扣除当月安装量 → 期末库存
+        2. 预加载 6 个月需求预测，计算残差标准差 σ = std(预测01+02 − 真实01+02)
+        3. 加载当月需求预测（SMCP Excel，按类别汇总，分离 BUS_TYPE 01+02 和 03）
+        4. 调用 GA 优化 alpha（每个仓库 × DEV_CLS 独立）
+        5. 计算基准库存: S = 1.5 × λ + norm.ppf(α) × 1.5 × σ, λ = 预测01+02 + 真实03安装
+        6. 补货量 q = max(0, S - I₀)
+        7. 合并安装数据（供电所→县），扣除当月安装量 → 期末库存
 
 输出:
-    - output/仿真补库数据_1-6月.xlsx（明细）
+    - output/仿真补库数据_1-6月.xlsx（明细，含残差标准差σ）
     - output/仿真补库数据_月度分类汇总.xlsx
     - output/仿真补库数据_安装量归并后.xlsx
     - output/仿真补库数据_库存变化图.png
@@ -38,7 +39,7 @@ from data_cleaning.simulation.data_prep import (
     load_initial_inventory, load_device_specs, load_item_costs,
     load_monthly_installs, load_monthly_demand,
 )
-from data_cleaning.simulation.ga_adapter import run_ga_one_month, apply_alpha_to_ppf
+from data_cleaning.simulation.ga_adapter import run_ga_one_month, apply_alpha_to_normal
 
 
 def run_simulation():
@@ -56,13 +57,50 @@ def run_simulation():
     spec_df = load_device_specs()              # [DEV_CODE, DEV_CLS, DEV_CATEG]
     cost_df = load_item_costs()                # [DEV_CODE, TAX_UP]
     valid_orgs = set(inventory['ORG_NO'].unique())
-    install_raw, install_03_index = load_monthly_installs(inventory_orgs=valid_orgs)
+    install_raw, install_03_index, install_0102_index = load_monthly_installs(inventory_orgs=valid_orgs)
 
     dev_to_cls = dict(zip(spec_df['DEV_CODE'], spec_df['DEV_CLS']))
     install_index = install_raw.set_index(['ORG_NO', 'DEV_CODE', 'MONTH'])['INSTAL_NUM']
 
     # 保存归并后的安装数据
     install_raw.to_excel(os.path.join(OUTPUT_DIR, "仿真补库数据_安装量归并后.xlsx"), index=False)
+
+    # ================================================================
+    # 1b. 预计算残差标准差 σ（6 个月，不区分月份）
+    # ================================================================
+    logging.info("[仿真] Step 1b: 预加载6个月需求预测，计算残差标准差 σ...")
+    residuals_acc = {}  # {(org, dev): [residual_m1, ..., residual_m6]}
+    for month in range(SIM_START_MONTH, SIM_END_MONTH + 1):
+        ym = int(f"{SIM_YEAR}{month:02d}")
+        pre_demand = load_monthly_demand(SIM_YEAR, month)
+        for _, row in pre_demand.iterrows():
+            org = str(row['ORG_NO']).strip()
+            dev = str(row['DEV_CODE']).strip()
+            pred_0102 = int(row['LAMBDA_0102'])
+            actual_0102 = install_0102_index.get((org, dev, ym), 0.0)
+            residual = pred_0102 - actual_0102
+            residuals_acc.setdefault((org, dev), []).append(residual)
+
+    sigma_dict = {}  # {(org, dev): sigma}  ← 不区分月份，所有月份用同一个值
+    n_zero_sigma = 0
+    for (org, dev), residuals in residuals_acc.items():
+        if len(residuals) >= 2:
+            s = float(np.std(residuals, ddof=1))
+        else:
+            s = 0.0
+        sigma_dict[(org, dev)] = s
+        if s == 0.0:
+            n_zero_sigma += 1
+
+    n_pairs = len(sigma_dict)
+    sigma_values = list(sigma_dict.values())
+    logging.info(
+        f"[仿真] σ 计算完成: {n_pairs} 个 (org,dev) 组合, "
+        f"σ=0: {n_zero_sigma} 个, "
+        f"σ 均值={np.mean(sigma_values):.1f}, "
+        f"σ 中位数={np.median(sigma_values):.1f}, "
+        f"σ 最大值={np.max(sigma_values):.1f}"
+    )
 
     # ================================================================
     # 2. 初始化库存追踪
@@ -117,10 +155,11 @@ def run_simulation():
             direct_03 = install_03_index.get((org, dev, int(ym)), 0.0)
             lam = lam_0102 + int(direct_03)
 
-            # 基准库存: Poisson 分位数直接用总 λ
+            # 基准库存: S = 1.5 × λ + z_α × 1.5 × σ（正态分布分位数）
             dev_cls = dev_to_cls.get(dev, '00')
             alpha_val = alpha_dict.get(org, {}).get(dev_cls, GA_EPSILON) if alpha_dict else GA_EPSILON
-            S = apply_alpha_to_ppf(alpha_dict, org, dev_cls, lam, GA_EPSILON) if lam > 0 else 0.0
+            sigma = sigma_dict.get((org, dev), 0.0)
+            S = apply_alpha_to_normal(alpha_dict, org, dev_cls, lam, sigma, GA_EPSILON) if lam > 0 else 0.0
             q = max(0.0, S - I0)
 
             # 安装量
@@ -141,6 +180,7 @@ def run_simulation():
                 '期初库存': I0,
                 '需求预测值(λ)': lam,
                 'direct(03)': direct_03,
+                '残差标准差σ': round(sigma, 2),
                 '基准库存S': S,
                 '补货量q': q,
                 '安装量': inst,
@@ -202,6 +242,7 @@ def run_simulation():
         期初库存=('期初库存', 'sum'),
         需求预测值=('需求预测值(λ)', 'sum'),
         direct_03=('direct(03)', 'sum'),
+        残差标准差σ=('残差标准差σ', 'mean'),
         基准库存S=('基准库存S', 'sum'),
         补货量q=('补货量q', 'sum'),
         安装量=('安装量', 'sum'),

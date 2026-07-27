@@ -243,3 +243,36 @@ def apply_alpha_to_ppf(alpha_dict, org_no, dev_cls, lam, default_alpha=0.95):
         return 0.0
     quantile = poisson.ppf(alpha, lam * 1.5)  # rate=1.5 与 Item 保持一致
     return float(np.ceil(quantile))
+
+
+def apply_alpha_to_normal(alpha_dict, org_no, dev_cls, lam, sigma, default_alpha=0.95):
+    """
+    用 GA 优化出的 alpha 计算正态分布基准库存（v4 新公式）。
+
+    S = 1.5 × λ + z_α × 1.5 × σ
+
+    其中:
+        λ = 预测01+02 + 真实03
+        σ = 6 个月残差（预测01+02 − 真实01+02）的标准差，不区分月份
+        z_α = norm.ppf(α)
+
+    Args:
+        alpha_dict: {org_no: {dev_cls: alpha}}
+        org_no: 仓库编码
+        dev_cls: 设备类别编码
+        lam: 月度总需求 λ
+        sigma: 残差标准差（6 个月，所有月份共用）
+        default_alpha: alpha 查找失败时的默认值
+
+    Returns:
+        float: 基准库存 S = ceil(1.5 × λ + z × 1.5 × σ)
+    """
+    from scipy.stats import norm
+
+    alpha = alpha_dict.get(str(org_no).strip(), {}).get(dev_cls, default_alpha)
+    if lam <= 0:
+        return 0.0
+    z = norm.ppf(alpha)
+    sigma = sigma if sigma > 0 else 0.0
+    S = 1.5 * lam + z * 1.5 * sigma
+    return float(np.ceil(max(0.0, S)))

@@ -61,7 +61,7 @@ MAP_TABLE_CLASS_TO_CATEGORY = {
 
 # ==================== GA 参数 ====================
 
-GA_EPSILON = 0.95       # 目标满足率下限
+GA_EPSILON = 0.99       # 目标满足率下限
 GA_N_ITER = 10          # 遗传代数
 GA_POP_SIZE = 200       # 种群大小
 GA_N_PROCESSOR = 8      # 并行进程数

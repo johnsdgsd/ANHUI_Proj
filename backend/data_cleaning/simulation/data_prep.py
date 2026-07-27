@@ -414,7 +414,7 @@ def load_monthly_installs(inventory_orgs=None):
     df['DEV_CODE'] = df['MAPPED_DEV']
     df.drop(columns=['MAPPED_DEV'], inplace=True)
 
-    # ---- Step 4: 提取 BUS_TYPE=03 实际新装量（用于 direct） ----
+    # ---- Step 4a: 提取 BUS_TYPE=03 实际新装量（用于 direct） ----
     df_03 = df[df['BUS_TYPE'] == 3].copy()
     result_03 = df_03.groupby(['ORG_NO', 'DEV_CODE', 'MONTH'], as_index=False)['INSTAL_NUM'].sum()
     install_03_index = {}
@@ -422,6 +422,15 @@ def load_monthly_installs(inventory_orgs=None):
         install_03_index[(str(r['ORG_NO']).strip(), str(r['DEV_CODE']).strip(), int(r['MONTH']))] = float(r['INSTAL_NUM'])
     logging.info(f"[数据] BUS_TYPE=03 实际新装量(用于direct): {result_03['INSTAL_NUM'].sum():,}件, "
                  f"{result_03.shape[0]}条")
+
+    # ---- Step 4b: 提取 BUS_TYPE=01+02 实际安装量（用于残差计算） ----
+    df_0102 = df[df['BUS_TYPE'].isin([1, 2])].copy()
+    result_0102 = df_0102.groupby(['ORG_NO', 'DEV_CODE', 'MONTH'], as_index=False)['INSTAL_NUM'].sum()
+    install_0102_index = {}
+    for _, r in result_0102.iterrows():
+        install_0102_index[(str(r['ORG_NO']).strip(), str(r['DEV_CODE']).strip(), int(r['MONTH']))] = float(r['INSTAL_NUM'])
+    logging.info(f"[数据] BUS_TYPE=01+02 实际安装量(用于残差): {result_0102['INSTAL_NUM'].sum():,}件, "
+                 f"{result_0102.shape[0]}条")
 
     # ---- Step 5: 按 (ORG_NO, DEV_CODE, MONTH) 汇总（BUS_TYPE 全加） ----
     result = df.groupby(['ORG_NO', 'DEV_CODE', 'MONTH'], as_index=False)['INSTAL_NUM'].sum()
@@ -432,7 +441,7 @@ def load_monthly_installs(inventory_orgs=None):
 
     logging.info(f"[数据] 月安装量: {result.shape[0]}行, {result['ORG_NO'].nunique()}县, "
                  f"总计={result['INSTAL_NUM'].sum():,}件")
-    return result, install_03_index
+    return result, install_03_index, install_0102_index
 
 def _load_installs_from_db():
     """从 DB 加载安装数据。"""
@@ -609,7 +618,7 @@ def load_all_data():
     cost_df = load_item_costs()
     # 传递库存 ORG_NO 用于过滤安装数据
     valid_orgs = set(inventory['ORG_NO'].unique())
-    install_df = load_monthly_installs(inventory_orgs=valid_orgs)
+    install_df, _, _ = load_monthly_installs(inventory_orgs=valid_orgs)
 
     # 交叉校验 ORG_NO 一致性
     inv_orgs = set(inventory['ORG_NO'].unique())

@@ -10,7 +10,7 @@ import logging
 import sys
 
 
-def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None, near_center_nodes=None):
+def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT, node_priority=None, daily_vehicle_limits=None, vehicle_types=None, near_center_nodes=None, work_days=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", stream=sys.stdout)
 
     '''1. 提取基础参数与箱数转换'''
@@ -405,6 +405,10 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         continue
 
                     combined = routes[i]['deliveries'] + routes[j]['deliveries']
+                    # 合并同网点条目: 防止同一网点出现多条记录
+                    merged_map = defaultdict(float)
+                    for c, a in combined: merged_map[c] += a
+                    combined = [(c, a) for c, a in merged_map.items()]
                     unique_nodes = set(c for c, _ in combined)
                     if len(unique_nodes) > 3:
                         continue
@@ -602,8 +606,26 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             temp_j = copy.deepcopy(rj)
                             temp_i['deliveries'].pop(pi)
                             temp_j['deliveries'].pop(pj)
-                            temp_i['deliveries'].append((cid_j, amt_j))
-                            temp_j['deliveries'].append((cid_i, amt_i))
+                            # 合并而非跳过: 若目标已有该网点则加量, 否则追加
+                            has_j_in_i = any(c == cid_j for c, _ in temp_i['deliveries'])
+                            if has_j_in_i:
+                                for k, (c, a) in enumerate(temp_i['deliveries']):
+                                    if c == cid_j: temp_i['deliveries'][k] = (c, a + amt_j); break
+                            else:
+                                temp_i['deliveries'].append((cid_j, amt_j))
+
+                            has_i_in_j = any(c == cid_i for c, _ in temp_j['deliveries'])
+                            if has_i_in_j:
+                                for k, (c, a) in enumerate(temp_j['deliveries']):
+                                    if c == cid_i: temp_j['deliveries'][k] = (c, a + amt_i); break
+                            else:
+                                temp_j['deliveries'].append((cid_i, amt_i))
+
+                            # 容量校验: 合并后不得超最大车型容量
+                            load_i = sum(a for _, a in temp_i['deliveries'])
+                            load_j = sum(a for _, a in temp_j['deliveries'])
+                            if load_i > MAX_CAP or load_j > MAX_CAP:
+                                continue
 
                             # 网点数约束
                             nodes_i = set(c for c, _ in temp_i['deliveries'])
@@ -1292,6 +1314,17 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     best_sol = dismantle_low_load_routes(best_sol, min_load_rate=0.5)
     best_sol = _relocate_improve(best_sol, max_passes=5)
 
+    # 安全兜底: 合并每条路线内同网点的重复条目
+    dedup_count = 0
+    for r in best_sol:
+        merged = defaultdict(float)
+        for cid, amt in r['deliveries']: merged[cid] += amt
+        if len(merged) < len(r['deliveries']):
+            dedup_count += len(r['deliveries']) - len(merged)
+            r['deliveries'] = [(c, a) for c, a in merged.items()]
+    if dedup_count > 0:
+        logging.info(f"[最终去重] 合并了{dedup_count}条同网点重复记录")
+
     best_sol, dropped = reassign_vehicles(best_sol)
     retry = 0
     while dropped:
@@ -1411,8 +1444,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     x = pulp.LpVariable.dicts("x", [(r, d) for r in range(num_routes) for d in range(DelivDay)], cat='Binary')
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
-    ALPHA = 1000000  # 聚类惩罚权重（拉开同网点配送间隔）
-    BETA =500   # 缺货优先级惩罚权重（只罚代表路线，不绑架其余路线）
+    ALPHA = 100000  # 聚类惩罚权重（拉开同网点配送间隔）
+    BETA =5   # 缺货优先级惩罚权重（只罚代表路线，不绑架其余路线）
 
     # ---- 构建网点→路线映射 & 计算网点级数据 ----
     node_routes_ilp = defaultdict(list)  # {cid: [route_idx, ...]}
@@ -1476,10 +1509,16 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     if penalties:
         obj_terms.append(ALPHA * pulp.lpSum(penalties))
     if has_priority:
-        # 只惩罚代表路线（载量最小的那条），避免全量网点箱数绑架BETA
-        # 缺货概率 × 首次配送日 × 代表路线载量
+        # 软期限：前 SOFT_DEADLINE 天免费，只罚超出部分
+        # 避免把所有路线都压向 day=0，给 GAMMA 周均衡留出操作空间
+        SOFT_DEADLINE = int(DelivDay * 0.3)
+        overdue_vars = {}
+        for cid in priority_nodes:
+            ov = pulp.LpVariable(f"Overdue_N{cid}", lowBound=0, cat='Continuous')
+            prob2 += ov >= earliest[cid] - SOFT_DEADLINE
+            overdue_vars[cid] = ov
         priority_pen = pulp.lpSum(
-            priority_nodes[cid] * earliest[cid] * priority_route_info[cid][1]
+            priority_nodes[cid] * overdue_vars[cid] * priority_route_info[cid][1]
             for cid in priority_nodes
         )
         obj_terms.append(BETA * priority_pen)
@@ -1488,8 +1527,46 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         avg_pri = sum(priority_nodes.values()) / len(priority_nodes)
         total_rep_load = sum(v[1] for v in priority_route_info.values())
         logging.info(f"[ILP首次配送] 缺货概率>0.5的网点={high_pri_nodes}/{len(priority_nodes)}, "
-                     f"BETA={BETA}, 代表路线总载量={total_rep_load:.0f}箱, "
+                     f"BETA={BETA}, SOFT_DEADLINE=D{SOFT_DEADLINE}, 代表路线总载量={total_rep_load:.0f}箱, "
                      f"最大优先级={max_pri:.4f}, 平均={avg_pri:.4f}")
+    # ---- 周路线数均衡惩罚（按真实日历周分组，不满5天的周跳过） ----
+    GAMMA = 10000  # 周均衡权重（与BETA软期限形成6:1力量对比，确保周分布均匀）
+    if work_days is not None and len(work_days) == DelivDay:
+        from collections import defaultdict as _dd
+        _week_days = _dd(list)
+        for d_idx, dt in enumerate(work_days):
+            if hasattr(dt, 'isocalendar'):
+                iso_week = dt.isocalendar()[1]
+            else:
+                iso_week = (d_idx // 7) + 1  # 兜底：非 datetime 对象按固定7天分组
+            _week_days[iso_week].append(d_idx)
+        # 只对 >=5 个工作日的完整周做均衡
+        _valid_weeks = {w: days for w, days in _week_days.items() if len(days) >= 5}
+        if len(_valid_weeks) > 1:
+            _target = num_routes / len(_valid_weeks)
+            _dev_vars = []
+            for w, days in _valid_weeks.items():
+                _week_routes = pulp.lpSum(x[r, d] for r in range(num_routes) for d in days)
+                _dev = pulp.LpVariable(f"WeekDev_W{w}", lowBound=0, cat='Continuous')
+                prob2 += _dev >= _week_routes - _target
+                prob2 += _dev >= _target - _week_routes
+                _dev_vars.append(_dev)
+            obj_terms.append(GAMMA * pulp.lpSum(_dev_vars))
+            logging.info(f"[ILP周均衡] {len(_valid_weeks)}个完整周(≥5天), "
+                         f"目标={_target:.1f}条/周, GAMMA={GAMMA}")
+    # ---- 每日路线数均衡惩罚（防止一周内路线扎堆某一天） ----
+    DELTA = 200  # 日均衡权重（微调力量，不颠覆优先级，仅防止同日爆满）
+    avg_per_day = num_routes / DelivDay
+    _day_dev_vars = []
+    for d in range(DelivDay):
+        _day_routes = pulp.lpSum(x[r, d] for r in range(num_routes))
+        _ddev = pulp.LpVariable(f"DayDev_D{d}", lowBound=0, cat='Continuous')
+        prob2 += _ddev >= _day_routes - avg_per_day
+        prob2 += _ddev >= avg_per_day - _day_routes
+        _day_dev_vars.append(_ddev)
+    obj_terms.append(DELTA * pulp.lpSum(_day_dev_vars))
+    logging.info(f"[ILP日均衡] DelivDay={DelivDay}, 日均目标={avg_per_day:.1f}条/天, DELTA={DELTA}")
+
     prob2 += pulp.lpSum(obj_terms)
 
     for r in range(num_routes):
@@ -1513,8 +1590,13 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     for d in range(DelivDay):
         prob2 += pulp.lpSum(x[r, d] * sum(amt for _, amt in best_sol[r]['deliveries']) for r in range(num_routes)) <= Z
 
-    solver2 = pulp.PULP_CBC_CMD(msg=False, options=['sec=60', 'ratioGap=0.01'])
-    status = prob2.solve(solver2)
+    solver2 = pulp.PULP_CBC_CMD(msg=False, options=['sec=120', 'ratioGap=0.01'])
+    try:
+        status = prob2.solve(solver2)
+    except IndexError:
+        logging.warning("[ILP] CBC 解析异常，放宽 gap 重试...")
+        solver2 = pulp.PULP_CBC_CMD(msg=False, options=['sec=120', 'ratioGap=0.05'])
+        status = prob2.solve(solver2)
 
     if pulp.LpStatus[status] != 'Optimal':
         raise Exception(f"【运力严重不足】在不超每日配额的前提下无法排开所有路线！状态: {pulp.LpStatus[status]}")

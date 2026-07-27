@@ -188,7 +188,8 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     ScheduledRoutes = GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList,
                                    actual_deliv_days, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT,
                                    node_priority, daily_vehicle_limits, vehicle_types=all_vehicle_types,
-                                   near_center_nodes=near_center_nodes if near_center_nodes else None)
+                                   near_center_nodes=near_center_nodes if near_center_nodes else None,
+                                   work_days=work_days_list)
 
     # 【诊断】排程后装箱前：汇总 ALNS 配送结果
     sched_total_boxes = 0.0
@@ -203,6 +204,39 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                  f"配送总体积箱数={sched_total_boxes:,.0f}箱, 覆盖网点数={sched_loc_count}, "
                  f"占原始总箱数={sched_total_boxes/total_demand_boxes*100:.1f}%"
                  f"{' ←缺口!' if sched_total_boxes < total_demand_boxes - 1 else ''}")
+
+    # ---- 排程月每周配送车辆数统计 ----
+    week_veh = defaultdict(lambda: defaultdict(int))  # {week: {vehicle_type: count}}
+    week_boxes = defaultdict(float)                     # {week: total_boxes}
+    week_routes = defaultdict(int)                      # {week: route_count}
+    for trip in ScheduledRoutes:
+        day_idx = trip.get('schedule_day_idx', 0)
+        if day_idx < len(work_days_list):
+            d = work_days_list[day_idx]
+            week = (d.day - 1) // 7 + 1
+            vt = int(trip.get('vehicle_type', 1))
+            week_veh[week][vt] += 1
+            week_routes[week] += 1
+            week_boxes[week] += sum(amt for _, amt in trip['deliveries'])
+    if week_veh:
+        logging.info("=" * 70)
+        logging.info(f">>> 排程月每周配送车辆统计 (共{len(work_days_list)}个工作日)")
+        logging.info(f"{'周次':<6} {'工作日范围':<16} {'路线数':<8} {'配送箱数':<10} {'各车型车辆数'}")
+        logging.info("-" * 70)
+        for week in sorted(week_veh.keys()):
+            # 找该周的工作日范围
+            week_dates = [work_days_list[trip.get('schedule_day_idx', 0)]
+                         for trip in ScheduledRoutes
+                         if trip.get('schedule_day_idx', 0) < len(work_days_list)
+                         and (work_days_list[trip.get('schedule_day_idx', 0)].day - 1) // 7 + 1 == week]
+            if week_dates:
+                date_range = f"{min(week_dates).strftime('%m/%d')}-{max(week_dates).strftime('%m/%d')}"
+            else:
+                date_range = "-"
+            veh_detail = " | ".join(f"车型{vt}×{cnt}" for vt, cnt in sorted(week_veh[week].items()))
+            logging.info(f"第{week}周   {date_range:<16} {week_routes[week]:<8} "
+                        f"{week_boxes[week]:<10.0f} {veh_detail}")
+        logging.info("=" * 70)
 
     # ---- 缺货概率 TOP5 网点 + 设备码，含配送日期 ----
     if org_priority or (dev_stock and dev_forecast):
@@ -298,77 +332,72 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             prev_node = loc_1based
             org_no = str(locations.loc[loc_1based, 'ORG_NO']).strip()
 
-            # ---- 贪心逐箱分配：每次选缺货概率最大的设备码装1箱 ----
+            # ---- 逐个设备码尽量装满：排序一次，同一设备码不拆散 ----
             alloc_map = {}  # dev_code → 累计分配只数
 
-            while vol_remaining > 0.0001:
+            # 1. 一次性计算所有设备码的缺货概率并排序
+            dev_ranking = []  # [(prob, fulfilled_pct, sub_idx, dc), ...]
+            remaining_cap0 = max_cap_boxes - total_vol_used
+            for sub_idx in active_dev_indices:
+                remaining_demand = Sim_Demands[loc_1based - 1, sub_idx]
+                if remaining_demand <= 0:
+                    continue
+                dc = str(SubTypeList.loc[sub_idx, 'DEV_CODE_NO']).strip()
+                vm = dev_vol_mult.get(dc, 1.0)
+                if vm > remaining_cap0 + 0.001:
+                    continue  # 至少能装下1箱
+
+                key = (org_no, dc)
+                init_stock = dev_stock.get(key, 0)
+                cur_stock = effective_stock.get(key, init_stock)
+                forecast = dev_forecast.get(key, 0)
+
+                if forecast <= 0:
+                    prob = 1.0
+                else:
+                    prob = max(0.0, 1.0 - cur_stock / forecast)
+
+                plan_qty = Demands[loc_1based - 1, sub_idx]
+                fulfilled_pct = (plan_qty - remaining_demand) / plan_qty if plan_qty > 0 else 1.0
+
+                dev_ranking.append((prob, fulfilled_pct, sub_idx, dc))
+
+            # 概率降序；概率相同时完成率低的优先
+            dev_ranking.sort(key=lambda x: (-x[0], x[1]))
+
+            # 2. 固定排序 + while 轮流装：每轮每个设备码装1箱，装完的退出
+            cur_devs = [(p, f, s, d, dev_vol_mult.get(d, 1.0), dev_unit_box.get(d, 5))
+                        for p, f, s, d in dev_ranking]
+            while vol_remaining > 0.0001 and cur_devs:
                 remaining_cap = max_cap_boxes - total_vol_used
                 if remaining_cap <= 0.001:
                     break
-
-                # 找缺货概率最大的设备码（需能装下至少1箱）
-                # tiebreaker: 概率相同时选完成率最低的设备码（防止大数据量设备霸占所有箱数）
-                best_dev_idx = -1
-                best_prob = -1.0
-                best_fulfilled_pct = 2.0  # 完成率(0~1), 越小越优先, 初始>1保证首次选中
-                best_dev_code = None
-
-                for sub_idx in active_dev_indices:
-                    remaining_demand = Sim_Demands[loc_1based - 1, sub_idx]
-                    if remaining_demand <= 0:
+                any_allocated = False
+                next_devs = []
+                for prob, fulfilled_pct, sub_idx, dc, vm, unit_per_box in cur_devs:
+                    if total_vol_used + vm > max_cap_boxes + 0.001:
+                        next_devs.append((prob, fulfilled_pct, sub_idx, dc, vm, unit_per_box))
+                        continue  # 这轮装不下，下轮再试
+                    demand = Sim_Demands[loc_1based - 1, sub_idx]
+                    if demand <= 0:
                         continue
-                    dc = str(SubTypeList.loc[sub_idx, 'DEV_CODE_NO']).strip()
-                    vm = dev_vol_mult.get(dc, 1.0)
-                    if vm > remaining_cap + 0.001:
-                        continue  # 装不下1箱
-
-                    # 当前有效库存 = 初始库存 + 已分配量
+                    # 装 1 箱
+                    qty = min(demand, unit_per_box)
+                    boxes_used = math.ceil(qty / unit_per_box)
+                    vol_used = boxes_used * vm
+                    total_vol_used += vol_used
+                    vol_remaining -= vol_used
+                    Sim_Demands[loc_1based - 1, sub_idx] -= qty
+                    any_allocated = True
                     key = (org_no, dc)
                     init_stock = dev_stock.get(key, 0)
-                    cur_stock = effective_stock.get(key, init_stock)
-                    forecast = dev_forecast.get(key, 0)
-
-                    if forecast <= 0:
-                        prob = 1.0
-                    else:
-                        prob = max(0.0, 1.0 - cur_stock / forecast)
-
-                    # 完成率 = 已分配量 / 月计划量（越小越需要补充分配）
-                    plan_qty = Demands[loc_1based - 1, sub_idx]
-                    fulfilled_pct = (plan_qty - remaining_demand) / plan_qty if plan_qty > 0 else 1.0
-
-                    # 概率优先；概率相同时完成率低的优先
-                    if prob > best_prob or (abs(prob - best_prob) < 0.0001 and fulfilled_pct < best_fulfilled_pct):
-                        best_prob = prob
-                        best_fulfilled_pct = fulfilled_pct
-                        best_dev_idx = sub_idx
-                        best_dev_code = dc
-
-                if best_dev_idx < 0:
-                    break  # 所有设备码都装不下或需求已耗尽
-
-                # 分配1箱
-                unit_per_box = dev_unit_box.get(best_dev_code, 5)
-                vm = dev_vol_mult.get(best_dev_code, 1.0)
-
-                qty_per_box = min(Sim_Demands[loc_1based - 1, best_dev_idx], unit_per_box)
-                used_boxes = math.ceil(qty_per_box / unit_per_box)
-                vol_used = used_boxes * vm
-
-                if total_vol_used + vol_used > max_cap_boxes + 0.001:
-                    break  # 容量不够装完整箱
-
-                total_vol_used += vol_used
-                vol_remaining -= vol_used
-                Sim_Demands[loc_1based - 1, best_dev_idx] -= qty_per_box
-
-                # 更新有效库存 → 降低该设备码后续缺货概率
-                key = (org_no, best_dev_code)
-                init_stock = dev_stock.get(key, 0)
-                effective_stock[key] = effective_stock.get(key, init_stock) + qty_per_box
-
-                # 聚合到同设备码
-                alloc_map[best_dev_code] = alloc_map.get(best_dev_code, 0) + qty_per_box
+                    effective_stock[key] = effective_stock.get(key, init_stock) + qty
+                    alloc_map[dc] = alloc_map.get(dc, 0) + qty
+                    if Sim_Demands[loc_1based - 1, sub_idx] > 0:
+                        next_devs.append((prob, fulfilled_pct, sub_idx, dc, vm, unit_per_box))
+                if not any_allocated:
+                    break
+                cur_devs = next_devs
 
             # 将聚合结果转为 details_data 行
             for dev_code_str, qty_needed in alloc_map.items():
