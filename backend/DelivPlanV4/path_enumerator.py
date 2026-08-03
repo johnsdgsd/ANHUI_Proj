@@ -35,7 +35,8 @@ from backend.DelivPlanV4.geometry import (
 
 
 def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
-                               hefei_node_ids=None, node_to_group=None):
+                               hefei_node_ids=None, node_to_group=None,
+                               depot_coord=None, node_coords=None):
     """
     枚举所有满足约束的候选配送路径。
 
@@ -47,6 +48,10 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         - [约束1] 同城节点首站必须最大箱数
         - [约束2] 合肥四库房不能与各自 150km 内非合肥节点同路
 
+    V4.1: 支持基于经纬度的地理方位角约束
+        - 传入 depot_coord + node_coords → 用地理方位角差（≤45°）
+        - 不传 → 用道路距离余弦定理（完全向后兼容）
+
     Args:
         demand_units: list[tuple], [(unit_id, node_id, boxes), ...]
         dmat_arr: numpy 2D array, 距离矩阵
@@ -54,6 +59,8 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         max_route_dist: float, 最大闭环距离
         hefei_node_ids: set[int] | None, 合肥四库房 node_id 集合（合肥本部/肥东/肥西/长丰）
         node_to_group: dict[int, str] | None, node_id → 城市编码（ORG_NO 前5位），用于约束 1
+        depot_coord: (lon, lat) | None, 省库经纬度，None 时用距离模式
+        node_coords: {node_id: (lon, lat)} | None, 网点经纬度映射，None 时用距离模式
 
     Returns:
         list[dict]: 候选路径列表，每项格式:
@@ -83,7 +90,8 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
     # 合肥四库房 = 合肥本部/肥东/肥西/长丰（由调用方通过 hefei_node_ids 传入）
     # 这些节点不受角度约束，可出现在任意滑动窗口中
     hefei_nodes = hefei_node_ids or set()
-    polar = compute_polar_angles(unique_nodes, dmat_arr, hefei_nodes=hefei_nodes if hefei_nodes else None)
+    polar = compute_polar_angles(unique_nodes, dmat_arr, hefei_nodes=hefei_nodes if hefei_nodes else None,
+                                  depot_coord=depot_coord, node_coords=node_coords)
     n_polar = len(polar)
 
     if hefei_nodes:
@@ -131,7 +139,10 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         window_nodes = [polar[start][0]]
         for end in range(start + 1, n_polar):
             candidate_nid = polar[end][0]
-            if all(check_angle_constraint(candidate_nid, wn, dmat_arr, hefei_nodes if hefei_nodes else None) for wn in window_nodes):
+            if all(check_angle_constraint(candidate_nid, wn, dmat_arr,
+                                           hefei_nodes if hefei_nodes else None,
+                                           depot_coord=depot_coord, node_coords=node_coords)
+                   for wn in window_nodes):
                 window_nodes.append(candidate_nid)
 
         # 注入合肥四库房（不受角度约束，可出现在任意窗口）
@@ -148,7 +159,9 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         max_k = min(len(window_nodes), MAX_STOPS)
         for k in range(1, max_k + 1):
             for node_subset in itertools.combinations(window_nodes, k):
-                if not _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes if hefei_nodes else None):
+                if not _all_pairs_angle_ok(node_subset, dmat_arr,
+                                            hefei_nodes if hefei_nodes else None,
+                                            depot_coord=depot_coord, node_coords=node_coords):
                     continue
 
                 subset_uids = []
@@ -268,17 +281,21 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
     return candidates
 
 
-def _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes=None):
+def _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes=None,
+                        depot_coord=None, node_coords=None):
     """检查节点集合内所有两两组合是否满足角度约束。
     Args:
         node_subset: 节点 ID 集合
         dmat_arr: 距离矩阵
         hefei_nodes: 合肥四库房 node_id 集合（None 时用距离阈值兜底）
+        depot_coord: (lon, lat) 省库经纬度，None 时用距离模式
+        node_coords: {node_id: (lon, lat)}，None 时用距离模式
     """
     nodes = list(node_subset)
     for i in range(len(nodes)):
         for j in range(i + 1, len(nodes)):
-            if not check_angle_constraint(nodes[i], nodes[j], dmat_arr, hefei_nodes):
+            if not check_angle_constraint(nodes[i], nodes[j], dmat_arr, hefei_nodes,
+                                          depot_coord=depot_coord, node_coords=node_coords):
                 return False
     return True
 

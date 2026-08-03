@@ -18,7 +18,8 @@ import pulp
 from backend.DelivPlanV4.config import ILP_TIMEOUT_SEC
 
 
-def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_price):
+def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_price,
+                            no_small_first=False, load_rate_penalty=0.0):
     """
     求解集合划分 ILP，返回 best_sol 格式的路线列表。
 
@@ -27,6 +28,10 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
         demand_units: list[tuple], [(unit_id, node_id, boxes), ...]
         vehicle_config: list[dict], 按 cap 升序的车辆配置 [{type, cap, daily_max}, ...]
         ve_unit_price: list, 各车型单价 (索引 = type - 1)
+        no_small_first: bool, 是否跳过小车优先策略。True 时全车型单轮求解，
+                        False 时保持三轮逐步放宽（默认）。
+        load_rate_penalty: float, 低装载率惩罚系数。0=不惩罚（默认）。
+                           >0 时 cost *= (1 + penalty×(1-load_rate)²)，推动合并低载路线。
 
     Returns:
         list[dict]: best_sol 格式:
@@ -71,11 +76,16 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
     # extra_types=0: 只允许最小车型（最优装载率）
     # extra_types=1: 允许最小+次小车型（小型车配额不够的兜底）
     # extra_types=num_types-1: 允许全部车型（最终兜底，等价于原始行为）
+    # no_small_first=True: 跳过前两轮，直接全车型单轮求解
     last_error = None
     last_error_detail = ""
     x, prob, status_str, obj_val = None, None, None, None
 
-    for pass_idx, extra_types in enumerate([0, 1, num_types - 1]):
+    extra_type_passes = [0, 1, num_types - 1]  # 默认：三轮逐步放宽
+    if no_small_first:
+        extra_type_passes = [num_types - 1]    # 跳过小车优先，直接全车型
+
+    for pass_idx, extra_types in enumerate(extra_type_passes):
         # ---- 4a. 构建本轮兼容矩阵 ----
         compat = {}
         compat_count_per_type = defaultdict(int)
@@ -94,12 +104,14 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
                 if cap < load - 0.01:
                     continue
 
-                # ---- V4 约束3: 合肥混合路线满载率 ≥70% 禁止 ----
+                # ---- V4 约束3: 合肥独占路线装载率 <70% 必须混装远距节点 ----
+                # 含义：如果路线只含合肥四库房（无远距节点）且装不满 70%，则拒绝，
+                # 强制要求搭配 >150km 的远距节点来提高装载率
                 has_hefei = candidates[r].get('has_hefei', False)
                 has_far = candidates[r].get('has_far_node', False)
-                if has_hefei and has_far and cap > 0:
+                if has_hefei and not has_far and cap > 0:
                     load_rate = load / cap
-                    if load_rate >= HEFEI_DEDICATED_LOAD_RATE - 0.001:
+                    if load_rate < HEFEI_DEDICATED_LOAD_RATE - 0.001:
                         constraint3_rejected += 1
                         continue
 
@@ -107,13 +119,17 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
                 compat_count_per_type[t] += 1
 
         # 日志：本轮车型限制说明
-        pass_desc = [
-            f"仅最小车型",
-            f"允许2种车型",
-            f"允许全部车型"
-        ][pass_idx]
+        total_passes = len(extra_type_passes)
+        if no_small_first:
+            pass_desc = "全车型一次性求解"
+        else:
+            pass_desc = [
+                f"仅最小车型",
+                f"允许2种车型",
+                f"允许全部车型"
+            ][pass_idx]
         logging.info(
-            f"[Stage2] Pass {pass_idx + 1}/3 ({pass_desc}): "
+            f"[Stage2] Pass {pass_idx + 1}/{total_passes} ({pass_desc}): "
             f"兼容矩阵 {len(compat)} 个(r,t)组合, " +
             " | ".join(
                 f"车型{vehicle_config[t]['type']}:{compat_count_per_type.get(t, 0)}条路径"
@@ -142,16 +158,26 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
 
         logging.info(f"[Stage2] 决策变量: {len(x)}个")
 
-        # 目标函数: min Σ cost_r × price_type × x[(r, t)]
+        # 目标函数: min Σ cost_r × price × (1 + ε × cap/max_cap) × penalty × x
+        # ε 极小，仅用于打破平局：当 base_cost×price 相同时优先选小车
+        # penalty: 低装载率惩罚 (1 + λ×(1-lr)²)，推动合并、减少低载路线
         obj_terms = []
         cost_samples = []
+        max_cap = max(c['cap'] for c in vehicle_config)
+        EPS = 1e-8  # 容量平局打破系数
+        LRP = load_rate_penalty  # 缩写
         for (r, t) in compat:
             vt = vehicle_config[t]['type']
             price = float(ve_unit_price[vt - 1])
-            cost_coef = candidates[r]['base_cost'] * price
+            cap = vehicle_config[t]['cap']
+            load = candidates[r]['load']
+            load_rate = load / cap if cap > 0 else 0
+            penalty_factor = 1.0 + LRP * (1.0 - load_rate) ** 2
+            cost_coef = (candidates[r]['base_cost'] * price *
+                         (1 + EPS * cap / max_cap) * penalty_factor)
             obj_terms.append(cost_coef * x[(r, t)])
             if len(cost_samples) < 5:
-                cost_samples.append((r, t, candidates[r]['load'], vehicle_config[t]['cap'], cost_coef))
+                cost_samples.append((r, t, load, cap, cost_coef))
         prob += pulp.lpSum(obj_terms), "total_cost"
 
         logging.info(f"[Stage2] 目标系数样本 (前5个):")

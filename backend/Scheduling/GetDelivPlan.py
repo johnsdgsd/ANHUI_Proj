@@ -80,13 +80,19 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     # 【新增】合肥库房约束基础设施
     # ====================================================================
     HEFEI_ORGS = {'34401', '3440101', '3440102', '3440103'}
+    HEFEI_NEAR_THRESHOLD = 150  # 距中心 ≤ 此距离的网点禁止与合肥拼车（约束2）
     hefei_nodes = set()
-    _node_org = {}  # {node_id: org_no_str}
+    near_nodes = set()    # 距中心 ≤ 150km 的非合肥网点（约束2禁拼对象）
+    _node_org = {}        # {node_id: org_no_str}
     if node_org_map:
         _node_org = node_org_map
         for nid, org in node_org_map.items():
             if str(org).strip() in HEFEI_ORGS:
                 hefei_nodes.add(nid)
+        # 构建"近距离集合"：距中心 ≤ 150km 的非合肥网点
+        for nid in range(1, LocationNum + 1):
+            if nid not in hefei_nodes and get_dist(0, nid) <= HEFEI_NEAR_THRESHOLD:
+                near_nodes.add(nid)
 
     def _same_city(nid1, nid2):
         """两个 node 是否同市（ORG_NO 前5位相等）"""
@@ -106,15 +112,14 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     def _check_hefei_constraint(deliveries, new_cid=None, new_amt=0):
         """
         合肥约束检查，返回 (ok, reason)
-        约束2: Hefei 库房不能与 150km 内非 Hefei 库房拼车
-        约束3: Hefei 路线装载率 >= 70% 不能带非 Hefei
+        约束2: 合肥4库房不能与距中心≤150km的库房拼车
+        约束3: 合肥路线满载率≥70%时不能包含任何非合肥库房
         """
         if not hefei_nodes:
             return (True, '')
         # 构建临时 deliveries 列表
         tmp = list(deliveries)
         if new_cid is not None:
-            # 合并同 cid 的条目
             found = False
             for i, (c, a) in enumerate(tmp):
                 if c == new_cid:
@@ -128,25 +133,21 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
         if not has_hefei:
             return (True, '')
 
-        # 约束2: Hefei 节点 150km 隔离
-        for cid, _ in tmp:
-            if cid not in hefei_nodes:
-                continue
-            for other, _ in tmp:
-                if other == cid or other in hefei_nodes:
-                    continue
-                d = get_dist(cid, other)
-                if d <= 150:
-                    return (False, f'Hefei{cid}与非Hefei{other}距{d:.0f}km≤150')
+        non_hefei = [c for c, _ in tmp if c not in hefei_nodes]
+        if not non_hefei:
+            return (True, '')  # 全是合肥库房，允许
 
-        # 约束3: Hefei 路线装载率 >= 70% 隔离
+        # 约束3: 满载率 ≥ 70% → 任何非合肥库房都不行
         total_load = sum(a for _, a in tmp)
         cap = _best_fitting_cap(total_load)
         load_rate = total_load / cap if cap > 0 else 0
         if load_rate >= 0.70:
-            non_hefei = [c for c, _ in tmp if c not in hefei_nodes]
-            if non_hefei:
-                return (False, f'Hefei路线装载率{load_rate:.0%}≥70%含非Hefei{non_hefei}')
+            return (False, f'Hefei装载率{load_rate:.0%}≥70%含非合肥网点{non_hefei}')
+
+        # 约束2: 装载率 < 70% 时，仍不能与距中心 ≤ 150km 的库房拼车
+        near_in_route = [c for c in non_hefei if c in near_nodes]
+        if near_in_route:
+            return (False, f'Hefei距中心≤150km网点{near_in_route}禁拼')
 
         return (True, '')
 
@@ -735,12 +736,16 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                             if not _check_route_angle(nodes_i) or not _check_route_angle(nodes_j):
                                 continue
 
-                            # 排序+里程校验
+                            # 排序+里程+合肥约束校验
                             temp_i = optimize_route_sequence(temp_i)
                             temp_j = optimize_route_sequence(temp_j)
                             if calc_route_distance(temp_i['deliveries']) > MAX_ROUTE_DIST:
                                 continue
                             if calc_route_distance(temp_j['deliveries']) > MAX_ROUTE_DIST:
+                                continue
+                            if not _check_hefei_constraint(temp_i['deliveries'])[0]:
+                                continue
+                            if not _check_hefei_constraint(temp_j['deliveries'])[0]:
                                 continue
 
                             # 方案1：仅交换的收益
@@ -1063,7 +1068,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
                         temp['deliveries'].append((cid, ins_amt))
                     temp = optimize_route_sequence(temp)
 
-                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and                        _check_hefei_constraint(temp['deliveries'])[0]:
+                    if calc_route_distance(temp['deliveries']) <= MAX_ROUTE_DIST and _check_hefei_constraint(temp['deliveries'])[0]:
                         fit = eval_route_fitness(temp)
                         if has_cid:
                             fit *= 0.5
@@ -1546,7 +1551,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     Z = pulp.LpVariable("Peak_Volume", lowBound=0, cat='Continuous')
 
     ALPHA = 100000  # 聚类惩罚权重（拉开同网点配送间隔）
-    BETA =5   # 缺货优先级惩罚权重（只罚代表路线，不绑架其余路线）
+    BETA =500  # 缺货优先级惩罚权重（只罚代表路线，不绑架其余路线）
 
     # ---- 构建网点→路线映射 & 计算网点级数据 ----
     node_routes_ilp = defaultdict(list)  # {cid: [route_idx, ...]}
@@ -1610,16 +1615,15 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
     if penalties:
         obj_terms.append(ALPHA * pulp.lpSum(penalties))
     if has_priority:
-        # 软期限：前 SOFT_DEADLINE 天免费，只罚超出部分
-        # 避免把所有路线都压向 day=0，给 GAMMA 周均衡留出操作空间
-        SOFT_DEADLINE = int(DelivDay * 0.3)
+        # 无缓冲期：缺货概率直接作用于最早配送日，由 GAMMA 周均衡防止过度聚集
+        SOFT_DEADLINE = 0
         overdue_vars = {}
         for cid in priority_nodes:
             ov = pulp.LpVariable(f"Overdue_N{cid}", lowBound=0, cat='Continuous')
             prob2 += ov >= earliest[cid] - SOFT_DEADLINE
             overdue_vars[cid] = ov
         priority_pen = pulp.lpSum(
-            priority_nodes[cid] * overdue_vars[cid] * priority_route_info[cid][1]
+            priority_nodes[cid] * overdue_vars[cid]
             for cid in priority_nodes
         )
         obj_terms.append(BETA * priority_pen)
@@ -1656,7 +1660,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay, VeUnitPr
             logging.info(f"[ILP周均衡] {len(_valid_weeks)}个完整周(≥5天), "
                          f"目标={_target:.1f}条/周, GAMMA={GAMMA}")
     # ---- 每日路线数均衡惩罚（防止一周内路线扎堆某一天） ----
-    DELTA = 200  # 日均衡权重（微调力量，不颠覆优先级，仅防止同日爆满）
+    DELTA = 20000  # 日均衡权重（微调力量，不颠覆优先级，仅防止同日爆满）
     avg_per_day = num_routes / DelivDay
     _day_dev_vars = []
     for d in range(DelivDay):

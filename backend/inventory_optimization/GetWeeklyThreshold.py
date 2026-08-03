@@ -27,15 +27,25 @@ def GenerateWeeklyThreshold(year:str, month:str):
         insert_into_adam_stock_week_limt_pre,
         delete_adam_stock_week_limt_pre_by_ym)
 
-    # ============ 1. 加载月度需求预测（用于上限） ============
+    # ============ 1. 加载月度需求预测 ============
     monthly_df = query_adam_yqm_dmd_pre_by_year_month(year, month)
     print(f'成功读取月度需求预测，时间：{year}{month}，数据量：{len(monthly_df)}条')
     monthly_demand = {}
     for _, row in monthly_df.iterrows():
         key = (str(row['ORG_NO']), str(row['DEV_CODE']))
         monthly_demand[key] = float(row['PRE_NUM'])
+    # ── 月度预测维度 ──
+    monthly_orgs = monthly_df['ORG_NO'].nunique()
+    monthly_devs = monthly_df['DEV_CODE'].nunique()
+    print(f"[月度预测维度] 单位数: {monthly_orgs}, 设备码数: {monthly_devs}, "
+          f"总记录: {len(monthly_df)}, 单位×设备码: {monthly_orgs * monthly_devs}")
+    zero_keys = [k for k, v in monthly_demand.items() if v <= 0]
+    if zero_keys:
+        print(f"[月度预测] PRE_NUM=0 的记录: {len(zero_keys)} 条, 设备码: {sorted(set(d for _,d in zero_keys))}")
+        for k in zero_keys[:3]:
+            print(f"  [样本] {k} -> {monthly_demand[k]}")
 
-    # ============ 2. 加载周度需求预测（用于下限） ============
+    # ============ 2. 加载周度需求预测（仅取周次信息） ============
     pre_type = '04'
     org_df = query_adam_del_site_conf()
     org_df = org_df[org_df['STAT_NAME'] != '营销服务中心']
@@ -43,30 +53,37 @@ def GenerateWeeklyThreshold(year:str, month:str):
 
     df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year, month, pre_type)
     print(f'成功读取周度预测结果，时间：{year}{month}类型：{pre_type}，数据量：{len(df)}条')
-    columns_to_drop = ['WD_DMD_PRE_ID', 'PRE_TYPE', 'PRE_DATE']
-    df = df.drop(columns=columns_to_drop, errors='ignore')
-    df['ORG_NAME'] = df['ORG_NO'].map(org_dict)
-    df_grouped = df.groupby(
-        ['PRE_YEAR', 'PRE_MONTH', 'PRE_QUARTER', 'PRE_WEEK', 'ORG_NO', 'DEV_CODE', 'ORG_NAME'],
-        as_index=False
-    )['PRE_NUM'].sum()
-    df_grouped = df_grouped.rename(columns={'PRE_NUM': '预测数量'})
-    print(f'聚合后周度预测值数据为：{len(df_grouped)}')
 
-    # ============ 3. 构建仓库（基于周度数据中的单位） ============
-    df_temp = df_grouped[['ORG_NO', 'ORG_NAME']].drop_duplicates()
-    print(f'准备初始化仓库的临时数据，数据量为:{len(df_temp)}')
+    # 提取去重周次
+    distinct_weeks = sorted(int(w) for w in df['PRE_WEEK'].unique())
+    default_quarter = df['PRE_QUARTER'].iloc[0] if len(df) > 0 else ''
+    print(f"[周度数据] 周数: {len(distinct_weeks)}, 周次: {distinct_weeks}")
+
+    # 构建周度预测值索引: (ORG_NO, DEV_CODE, PRE_WEEK) → PRE_NUM
+    weekly_lookup = {}
+    for _, row in df.iterrows():
+        wk = (str(row['ORG_NO']), str(row['DEV_CODE']), int(row['PRE_WEEK']))
+        weekly_lookup[wk] = weekly_lookup.get(wk, 0) + float(row['PRE_NUM'])
+    print(f"[周度数据] 唯一键数量: {len(weekly_lookup)}")
+
+    # ============ 3. 构建仓库（基于月度数据中的单位） ============
+    monthly_org_list = monthly_df[['ORG_NO']].drop_duplicates().copy()
+    monthly_org_list['ORG_NAME'] = monthly_org_list['ORG_NO'].map(org_dict)
+    print(f'[仓库初始化] 单位数: {len(monthly_org_list)}')
     LWI = LocalWarehouseInitializer()
-    LWI.load_city_mapping(df_temp)
-    local_warehouses = LWI.initialize_warehouses(df_temp)
+    LWI.load_city_mapping(monthly_org_list)
+    local_warehouses = LWI.initialize_warehouses(monthly_org_list)
     warehouse_dict = {w.city_code: w for w in local_warehouses}
+    print(f'仓库创建完成，共 {len(local_warehouses)} 个仓库', flush=True)
 
-    # ============ 4. 为每个物资装入周度需求分布 ============
-    grouped = df_grouped.groupby(['ORG_NO', 'ORG_NAME', 'DEV_CODE'])
+    # ============ 4. 为每个物资装入周度需求分布（月度维度 × 所有周次） ============
     item_count = 0
-    for (org_no, org_name, dev_code), group in grouped:
-        warehouse = warehouse_dict.get(str(org_no))
+    skipped_no_warehouse = 0
+    missing_weekly = 0
+    for (org_no, dev_code), monthly_val in monthly_demand.items():
+        warehouse = warehouse_dict.get(org_no)
         if not warehouse:
+            skipped_no_warehouse += 1
             continue
         item = Item(
             cls=None,
@@ -76,14 +93,19 @@ def GenerateWeeklyThreshold(year:str, month:str):
             shortage_cost=0.0,
             alpha=0.0
         )
-        for _, row in group.iterrows():
-            week = int(row['PRE_WEEK'])
-            lambda_value = float(row['预测数量'])
-            distribution = PoissonDistribution(lambda_=lambda_value)
-            item.set_demand_distribution(week, distribution)
+        has_any_weekly = False
+        for week in distinct_weeks:
+            wl = weekly_lookup.get((org_no, dev_code, week), 0)
+            if wl > 0:
+                has_any_weekly = True
+            item.set_demand_distribution(week, PoissonDistribution(lambda_=wl))
+        if not has_any_weekly:
+            missing_weekly += 1
         warehouse.add_item(dev_code, item)
         item_count += 1
-    print(f"物资创建完成，共 {item_count} 个物资", flush=True)
+
+    print(f"[物资创建] 共 {item_count} 个物资 (={monthly_orgs}×{monthly_devs}), "
+          f"跳过(无仓库): {skipped_no_warehouse}, 无任何周度数据: {missing_weekly}", flush=True)
 
     # ============ 5. 读取设备分类映射 ============
     print("开始读取设备分类配置...", flush=True)
@@ -130,7 +152,7 @@ def GenerateWeeklyThreshold(year:str, month:str):
                     record = {
                         "STOCK_WEEK_LIMT_PRE_ID": stock_id,
                         "PRE_YEAR": year,
-                        "PRE_QUARTER": df_grouped['PRE_QUARTER'].iloc[0],
+                        "PRE_QUARTER": default_quarter,
                         "PRE_MONTH": month,
                         "PRE_WEEK": week_seq,
                         "ORG_NO": warehouse.city_code,
@@ -154,10 +176,30 @@ def GenerateWeeklyThreshold(year:str, month:str):
 
     if zero_monthly > 0:
         print(f"⚠ 注意: {zero_monthly}/{total_items} 个物资无月度需求数据，上限=0", flush=True)
+        sample_count = 0
+        for warehouse in local_warehouses:
+            for item_key, item in warehouse.items.items():
+                m_key = (warehouse.city_code, str(item.dev_code))
+                if monthly_demand.get(m_key, 0) <= 0:
+                    print(f"  [样本] warehouse.city_code={warehouse.city_code!r}, "
+                          f"dev_code={item.dev_code!r}, "
+                          f"monthly_demand.get={monthly_demand.get(m_key, 'MISSING')!r}")
+                    sample_count += 1
+                    if sample_count >= 5:
+                        break
+            if sample_count >= 5:
+                break
 
     print(f"阈值计算完成，共处理 {processed} 个物资", flush=True)
     WeeklyThreshold = pd.DataFrame(res_df)
     print(f'生成周度阈值结果{len(WeeklyThreshold)}条', flush=True)
+    # ── 最终阈值维度 ──
+    final_orgs = WeeklyThreshold['ORG_NO'].nunique()
+    final_devs = WeeklyThreshold['DEV_CODE'].nunique()
+    final_weeks = WeeklyThreshold['PRE_WEEK'].nunique()
+    print(f"[最终阈值维度] 单位数: {final_orgs}, 设备码数: {final_devs}, "
+          f"周数: {final_weeks}, 总记录: {len(WeeklyThreshold)}, "
+          f"单位×设备码×周数: {final_orgs * final_devs * final_weeks}")
 
     # 删除旧数据（防御性处理，删除失败不影响后续插入）
     try:

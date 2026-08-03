@@ -1454,7 +1454,33 @@ def GetRunDurDetail(detail:pd.DataFrame):
 
 def determine_scheme_focus(scheme_items: dict) -> dict:
 
-    # 提取信息列表，每个元素为 (tag, cost, itt, exec_ym)
+    # ================================================================
+    # 第一步：PRE_ITT 微调（先微调，确保成本-周转关系正确后再分配侧重）
+    # ================================================================
+    for tag, df in scheme_items.items():
+        df.loc[0, 'PRE_ITT'] = round(df.iloc[0]['PRE_ITT'], 2)
+    itt_vals = {tag: df.iloc[0]['PRE_ITT'] for tag, df in scheme_items.items()}
+    logger.info(f"PRE_ITT round后: {itt_vals}")
+
+    # 始终按成本微调，确保: 成本低→周转高, 成本高→周转低
+    logger.info("PRE_ITT 按成本微调 (成本低→周转高, 成本高→周转低)")
+    base = min(itt_vals.values())
+    tags_by_cost = sorted(scheme_items.keys(),
+                          key=lambda t: scheme_items[t].iloc[0]['PRE_STAT_COST'])
+    offsets = [0.02, 0.01, 0.0]  # [最低成本, 中, 最高成本]
+    for i, tag in enumerate(tags_by_cost):
+        df = scheme_items[tag]
+        df.loc[0, 'PRE_ITT'] = max(0, base + offsets[min(i, len(offsets) - 1)])
+    logger.info(f"PRE_ITT 微调后: { {tag: df.iloc[0]['PRE_ITT'] for tag, df in scheme_items.items()} }")
+
+    # ================================================================
+    # 第二步：基于微调后的周转分配方案侧重
+    #   规则：成本最高 → 资金入账优先(01)
+    #         剩余中周转最高 → 周转优先(02)
+    #         最后一个 → 均衡方案(03)
+    # ================================================================
+
+    # 提取信息列表（使用微调后的 ITT）
     items = []
     for tag, df in scheme_items.items():
         cost = df.iloc[0]['PRE_STAT_COST']
@@ -1463,9 +1489,8 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
         items.append((tag, cost, itt, exec_ym))
         logger.info(f"方案 {tag}: 成本={cost}, 周转={itt:.4f}, 年月={exec_ym}")
 
-    # 按成本降序、周转降序排序
+    # 按成本降序排序
     items_by_cost = sorted(items, key=lambda x: x[1], reverse=True)
-    items_by_itt = sorted(items, key=lambda x: x[2], reverse=True)
 
     focus_map = {}
 
@@ -1490,18 +1515,15 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
     # 修改 DataFrame
     for tag, df in scheme_items.items():
         focus = focus_map[tag]
-        # 设置 SCHEME_FOCUS
         if 'SCHEME_FOCUS' not in df.columns:
             df['SCHEME_FOCUS'] = None
         df.loc[0, 'SCHEME_FOCUS'] = focus
 
-        # 获取年月
         exec_ym = df.iloc[0].get('EXEC_YM', '')
         if not exec_ym:
             exec_ym = "未知年月"
             logger.warning(f"方案 {tag} 缺少 EXEC_YM 列，使用默认")
 
-        # 生成方案名
         if focus == '01':
             scheme_name = f"{exec_ym}资金入账优先方案"
         elif focus == '02':
@@ -1509,31 +1531,11 @@ def determine_scheme_focus(scheme_items: dict) -> dict:
         else:
             scheme_name = f"{exec_ym}均衡方案"
 
-        # 修复列类型问题：强制转换为 object
         if 'SCHEME_NAME' not in df.columns:
             df['SCHEME_NAME'] = None
         df['SCHEME_NAME'] = df['SCHEME_NAME'].astype(str)
         df.loc[0, 'SCHEME_NAME'] = scheme_name
         logger.info(f"已设置方案 {tag}: SCHEME_FOCUS={focus}, SCHEME_NAME={scheme_name}")
-
-    # ---- PRE_ITT 后处理：保留两位小数，重复时按侧重微调 ----
-    for tag, df in scheme_items.items():
-        df.loc[0, 'PRE_ITT'] = round(df.iloc[0]['PRE_ITT'], 2)
-    itt_vals = {tag: df.iloc[0]['PRE_ITT'] for tag, df in scheme_items.items()}
-    logger.info(f"PRE_ITT round后: {itt_vals}")
-
-    if len(set(itt_vals.values())) < len(scheme_items):
-        logger.info("PRE_ITT 存在重复，按成本微调 (成本低→周转高, 成本高→周转低)")
-        base = min(itt_vals.values())
-        # 按成本升序排列: [最低成本, 中, 最高成本]
-        tags_by_cost = sorted(scheme_items.keys(),
-                              key=lambda t: scheme_items[t].iloc[0]['PRE_STAT_COST'])
-        offsets = [0.02, 0.01, 0.0]  # 成本低→周转高, 成本高→周转低
-        for i, tag in enumerate(tags_by_cost):
-            df = scheme_items[tag]
-            df.loc[0, 'PRE_ITT'] = max(0, base + offsets[min(i, len(offsets) - 1)])
-        logger.info(f"PRE_ITT 微调后: { {tag: df.iloc[0]['PRE_ITT'] for tag, df in scheme_items.items()} }")
-    # -------------------------------------------------------------------
 
     # 输出最终分配
     logger.info("最终侧重分配:")

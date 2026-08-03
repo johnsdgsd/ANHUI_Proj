@@ -208,10 +208,14 @@ def run_deliv_plan_v4(date_str):
         logging.warning("[V4] ⚠ 未识别到任何合肥四库房! "
                         f"请检查站点名称中是否包含 {HEFEI_FOUR_KEYWORDS}")
 
+    # ---- V4.1: 加载经纬度坐标 → geodesic 角度约束 ----
+    depot_coord, node_coords = _load_coordinates(org_labels, hefei_node_ids)
+
     candidates = enumerate_candidate_paths(
         demand_units, dmat_arr, max_cap, MAX_ROUTE_DIST,
         hefei_node_ids=hefei_node_ids if hefei_node_ids else None,
-        node_to_group=node_to_group if node_to_group else None
+        node_to_group=node_to_group if node_to_group else None,
+        depot_coord=depot_coord, node_coords=node_coords
     )
     timing['stage1'] = time.time() - t0
 
@@ -222,7 +226,8 @@ def run_deliv_plan_v4(date_str):
     t0 = time.time()
     logging.info(f"[V4] Step 6/6: Stage2 ILP求解...")
     best_sol = solve_set_partition_ilp(
-        candidates, demand_units, vehicle_config, ve_unit_price
+        candidates, demand_units, vehicle_config, ve_unit_price,
+        load_rate_penalty=1.0
     )
     timing['stage2'] = time.time() - t0
 
@@ -374,6 +379,61 @@ def _print_delivery_summary(best_sol, unit_sum, demand_units, type_to_cap, total
         logging.info(f"  站点级核验: {len(unit_sum)}个站点全部满足 ✓")
 
     logging.info(f"[V4] =================================================")
+
+
+def _load_coordinates(org_labels, hefei_node_ids):
+    """
+    从 ADAM_DEL_SITE_CONF 加载经纬度，构建 depot_coord + node_coords。
+
+    Args:
+        org_labels: array-like, org_labels[i] = ORG_NO for node i (1-indexed)
+        hefei_node_ids: set[int], 合肥四库房 node_id 集合
+
+    Returns:
+        (depot_coord, node_coords):
+            depot_coord: (lon, lat) 或 None（合肥四库房均值，DB 中 34101 为 0,0）
+            node_coords: {node_id: (lon, lat)} 或 None
+    """
+    try:
+        from backend.api.data_api.fetch_data import query_adam_del_site_conf
+        site_conf = query_adam_del_site_conf()
+        if site_conf is None or site_conf.empty:
+            logging.warning("[V4] 无法加载站点坐标，回退道路距离角度约束")
+            return None, None
+
+        coords_by_org = {}
+        for _, row in site_conf.iterrows():
+            org = str(row['ORG_NO']).strip()
+            lon = float(row['LONGITUDE']) if row.get('LONGITUDE') else 0.0
+            lat = float(row['LATITUDE']) if row.get('LATITUDE') else 0.0
+            coords_by_org[org] = (lon, lat)
+
+        node_coords = {}
+        for i in range(1, len(org_labels)):
+            org = str(org_labels[i]).strip()
+            coord = coords_by_org.get(org)
+            if coord and coord[0] != 0:
+                node_coords[i] = coord
+
+        # 省库坐标：合肥四库房均值（34101 在 DB 中为 0,0）
+        depot_coord = None
+        hf_coords = [node_coords[n] for n in hefei_node_ids if n in node_coords]
+        if hf_coords:
+            depot_coord = (sum(c[0] for c in hf_coords) / len(hf_coords),
+                           sum(c[1] for c in hf_coords) / len(hf_coords))
+            logging.info(
+                f"[V4] 角度约束: haversine模式, "
+                f"省库=({depot_coord[0]:.4f},{depot_coord[1]:.4f}), "
+                f"{len(node_coords)}个站点有坐标"
+            )
+        else:
+            logging.warning("[V4] 无法确定省库坐标，回退道路距离角度约束")
+            return None, None
+
+        return depot_coord, node_coords
+    except Exception as e:
+        logging.warning(f"[V4] 坐标加载失败({e})，回退道路距离角度约束")
+        return None, None
 
 
 def _empty_schemes():
