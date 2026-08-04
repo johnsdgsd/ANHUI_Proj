@@ -9,7 +9,7 @@ import pandas as pd
 
 from backend.algorithm.warehouse_layout.config import (
     R_w, L_w, z_w, ANNUAL_INTEREST_RATE, TRANSPORT_UNIT_PRICE,
-    N_PARETO_SOLUTIONS, MAX_LOCAL_SEARCH_ITER,
+    N_PARETO_SOLUTIONS,
 )
 from backend.algorithm.warehouse_layout.milp_solver import (
     solve_distance_milp,
@@ -43,11 +43,29 @@ def prepare_data(
     demand_stations = set(demand_df['STATION_ORG_CODE'].astype(str).str.strip())
     dist_stations = set(dist_df['STATION_ORG_CODE'].astype(str).str.strip())
 
+    if len(station_df) > len(station_codes_all):
+        logger.warning(f"[数据准备] 供电所表有 {len(station_df) - len(station_codes_all)} 条重复编码，"
+                       f"已去重 ({len(station_df)} → {len(station_codes_all)})")
+
+    logger.info(f"[数据准备] 原始集合: 供电所={len(station_codes_all)}, "
+                f"年需求={len(demand_stations)}, 距离={len(dist_stations)}")
+
     common = station_codes_all & demand_stations & dist_stations
     missing = station_codes_all - common
     if missing:
-        logger.warning(f"[数据准备] {len(missing)} 个供电所无需求或距离数据，排除: "
-                       f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}")
+        no_demand = [m for m in missing if m not in demand_stations]
+        no_dist = [m for m in missing if m not in dist_stations]
+        logger.warning(f"[数据准备] {len(missing)} 个供电所排除: "
+                       f"缺年需求 {len(no_demand)} 个, 缺距离 {len(no_dist)} 个")
+        for m in sorted(missing)[:5]:
+            reasons = []
+            if m not in demand_stations:
+                reasons.append("缺年需求")
+            if m not in dist_stations:
+                reasons.append("缺距离")
+            logger.warning(f"[数据准备]   {m}: {', '.join(reasons)}")
+        if len(missing) > 5:
+            logger.warning(f"[数据准备]   ... 等共 {len(missing)} 个")
 
     station_codes = sorted(common)
     s2i = {c: i for i, c in enumerate(station_codes)}
@@ -110,7 +128,40 @@ def prepare_data(
             holding_cost[d2i[d]] = p * ANNUAL_INTEREST_RATE
             dev_categs[d2i[d]] = str(row.get('DEV_CATEG', ''))
 
-    # ---- 7. 日志 ----
+    # ---- 7. 校验 ----
+    errors = []
+    for name, df in [("年需求", demand_df), ("候选库房", warehouse_df),
+                      ("供电所", station_df), ("距离矩阵", dist_df)]:
+        if len(df) == 0:
+            errors.append(f"{name}表查询结果为空")
+    if S == 0:
+        missing_detail = []
+        no_demand = station_codes_all - demand_stations
+        no_dist = station_codes_all - dist_stations
+        if no_demand:
+            missing_detail.append(f"{len(no_demand)}个缺年需求")
+        if no_dist:
+            missing_detail.append(f"{len(no_dist)}个缺距离")
+        errors.append(f"三表交集供电所为0 ({'; '.join(missing_detail)})")
+    if W == 0:
+        errors.append("候选库房为0")
+    if D == 0:
+        errors.append("有效设备码为0（全部无单价或单价无效）")
+    if errors:
+        raise ValueError("[数据校验失败] " + "; ".join(errors))
+
+    if demand_mat.sum() <= 0:
+        logger.warning("[数据校验] 需求总量为0")
+    if fixed_cost.sum() <= 0:
+        logger.warning("[数据校验] 库房固定成本全为0")
+    if (dist_mat.sum() >= 1e9 * W * S):
+        logger.warning("[数据校验] 距离矩阵全部不可达，无可行解")
+    orphan = [i for i in range(S) if dist_mat[:, i].min() >= 1e9]
+    if orphan:
+        logger.warning(f"[数据校验] {len(orphan)} 个供电所无可达库房: "
+                       f"{[station_codes[i] for i in orphan[:5]]}")
+
+    # ---- 8. 日志 ----
     reachable_ratio = (dist_mat < 1e9).mean()
     logger.info(f"[数据准备] 供电所 {S} 个 | 候选库房 {W} 个 | 有效设备码 {D} 个")
     logger.info(f"[数据准备] 需求总量 {demand_mat.sum():,.0f} 件 | 距离矩阵可达率 {reachable_ratio:.1%}")
@@ -198,7 +249,8 @@ def optimize_warehouse_layout(data: dict) -> List[dict]:
             seen.add(key)
             deduped.append(s)
 
-    logger.info(f"[ε-约束] 完成! 帕累托前沿 {len(deduped)} 组解:")
+    logger.info(f"[ε-约束] 完成! 帕累托前沿 {len(deduped)} 组解 "
+                f"(已分配供电所 {len(data['station_codes'])} 个):")
     for s in deduped:
         logger.info(f"  {s.get('label', '?'):<12} Z₁={s['Z1']:>12,.0f} 元  "
                     f"Z₂={s['Z2']:>6.1f} km  库房 {s['n_opened']:>3} 个")

@@ -27,6 +27,20 @@ def run_warehouse_layout_optimization():
 
         def _run():
             try:
+                # 删除当日旧方案
+                from datetime import datetime
+                from backend.api.data_api.fetch_data import (
+                    delete_adam_layout_result_by_date,
+                    delete_adam_layout_result_det_by_date,
+                )
+                today = datetime.now().strftime("%Y-%m-%d")
+                try:
+                    delete_adam_layout_result_det_by_date(today)
+                    delete_adam_layout_result_by_date(today)
+                    logger.info(f"[API] 已删除当日({today})旧方案")
+                except Exception as e:
+                    logger.warning(f"[API] 删除旧方案失败（继续执行）: {e}")
+
                 result = run_warehouse_optimization()
                 logger.info(f"[API] 仓网布局优化完成: {result.get('message', '')}")
             except Exception as e:

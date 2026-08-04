@@ -14,7 +14,7 @@ import numpy as np
 import pulp
 
 from backend.algorithm.warehouse_layout.config import (
-    R_w, L_w, z_w, N_PARETO_SOLUTIONS,
+    R_w, L_w, z_w,
 )
 
 logger = logging.getLogger(__name__)
@@ -248,6 +248,15 @@ def _extract_solution(
         if pulp.value(var) > 0.5:
             assignments[i] = j
 
+    # 校验：全部供电所已分配
+    unassigned = [i for i in range(S) if assignments[i] < 0]
+    if unassigned:
+        codes = [data['station_codes'][i] for i in unassigned]
+        raise RuntimeError(
+            f"[MILP] {len(unassigned)} 个供电所未分配库房: {codes[:10]}"
+            f"{'...' if len(unassigned) > 10 else ''}"
+        )
+
     # 计算 Z₁ 和 Z₂
     from backend.algorithm.warehouse_layout.config import (
         TRANSPORT_UNIT_PRICE, R_w as _R_w, L_w as _L_w, z_w as _z_w,
@@ -364,7 +373,7 @@ def solve_distance_milp(data: dict, pairs: List[Tuple[int, int]]) -> dict:
     prob += pulp.lpSum(obj_terms), "Z2_objective"
 
     logger.info(f"[MILP-距离] 变量: 二进制 {len(x) + len(y)}, 求解中...")
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=120, gapRel=0.001))
 
     result = _extract_solution(prob, x, y, {}, {},
                                 active_pairs, fixed_stations, data, station_demand)
@@ -416,12 +425,12 @@ def solve_cost_milp(data: dict, pairs: List[Tuple[int, int]]) -> dict:
             h = holding_cost[k]
             if h > 0:
                 obj_terms.append(h * R_w * u[(j, k)] / 2.0)
-                obj_terms.append(h * z_w * v[(j, k)])
+                obj_terms.append(h * z_w * np.sqrt(protection) * v[(j, k)])
 
     prob += pulp.lpSum(obj_terms), "Z1_objective"
 
     logger.info(f"[MILP-成本] 变量: 二进制 {len(x) + len(y)}, 求解中...")
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=120, gapRel=0.001))
 
     result = _extract_solution(prob, x, y, u, v,
                                 active_pairs, fixed_stations, data, station_demand)
@@ -480,12 +489,12 @@ def solve_constrained_milp(
             h = holding_cost[k]
             if h > 0:
                 obj_terms.append(h * R_w * u[(j, k)] / 2.0)
-                obj_terms.append(h * z_w * v[(j, k)])
+                obj_terms.append(h * z_w * np.sqrt(protection) * v[(j, k)])
 
     prob += pulp.lpSum(obj_terms), "Z1_objective"
 
     logger.info(f"[MILP-约束] 求解中...")
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=120, gapRel=0.001))
 
     result = _extract_solution(prob, x, y, u, v,
                                 active_pairs, fixed_stations, data, station_demand)

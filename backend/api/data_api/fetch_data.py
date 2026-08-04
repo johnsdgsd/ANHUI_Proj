@@ -2887,7 +2887,8 @@ def query_adam_power_station_active():
         if isinstance(data, list) and len(data) == 0:
             raise ValueError("供电所查询返回数据为空")
         df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
-        logger.info(f"仓网布局-活跃供电所: {len(df)} 个")
+        unique = df['STATION_ORG_CODE'].nunique()
+        logger.info(f"仓网布局-活跃供电所: {len(df)} 行, {unique} 个唯一编码")
         return df
     except requests.exceptions.RequestException:
         logger.exception("仓网布局-供电所查询网络异常")
@@ -3004,4 +3005,84 @@ def insert_adam_layout_result_det(df: pd.DataFrame):
         raise
     except Exception:
         logger.exception("仓网布局-结果明细插入失败")
+        raise
+
+
+def query_adam_sys_param() -> dict:
+    """查询仓网布局系统参数
+
+    Returns:
+        dict: {PARAM_CODE: PARAM_VALUE}
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sys-param'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            params = {}
+            for row in data:
+                code = row.get('PARAM_CODE', '')
+                value = row.get('PARAM_VALUE', '')
+                if code.startswith('WL_'):
+                    params[code] = value
+            logger.info(f"仓网布局-系统参数: 读取 {len(params)} 项")
+            return params
+        return {}
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-系统参数查询网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-系统参数查询失败")
+        raise
+
+
+def delete_adam_layout_result_by_date(today: str):
+    """按日期删除旧的仓网布局方案主表
+
+    Args:
+        today: 日期字符串，如 '2026-08-04'
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete-adam-layout-result-by-date'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"today": today})
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"仓网布局-删除旧方案主表 (>= {today}): {data}")
+        return data
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-删除方案主表网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-删除方案主表失败")
+        raise
+
+
+def delete_adam_layout_result_det_by_date(today: str):
+    """按日期删除旧的仓网布局方案明细表
+
+    Args:
+        today: 日期字符串，如 '2026-08-04'
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete-adam-layout-result-det-by-date'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"today": today})
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"仓网布局-删除旧方案明细表 (>= {today}): {data}")
+        return data
+    except requests.exceptions.RequestException:
+        logger.exception("仓网布局-删除方案明细表网络异常")
+        raise
+    except Exception:
+        logger.exception("仓网布局-删除方案明细表失败")
         raise
