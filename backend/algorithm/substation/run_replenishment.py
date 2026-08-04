@@ -17,7 +17,7 @@ _PROJ_DIR = os.path.dirname(os.path.dirname(os.path.dirname(_BASE_DIR)))
 sys.path.insert(0, _PROJ_DIR)
 
 from backend.api.data_api.fetch_data import (
-    query_adam_sys_param,
+    query_adam_ais_sys_param,
     query_adam_city_county_stock_sample,
     query_adam_sub_dmd_pre,
     query_adam_spec_code_config,
@@ -64,8 +64,8 @@ def run_substation_replenishment() -> dict:
 
     try:
         # ---- Step 1: 加载参数 ----
-        logger.info("[RS] Step 1/7: 加载系统参数 (ADAM_SYS_PARAM)...")
-        param_df = query_adam_sys_param()
+        logger.info("[RS] Step 1/7: 加载系统参数 (ADAM_AIS_SYS_PARAM)...")
+        param_df = query_adam_ais_sys_param()
         substation_params, default_params = load_substation_params(param_df)
         details['n_substation_params'] = len(substation_params)
 

@@ -21,6 +21,7 @@ from backend.api.data_api.fetch_data import (
     query_adam_station_dist_mist,
     insert_adam_layout_result,
     insert_adam_layout_result_det,
+    query_pk_next,
 )
 from backend.algorithm.warehouse_layout.config import N_PARETO_SOLUTIONS
 from backend.algorithm.warehouse_layout.algorithm import (
@@ -71,10 +72,12 @@ def run_warehouse_optimization() -> dict:
         # 主表
         result_rows = []
         detail_rows = []
-        result_id_start = int(datetime.now().timestamp() * 1000)
+
+        # 通过 /pk/next 申请主表与明细表主键（PK_ALLOC 已注册对应序列）
+        result_ids = [int(x) for x in query_pk_next("SEQ_ADAM_LAYOUT_RESULT", len(solutions))]
 
         for idx, sol in enumerate(solutions):
-            result_id = result_id_start + idx
+            result_id = result_ids[idx]
             result_rows.append({
                 'RESULT_ID': result_id,
                 'SCENARIO_CODE': scenario_code,
@@ -86,13 +89,16 @@ def run_warehouse_optimization() -> dict:
 
             for m in sol['mapping']:
                 detail_rows.append({
-                    'RESULT_DET_ID': result_id_start * 1000 + len(detail_rows) + 1,
                     'RESULT_ID': result_id,
                     'SCENARIO_CODE': scenario_code,
                     'ORG_NO': m['wh_code'],
                     'STATION_ORG_CODE': m['station_code'],
                     'CREATE_TIME': now,
                 })
+
+        det_ids = [int(x) for x in query_pk_next("SEQ_ADAM_LAYOUT_RESULT_DET", len(detail_rows))]
+        for row, det_id in zip(detail_rows, det_ids):
+            row['RESULT_DET_ID'] = det_id
 
         result_df = pd.DataFrame(result_rows)
         detail_df = pd.DataFrame(detail_rows)

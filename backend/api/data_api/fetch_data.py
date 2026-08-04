@@ -2578,35 +2578,36 @@ def query_adam_org_stock_sample_estimated(target_month: str):
 logger = logging.getLogger(__name__)
 
 
-def query_adam_sys_param():
-    """查询供电所补库系统参数（ADAM_SYS_PARAM）
+def query_adam_ais_sys_param():
+    """查询供电所补库系统参数（ADAM_AIS_SYS_PARAM）
 
     Returns:
-        pd.DataFrame: 列 REC_ORG_NO, REPLEISHMENT_CYCLE, TARGET_CYCLE_SERVICE_LEVEL, CYCLE_BASE_START_DATE
+        pd.DataFrame: 列 PARAM_ID, REC_ORG_NO, REPLEISHMENT_CYCLE,
+                      TARGET_CYCLE_SERVICE_LEVEL, CYCLE_BASE_START_DATE
     """
-    logger.info("[RS] 查询 ADAM_SYS_PARAM...")
+    logger.info("[RS] 查询 ADAM_AIS_SYS_PARAM...")
     try:
         host = API_CONFIG["database"]["host"]
         port = API_CONFIG["database"]["port"]
-        endpoint = '/exec/gk-adam-query-adam-sys-param'
+        endpoint = '/exec/gk-adam-query-adam-ais-sys-param'
         url = f"http://{host}:{port}{endpoint}"
         response = session.post(url, json={})
         response.raise_for_status()
         data = response.json()
         if isinstance(data, list) and len(data) == 0:
-            raise ValueError("ADAM_SYS_PARAM 返回数据为空")
+            raise ValueError("ADAM_AIS_SYS_PARAM 返回数据为空")
         if isinstance(data, list):
             df = pd.DataFrame(data)
         else:
             df = pd.DataFrame([data])
-        logger.info(f"[RS] ADAM_SYS_PARAM 查询成功: {len(df)} 条, "
+        logger.info(f"[RS] ADAM_AIS_SYS_PARAM 查询成功: {len(df)} 条, "
                     f"供电所 {len(df[df['REC_ORG_NO'] != '0000'])} 个 + 默认 1 条")
         return df
     except requests.exceptions.RequestException:
-        logger.exception("[RS] ADAM_SYS_PARAM 查询网络异常")
+        logger.exception("[RS] ADAM_AIS_SYS_PARAM 查询网络异常")
         raise
     except Exception:
-        logger.exception("[RS] ADAM_SYS_PARAM 查询失败")
+        logger.exception("[RS] ADAM_AIS_SYS_PARAM 查询失败")
         raise
 
 
@@ -2717,13 +2718,20 @@ def insert_into_adam_replenish_order(df: pd.DataFrame):
         endpoint = '/exec/gk-adam-insert-into-adam-replenish-order'
         url = f"http://{host}:{port}{endpoint}"
 
-        # NaN/Inf 处理
+        # NaN/Inf / 日期序列化处理
+        import datetime as _dt
         df = df.astype(object).where(df.notna(), None)
         records = df.rename(columns=str.lower).to_dict('records')
         for r in records:
             for k, v in r.items():
                 if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                     r[k] = None
+                elif isinstance(v, (_dt.datetime, pd.Timestamp)):
+                    # datetime/Timestamp → 'YYYY-MM-DD HH:MM:SS'（中间件 TIMESTAMP 无法解析 ISO T 格式）
+                    r[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+                elif isinstance(v, _dt.date):
+                    # 纯日期 → 'YYYY-MM-DD'
+                    r[k] = v.isoformat()
 
         total = len(records)
         batches = math.ceil(total / batch_size)
@@ -2761,6 +2769,30 @@ def insert_into_adam_replenish_order(df: pd.DataFrame):
         raise
     except Exception:
         logger.exception("[RS] 批量插入 ADAM_REPLENISH_ORDER 失败")
+        raise
+
+
+def delete_adam_replenish_order_by_date(cal_date: str):
+    """按补货日(CAL_DATE)删除旧的补货建议记录，防止重复插入
+
+    Args:
+        cal_date: 补货日期字符串，如 '2026-08-05'
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete-adam-replenish-order-by-date'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"cal_date": cal_date})
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"供电所补货-删除补货日({cal_date})旧建议: {data}")
+        return data
+    except requests.exceptions.RequestException:
+        logger.exception("供电所补货-删除旧建议网络异常")
+        raise
+    except Exception:
+        logger.exception("供电所补货-删除旧建议失败")
         raise
 
 

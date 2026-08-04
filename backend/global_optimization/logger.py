@@ -9,6 +9,8 @@ from datetime import datetime
 # 配置日志记录器
 logger = logging.getLogger('global_optimization')
 logger.setLevel(logging.INFO)
+# 关闭传播，避免日志重复输出到根 logger（否则同一条记录打两遍、格式不一致）
+logger.propagate = False
 
 # 避免重复添加处理器
 if not logger.handlers:

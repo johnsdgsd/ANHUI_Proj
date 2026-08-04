@@ -1,6 +1,6 @@
 """
 二阶段 (R,S) 补货算法 — 参数加载
-从 ADAM_SYS_PARAM 表加载补货周期 T、服务水平 alpha、基准起始日期 D0
+从 ADAM_AIS_SYS_PARAM 表加载补货周期 T、服务水平 alpha、基准起始日期 D0
 """
 import logging
 from datetime import date
@@ -13,16 +13,16 @@ logger = logging.getLogger(__name__)
 
 def load_substation_params(sys_param_df: pd.DataFrame) -> Tuple[Dict[str, dict], dict]:
     """
-    从 ADAM_SYS_PARAM DataFrame 中解析供电所参数。
+    从 ADAM_AIS_SYS_PARAM DataFrame 中解析供电所参数。
 
-    ADAM_SYS_PARAM 结构:
+    ADAM_AIS_SYS_PARAM 结构:
         REC_ORG_NO: '0000' 为通用默认配置，其他为供电所独立配置
         REPLEISHMENT_CYCLE: 补货周期 T（天）
         TARGET_CYCLE_SERVICE_LEVEL: 服务水平 alpha (0-1)
         CYCLE_BASE_START_DATE: 基准起始日期 D0
 
     Args:
-        sys_param_df: query_adam_sys_param() 返回的 DataFrame
+        sys_param_df: query_adam_ais_sys_param() 返回的 DataFrame
 
     Returns:
         substation_params: {org_no: {"T": int, "alpha": float, "D0": date}}
@@ -34,7 +34,7 @@ def load_substation_params(sys_param_df: pd.DataFrame) -> Tuple[Dict[str, dict],
     default_params: dict = {}
 
     if sys_param_df is None or sys_param_df.empty:
-        raise ValueError("ADAM_SYS_PARAM 查询为空，无法加载补货参数")
+        raise ValueError("ADAM_AIS_SYS_PARAM 查询为空，无法加载补货参数")
 
     for _, row in sys_param_df.iterrows():
         org_no = str(row['REC_ORG_NO']).strip()
