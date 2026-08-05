@@ -120,7 +120,7 @@ def run_warehouse_optimization() -> dict:
                     'Z1_cost': round(s['Z1']),
                     'Z2_avg_dist_km': round(s['Z2'], 1),
                     'n_opened_warehouses': s['n_opened'],
-                    'opened': s['opened_wh'][:5] + ('...' if len(s['opened_wh']) > 5 else ''),
+                    'opened': '、'.join(s['opened_wh'][:5]) + ('...' if len(s['opened_wh']) > 5 else ''),
                 }
                 for s in solutions
             ],

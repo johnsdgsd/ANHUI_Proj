@@ -264,12 +264,12 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
                 drop=True)
         logging.info(f"LotList去重后: {len(LotList)}行")
 
-    # ================= 3.5 【跨月扣减】下月初排时，扣除前月已排检定计划 =================
-    if not is_mid_month and not LotList.empty:
+    # ================= 3.5 【跨月扣减】始终扣除前月已排检定计划 =================
+    if not LotList.empty:
         target_dt = datetime.strptime(target_month, '%Y%m')
         prev_dt = target_dt - relativedelta(months=1)
         prev_month = prev_dt.strftime('%Y%m')
-        logging.info(f">>> [跨月扣减] 下月初排模式，查询前月({prev_month})已排检定计划...")
+        logging.info(f">>> [跨月扣减] 查询前月({prev_month})已排检定计划...")
 
         df_prev_plan = fetch_data("gk-adam-query_pending_detect_plans", {"target_month": prev_month})
         if not df_prev_plan.empty:
@@ -447,7 +447,30 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
     logging.info(f"缺货优先级计算完成: {len(org_priority)} 个网点")
     if org_priority:
         top5 = sorted(org_priority.items(), key=lambda x: x[1], reverse=True)[:5]
-        logging.info(f"缺货概率 TOP5: {top5}")
+        logging.info(f"缺货概率 TOP5 网点: {top5}")
+
+        # ---- 打印每个缺货概率TOP5网点的最缺设备码 ----
+        logging.info("=" * 70)
+        logging.info(f"{'排名':<4} {'网点编码':<12} {'网点名称':<16} {'缺货概率':>8} {'最缺设备码':<12} {'库存':>8} {'14天预测':>10} {'设备码缺货概率':>12}")
+        logging.info("-" * 70)
+        for rank, (org_no, org_prob) in enumerate(top5, 1):
+            # 取该网点缺货概率最高的设备码
+            node_rows = merged[merged['ORG_NO'] == org_no]
+            if not node_rows.empty:
+                best_row = node_rows.loc[node_rows['PROB'].idxmax()]
+                best_dev = str(best_row['DEV_CODE']).strip()
+                best_stock = float(best_row['STOCK_NUM'])
+                best_forecast = float(best_row['PRE_14DAY_NUM'])
+                best_prob = float(best_row['PROB'])
+                org_name = str(best_row.get('ORG_NAME', ''))
+            else:
+                best_dev = '-'
+                best_stock = 0
+                best_forecast = 0
+                best_prob = 0
+                org_name = ''
+            logging.info(f"{rank:<4} {str(org_no):<12} {org_name:<16} {org_prob:>8.4f} {best_dev:<12} {best_stock:>8.0f} {best_forecast:>10.0f} {best_prob:>12.4f}")
+        logging.info("=" * 70)
 
     # 【核心】：将 global_scheme_id、org_priority、设备码级数据作为最后参数返回
     return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast

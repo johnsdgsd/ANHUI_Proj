@@ -4,18 +4,25 @@ import requests
 import pandas as pd
 from datetime import datetime
 import calendar
+import sys
+
+# 强制绑定控制台输出，防止 Flask 多线程吞掉日志
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", stream=sys.stdout)
+
 from backend.config.config import API_CONFIG
 from backend.Scheduling.LoadDeliChcekData import LoadDeliChcekData
 from backend.Scheduling.GetCheckDeliverPlan import GetCheckDeliverPlan
 
 host = API_CONFIG["database"]["host"]
 port = API_CONFIG["database"]["port"]
-
 SQL_API_URL = f"http://{host}:{port}/exec"
 PK_API_URL = f"http://{host}:{port}/pk/next"
 
+
 def generate_safe_id():
+    """断网兜底使用的随机ID"""
     return random.randint(100000000000000, 999999999999999)
+
 
 def fetch_primary_keys(pk_code, num):
     """
@@ -35,6 +42,7 @@ def fetch_primary_keys(pk_code, num):
         logging.error(f"[{pk_code}] 请求主键发号器失败，启动随机兜底机制！错误: {e}")
 
     return [generate_safe_id() for _ in range(num)]
+
 
 def update_pre_conc_status(preConcId, stat):
     if not preConcId: return
@@ -76,10 +84,8 @@ def execute_batch(sql_id, data_list):
     logging.info(f"[{sql_id}] 成功执行 {success_count}/{len(data_list)} 条指令")
 
 
-
-def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
+def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
     try:
-        from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
         update_pre_conc_status(preConcId, '02')
 
         start_dt = datetime.strptime(preTime, '%Y-%m-%d')
@@ -268,33 +274,39 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
                     "global_scheme_id": global_scheme_id
                 })
 
-        logging.info("================ 开始回写数据库 ================")
+        if comp_flag == '02':
+            logging.info("================ 开始回写数据库 ================")
 
-        del_month_params = {
-            "pre_year": str(start_dt.year),
-            "pre_month": f"{start_dt.month:02d}"
-        }
+            del_month_params = {
+                "pre_year": str(start_dt.year),
+                "pre_month": f"{start_dt.month:02d}"
+            }
 
-        if is_mid_month:
-            logging.info(f"日检定: UPDATE{len(detect_update_list)}条, INSERT{len(detect_db_list)}条")
-            if detect_update_list:
-                execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
-            if detect_db_list:
-                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+            if is_mid_month:
+                logging.info(f"日检定: UPDATE{len(detect_update_list)}条, INSERT{len(detect_db_list)}条")
+                if detect_update_list:
+                    execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
+                if detect_db_list:
+                    execute_batch("gk-adam-insert_detect_plan", detect_db_list)
 
-            if month_detect_update_list:
-                execute_batch("gk-adam-update_month_detect_plan_num", month_detect_update_list)
-            if month_detect_db_list:
-                execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
+                if month_detect_update_list:
+                    execute_batch("gk-adam-update_month_detect_plan_num", month_detect_update_list)
+                if month_detect_db_list:
+                    execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
+            else:
+                execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
+                if detect_db_list:
+                    execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+
+                execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
+                if month_detect_db_list:
+                    execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
+
+            logging.info(f">>> [成功-检定] {target_month} 检定排程数据已落库。")
         else:
-            execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
-            if detect_db_list:
-                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+            logging.info(f">>> [comp_flag=01] 检定排程数据跳过回写，仅输出配送和排班。")
 
-            execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
-            if month_detect_db_list:
-                execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
-
+        # 配送和排班始终回写
         execute_batch("gk-adam-delete_undelivered_scheme_det", [{"target_month": target_month}])
         execute_batch("gk-adam-delete_undelivered_scheme", [{"target_month": target_month}])
 
@@ -309,9 +321,19 @@ def run_check_deliver_process(preTime, start_date,end_date,preConcId=None):
             execute_batch("gk-adam-insert_work_arrange_pre", work_arrange_db_list)
 
         logging.info(f">>> [成功] {target_month} 检定与配送联动排程完毕，数据已落库。")
-        DailyReplenishmentPlan(start_date, end_date)
+
+        # ---- 联动日补库：从 preTime 计算当月整月范围，生成日补库计划（恢复副本适配，不阻断排程结果） ----
+        try:
+            from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
+            month_start = start_dt.strftime('%Y-%m-01')
+            month_end = start_dt.strftime(f'%Y-%m-{last_day:02d}')
+            DailyReplenishmentPlan(month_start, month_end)
+            logging.info(f">>> 日补库数据已落库 ({month_start} ~ {month_end})。")
+        except Exception as e:
+            logging.error(f">>> 联动日补库失败（不阻断排程结果）: {e}", exc_info=True)
+
         update_pre_conc_status(preConcId, '03')
-        logging.info(f">>> 日补库数据已经落库。")
+
     except Exception as e:
         logging.error(f">>> [排程错误] {str(e)}", exc_info=True)
         update_pre_conc_status(preConcId, '04')

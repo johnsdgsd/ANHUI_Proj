@@ -37,8 +37,9 @@ def is_holiday(d: date) -> bool:
         logger.warning("chinese_calendar 未安装，仅判断周末")
         return d.weekday() >= 5
     except NotImplementedError:
-        # chinese_calendar 仅支持到 2025，2026+ 退化为周末判断
-        logger.warning(f"chinese_calendar 不支持 {d.year} 年，退化为周末判断")
+        # chinese_calendar 数据按年发布，当前 1.11.0 覆盖到 2026 年，2027+ 需升级库，
+        # 未覆盖年份退化为周末判断
+        logger.warning(f"chinese_calendar 无 {d.year} 年节假日数据（需升级库），退化为周末判断")
         return d.weekday() >= 5
 
 
@@ -67,7 +68,7 @@ def compute_rs_plan(
       6. q = max(0, S - I)
 
     Args:
-        inventory_df: ADAM_CITY_COUNTY_STOCK_SAMPLE 查询结果 (DS_SQL 已过滤 DIST_LV='05', DEV_STAT='01', OLD_NEW_FLAG='01')
+        inventory_df: ADAM_CITY_COUNTY_STOCK_SAMPLE 查询结果 (DS_SQL 已过滤 DIST_LV='05', DEV_STAT='09', OLD_NEW_FLAG='01')
                       列 ORG_NO, DEV_CODE, STOCK_NUM, DEV_CLS
         demand_df: ADAM_SUB_DMD_PRE 查询结果 (DS_SQL 已过滤 DIST_LV='05', VALID_FLAG='02', PRE_TYPE='05')
                    列 ORG_NO, DEV_CODE, PRE_DATE, PRE_NUM, BUS_TYPE
@@ -85,7 +86,7 @@ def compute_rs_plan(
     tomorrow = replenishment_date
 
     # ---- 1. 构建库存查找表 ----
-    # DS_SQL 已通过 EXISTS 过滤: DIST_LV='05' + DEV_STAT='01' + OLD_NEW_FLAG='01'
+    # DS_SQL 已通过 EXISTS 过滤: DIST_LV='05' + DEV_STAT='09'(合格在库) + OLD_NEW_FLAG='01'
     # 库存 ORG_NO 均为供电所级(9位)，直接精确匹配即可，无需县级回退
     if inventory_df.empty:
         stock_lookup: Dict[Tuple[str, str], float] = {}

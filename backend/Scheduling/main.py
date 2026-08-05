@@ -5,41 +5,40 @@ import logging
 import random
 import requests
 import pandas as pd
+
 pd.set_option('future.no_silent_downcasting', True)  # 彻底消灭类型降级警告
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import math
-# 在 main.py 顶部追加导入
 from backend.Scheduling.Service_CheckDeliver import run_check_deliver_process
-from backend.config.config import API_CONFIG
 from backend.Scheduling.GetArrPlan import GetArrPlan
 from backend.Scheduling.Getworkday import Getworkday
+from backend.config.config import API_CONFIG
 
-# 创建蓝图
+# 创建蓝图，供 api/run.py 统一注册（保持后端整体部署能力）
 bp = Blueprint('aps_scheduling', __name__, url_prefix='/api/aps')
-host = API_CONFIG["database"]["host"]
-port = API_CONFIG["database"]["port"]
-SQL_API_URL = f"http://{host}:{port}/exec"
-PK_API_URL =  f"http://{host}:{port}/pk/next"
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-# 清理可能被 Flask 劫持的旧输出通道
 for handler in logger.handlers[:]:
     logger.removeHandler(handler)
-# 建立新的屏幕输出通道，并强制刷新
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(console_handler)
 
+host = API_CONFIG["database"]["host"]
+port = API_CONFIG["database"]["port"]
+SQL_API_URL = f"http://{host}:{port}/exec"
+PK_API_URL = f"http://{host}:{port}/pk/next"
+
 
 def generate_safe_id():
-    """生成15位安全ID，防止达梦数据库 NUMBER(16,0) 溢出"""
+    """断网兜底使用的随机ID"""
     return random.randint(100000000000000, 999999999999999)
+
 
 def fetch_primary_keys(pk_code, num):
     """
-    【新增】统一调用序列号接口，批量获取主键
+    统一调用序列号接口，批量获取主键
     """
     if num <= 0: return []
     try:
@@ -73,36 +72,27 @@ def fetch_data(sql_id, params=None):
 
 
 def execute_batch(sql_id, data_list):
-    if not data_list:
-        return
+    if not data_list: return
     url = f"{SQL_API_URL}/{sql_id}"
     success_count = 0
-
     for data in data_list:
         try:
             response = requests.post(url, json=data)
             response.raise_for_status()
-
             resp_json = response.json() if response.text else {}
             if isinstance(resp_json, dict) and resp_json.get('code') in [500, -1]:
                 logging.error(f"[{sql_id}] 接口返回失败: {resp_json}")
             else:
                 success_count += 1
-
         except Exception as e:
-            logging.error(f"[{sql_id}] 插入单条数据失败: {e}")
-
-    logging.info(f"[{sql_id}] 成功插入 {success_count}/{len(data_list)} 条数据")
-
+            logging.error(f"[{sql_id}] 操作数据失败: {e}")
+    logging.info(f"[{sql_id}] 成功执行 {success_count}/{len(data_list)} 次数据库操作")
 
 
 def update_pre_conc_status(preConcId, stat):
-    """辅助函数：更新预测结论表的状态"""
-    if not preConcId:
-        return
+    if not preConcId: return
     url = f"{SQL_API_URL}/gk-adam-update_pre_conc_status"
     try:
-        # 传给 Java 后端的 key 依然叫 pre_conc_id，因为 DS_SQL 里配置的是 #{pre_conc_id}
         response = requests.post(url, json={"pre_conc_id": preConcId, "stat": stat})
         response.raise_for_status()
         logging.info(f"状态更新成功: preConcId [{preConcId}] -> STAT [{stat}]")
@@ -412,19 +402,15 @@ def handle_run_request():
     try:
         data = request.get_json() or {}
 
-        # 1. 获取时间参数 preMonth，如果不传或为空，默认计算下个月
         preMonth = data.get('preMonth')
         if not preMonth:
             next_month_dt = datetime.now() + relativedelta(months=1)
             preMonth = next_month_dt.strftime('%Y%m')
-            logging.info(f"未传入 preMonth，默认使用下个月: {preMonth}")
         else:
             preMonth = str(preMonth)
 
-        # 2. 获取预测结果表ID preConcId
         preConcId = data.get('preConcId')
 
-        # 3. 开启后台线程执行
         threading.Thread(target=run_full_aps_process, args=(preMonth, preConcId)).start()
 
         return jsonify({"code": 200, "msg": f"排程生成中: {preMonth}", "preConcId": preConcId}), 200
@@ -434,39 +420,18 @@ def handle_run_request():
 
 @bp.route('/plan/check_deliver/run', methods=['POST'])
 def handle_check_deliver_request():
-    from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
-    from datetime import datetime, timedelta
-    """
-    接收前端传来的滚动排程请求，具体到日。
-    请求体示例: {"preTime": "20260501", "preConcId": "123456"}
-    """
     try:
         data = request.get_json() or {}
         if 'preTime' not in data:
             return jsonify({"code": 400, "msg": "参数错误，必须包含 preTime (例如: 20260501)"}), 400
 
-        # 1. 获取前端传来的纯数字字符串
         raw_date_str = str(data['preTime']).strip()
-
-        # 2. 获取预测结果表ID
         preConcId = data.get('preConcId')
-
-        # 3. 按照 YYYYMMDD 格式解析
+        comp_flag = data.get('comp_flag', '02')
         dt_obj = datetime.strptime(raw_date_str, '%Y%m%d')
-
-        # 4. 转换回底层算法需要的 YYYY-MM-DD 标准格式
         algorithm_date_str = dt_obj.strftime('%Y-%m-%d')
 
-        start_date = datetime.strptime(algorithm_date_str,'%Y-%m-%d')
-        if start_date.month == 12:
-            end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
-        # 5. 开启后台线程执行，传入标准日期和 preConcId
-        start_date = start_date.strftime('%Y-%m-%d')
-        end_date = end_date.strftime('%Y-%m-%d')
-        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, start_date,end_date,preConcId)).start()
-
+        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, preConcId, comp_flag)).start()
 
         return jsonify({
             "code": 200,
@@ -478,3 +443,11 @@ def handle_check_deliver_request():
         return jsonify({"code": 400, "msg": "日期格式错误，请使用 8位数字 的 YYYYMMDD 格式，例如: 20260501"}), 400
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
+
+
+if __name__ == '__main__':
+    # 独立调试入口：从项目根运行 python -m backend.Scheduling.main
+    from flask import Flask
+    _app = Flask(__name__)
+    _app.register_blueprint(bp)
+    _app.run(host='0.0.0.0', port=2500)

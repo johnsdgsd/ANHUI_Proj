@@ -583,64 +583,89 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
     all_cats = set(get_cat(lot['row']['DEV_CODE_NO']) for lot in LotObjects)
 
+    # =========================================================================
+    # 【修复】构建唯一物理产线映射，防止共享产线被多品类重复计数
+    # =========================================================================
+    unique_lines = {}  # {line_id: {'line': {...}, 'cats': {cat1, cat2, ...}}}
     for cat in all_cats:
-        lots_cat = [lot for lot in LotObjects if get_cat(lot['row']['DEV_CODE_NO']) == cat]
+        for l in DevCatToLines.get(cat, []):
+            lid = l['line_id']
+            if lid not in unique_lines:
+                unique_lines[lid] = {'line': l, 'cats': set()}
+            unique_lines[lid]['cats'].add(cat)
 
-        auto_lines = [l for l in DevCatToLines.get(cat, []) if l['veri_type'] == '02']
-        manual_lines = [l for l in DevCatToLines.get(cat, []) if l['veri_type'] == '01']
-        num_a, num_m = len(auto_lines), len(manual_lines)
-        if num_a == 0 and num_m == 0: continue
+    # =========================================================================
+    # Phase 1: 以物理产线为单位进行宏观产能规划
+    # =========================================================================
+    for lid, info in unique_lines.items():
+        line = info['line']
+        is_auto = (line['veri_type'] == '02')
+        veri_type_str = '02' if is_auto else '01'
+        cats = info['cats']
 
-        # 换算流速 PPH
-        sample_code = lots_cat[0]['row']['DEV_CODE_NO']
-        a_dur = get_detect_time(sample_code, '02')
-        m_dur = get_detect_time(sample_code, '01')
-        a_pph = (auto_lines[0]['batch_cap'] if num_a > 0 else 200) / a_dur if a_dur > 0 else 9999
-        m_pph = (manual_lines[0]['batch_cap'] if num_m > 0 else 200) / m_dur if m_dur > 0 else 9999
+        # ----- 预计算各品类的需求(小时)和 PPH -----
+        cat_demand_h = {}   # {cat: 总需求小时}
+        cat_pph = {}        # {cat: pph}
+        total_demand_h = 0.0
 
-        # 该品类全月总共要消化的数量
-        rem_items = sum(lot['rem'] for lot in lots_cat)
+        for cat in cats:
+            lots_cat = [lot for lot in LotObjects if get_cat(lot['row']['DEV_CODE_NO']) == cat]
+            rem = sum(lot['rem'] for lot in lots_cat)
+            if rem > 0 and lots_cat:
+                sample_code = lots_cat[0]['row']['DEV_CODE_NO']
+                dur = get_detect_time(sample_code, veri_type_str)
+                pph = line['batch_cap'] / dur if dur > 0 else 9999
+                cat_pph[cat] = pph
+                cat_demand_h[cat] = rem / pph
+                total_demand_h += rem / pph
+            else:
+                cat_pph[cat] = 9999
+                cat_demand_h[cat] = 0.0
 
-        # 按优先级阶梯，依次将任务量折算为时间铺设到日历上
+        if total_demand_h <= 0.0001:
+            continue
+
+        num_l = 1  # 一条物理产线，产能不能倍数化
+
+        # 按优先级阶梯，依次将工时铺设到日历上
         for p in passes:
-            # 如果不是基础班，且任务已经全部分配完了，停止后续更高级别的加班运算！
-            if not p.get('is_base', False) and rem_items <= 0.0001: break
+            if p['is_auto'] != is_auto:
+                continue  # 自动线/人工线只走各自对应的 pass
 
-            is_auto = p['is_auto']
-            if is_auto and num_a == 0: continue
-            if not is_auto and num_m == 0: continue
+            # 非基础班 → 产能缺口已填满则停止
+            if not p.get('is_base', False) and total_demand_h <= 0.0001:
+                break
 
-            pph = a_pph if is_auto else m_pph
-            num_l = num_a if is_auto else num_m
-
-            # 【完美月初优先】：永远从 day 0 (1号) 开始循环寻找可以垫高工时的日子！
+            # 【完美月初优先】：永远从 day 0 (1号) 开始循环
             for d_idx in range(total_sim_days):
-                if not p.get('is_base', False) and rem_items <= 0.0001: break
+                if not p.get('is_base', False) and total_demand_h <= 0.0001:
+                    break
 
                 d = all_days[d_idx]
                 is_wd = is_workday_safe(d)
 
-                # 'wd' 仅工作日生效，'we' 仅周末生效
-                if p['target'] == 'wd' and not is_wd: continue
-                if p['target'] == 'we' and is_wd: continue
-
-                cap_items = p['add_h'] * num_l * pph  # 这个班次格子能吃多少货
+                if p['target'] == 'wd' and not is_wd:
+                    continue
+                if p['target'] == 'we' and is_wd:
+                    continue
 
                 if p.get('is_base', False):
-                    # 基础班次无条件全月铺设 8H，即使导致 rem_items 变成负数（产能溢出）也没关系
-                    actual_items = cap_items
-                    need_h = p['add_h']
+                    # 基础班次无条件全月铺设，即使需求已满也铺（产能溢出无所谓）
+                    need_h = p['add_h'] * num_l
                 else:
-                    # 加班班次极度克制：只吃掉剩余的缺口量，缺口吃完立马停止，绝不多排一天！
-                    actual_items = min(rem_items, cap_items)
-                    need_h = actual_items / (num_l * pph)
+                    # 加班班次极度克制：只吃掉剩余缺口
+                    need_h = min(total_demand_h, p['add_h'] * num_l)
 
-                if is_auto:
-                    cat_auto_h_dict[cat][d_idx] += need_h
-                else:
-                    cat_manual_h_dict[cat][d_idx] += need_h
+                # 按各品类需求比例分配工时
+                for cat in cats:
+                    ratio = cat_demand_h[cat] / total_demand_h if total_demand_h > 0 else 0
+                    cat_h = need_h * ratio
+                    if is_auto:
+                        cat_auto_h_dict[cat][d_idx] += cat_h
+                    else:
+                        cat_manual_h_dict[cat][d_idx] += cat_h
 
-                rem_items -= actual_items
+                total_demand_h -= need_h
 
     # =========================================================================
     # 【核心：Phase 2 微观批次物理落盘 (绝不撕裂)】
