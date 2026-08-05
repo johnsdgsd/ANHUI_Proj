@@ -122,10 +122,14 @@ def compute_rs_plan(
     dmd['PRE_NUM'] = dmd['PRE_NUM'].fillna(0).astype(float)
 
     # ---- 4. 遍历每个 (供电所, DEV_CODE) 组合 ----
-    # 注: DS_SQL 已通过 EXISTS 过滤 DIST_LV='05' + VALID_FLAG='02'，无需 Python 端再过滤
-    # 获取需求中所有唯一组合
+    # 注: DS_SQL 全网格查询已返回 有效供电所 × 启用设备码 的全组合（缺失补0），
+    # 因此 demand_pairs 即完整网格，无需 Python 端再过滤/扩充
     demand_pairs = dmd[['ORG_NO', 'DEV_CODE']].drop_duplicates()
-    # 补充库存中有但需求中没有的组合（不生成补货记录，但供参考）
+
+    # 预构建 (ORG, DEV) → {PRE_DATE: PRE_NUM} 查找表，避免每对扫描全表（全网格下组合数 ~万级）
+    dmd_lookup: Dict[Tuple[str, str], Dict[date, float]] = {}
+    for (org, dev), g in dmd.groupby(['ORG_NO', 'DEV_CODE']):
+        dmd_lookup[(org, dev)] = dict(zip(g['PRE_DATE'], g['PRE_NUM']))
 
     results = []
     stats = {
@@ -163,16 +167,15 @@ def compute_rs_plan(
 
             # 4d. 聚合需求: PRE_DATE ∈ [tomorrow, tomorrow + T - 1]
             end_date = tomorrow + timedelta(days=T - 1)
-            mask = (
-                (dmd['ORG_NO'] == org) &
-                (dmd['DEV_CODE'] == dev) &
-                (dmd['PRE_DATE'] >= tomorrow) &
-                (dmd['PRE_DATE'] <= end_date)
-            )
-            future_demand = dmd.loc[mask, 'PRE_NUM'].sum()
+            daily = dmd_lookup.get((org, dev), {})
+            future_demand = 0.0
+            actual_days = 0
+            for d, v in daily.items():
+                if tomorrow <= d <= end_date:
+                    future_demand += v
+                    actual_days += 1
 
             # 检查是否不足 T 天
-            actual_days = dmd.loc[mask, 'PRE_DATE'].nunique()
             if actual_days < T:
                 stats['warn_insufficient_days'] += 1
                 logger.debug(f"  [{org}/{dev}] 需求不足 T={T} 天，实际 {actual_days} 天")

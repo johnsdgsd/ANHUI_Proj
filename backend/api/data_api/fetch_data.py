@@ -2692,6 +2692,56 @@ def query_adam_sub_dmd_pre(pre_type: str, start_date: str, end_date: str):
         raise
 
 
+def query_adam_sub_dmd_pre_grid(pre_type: str, start_date: str, end_date: str):
+    """查询供电所日需求预测（全网格版），对齐月度补库口径
+
+    返回 有效供电所(DIST_LV=05) × 启用设备码(PRE_RANGE_INFO STAT=01) × 日期 的全组合，
+    LEFT JOIN 实际需求，缺失补 0。这样算法维度 = 供电所数 × 启用设备码数，
+    而非只遍历需求表里实际存在的组合。
+
+    Args:
+        pre_type: 预测类型，'05' 为日预测
+        start_date: 起始日期，格式 'YYYY-MM-DD'
+        end_date: 截止日期，格式 'YYYY-MM-DD'
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, DEV_CODE, PRE_DATE, PRE_NUM
+    """
+    logger.info(f"[RS] 查询 ADAM_SUB_DMD_PRE 全网格 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sub-dmd-pre-grid'
+        url = f"http://{host}:{port}{endpoint}"
+        json_data = {
+            "pre_type": pre_type,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        response = session.post(url, json=json_data)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            logger.warning(f"[RS] 供电所需求预测全网格返回数据为空 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+            return pd.DataFrame()
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        df['PRE_NUM'] = df['PRE_NUM'].fillna(0).astype(float)
+        logger.info(f"[RS] 需求预测全网格查询成功: {len(df)} 条, "
+                    f"供电所 {df['ORG_NO'].nunique()} 个, "
+                    f"设备码 {df['DEV_CODE'].nunique()} 个, "
+                    f"日期 {df['PRE_DATE'].nunique()} 天")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception(f"[RS] 需求预测全网格查询网络异常 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+        raise
+    except Exception:
+        logger.exception(f"[RS] 需求预测全网格查询失败 (PRE_TYPE={pre_type}, {start_date} ~ {end_date})")
+        raise
+
+
 def insert_into_adam_replenish_order(df: pd.DataFrame):
     """批量插入补货建议数据到 ADAM_REPLENISH_ORDER 表
 
@@ -2902,11 +2952,12 @@ def query_adam_warehouse_candidate():
 
 
 def query_adam_power_station_active():
-    """查询活跃供电所列表
+    """查询活跃供电所列表（不按组织结构表过滤，只查活跃供电所）
 
     Returns:
-        pd.DataFrame: STATION_ID, STATION_ORG_CODE, STATION_NAME,
+        pd.DataFrame: STATION_ID, STATION_ORG_CODE, STATION_NAME, WH_ID,
                       STATION_ADDR, STATION_LON, STATION_LAT, ORG_NO, IS_ACTIVE
+        WH_ID: 供电所服务点唯一键（存在重复 STATION_ORG_CODE 时用于区分）
     """
     try:
         host = API_CONFIG["database"]["host"]
@@ -2934,7 +2985,8 @@ def query_adam_station_dist_mist():
     """查询供电所与各市县距离矩阵
 
     Returns:
-        pd.DataFrame: STATION_MIST_ID, ORG_NO, STATION_ORG_CODE, DISTANCE
+        pd.DataFrame: STATION_MIST_ID, ORG_NO, STATION_ORG_CODE, WH_ID, DISTANCE
+        WH_ID: 供电所服务点唯一键（与 ADAM_POWER_STATION.WH_ID 对应）
     """
     try:
         host = API_CONFIG["database"]["host"]

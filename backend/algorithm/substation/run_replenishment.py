@@ -19,7 +19,7 @@ sys.path.insert(0, _PROJ_DIR)
 from backend.api.data_api.fetch_data import (
     query_adam_ais_sys_param,
     query_adam_city_county_stock_sample,
-    query_adam_sub_dmd_pre,
+    query_adam_sub_dmd_pre_grid,
     query_adam_spec_code_config,
     query_adam_y_mgt_org,
     insert_into_adam_replenish_order,
@@ -103,7 +103,7 @@ def run_substation_replenishment() -> dict:
             end_of_month = min(forecast_end, date(int(year), int(month),
                                _last_day_of_month(int(year), int(month))))
             if start_of_month <= end_of_month:
-                df = query_adam_sub_dmd_pre(
+                df = query_adam_sub_dmd_pre_grid(
                     pre_type='05',
                     start_date=start_of_month.isoformat(),
                     end_date=end_of_month.isoformat(),
