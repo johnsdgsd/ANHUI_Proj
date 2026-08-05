@@ -566,9 +566,9 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     # 不看具体批次到达时间，纯算账！如果全月需要加班 2 天 12H，雷打不动铺在 1号、2号！
     # =========================================================================
 
-    # 记录每天分配的宏观工时上限
-    cat_auto_h_dict = defaultdict(lambda: np.zeros(total_sim_days))
-    cat_manual_h_dict = defaultdict(lambda: np.zeros(total_sim_days))
+    # 记录每天分配的宏观工时上限（线级，不再按品类拆分）
+    line_auto_h_dict = defaultdict(lambda: np.zeros(total_sim_days))    # {line_id: [day_hours]}
+    line_manual_h_dict = defaultdict(lambda: np.zeros(total_sim_days))  # {line_id: [day_hours]}
 
     # 定义 6 级阶梯。注意：is_base=True 代表基础工作日产能，无条件全月铺满 12H。
     # 其余阶梯都是加班增量，只有全月总任务吃不消时，才会从每月 1 号开始依次触发！
@@ -656,14 +656,11 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                     # 加班班次极度克制：只吃掉剩余缺口
                     need_h = min(total_demand_h, p['add_h'] * num_l)
 
-                # 按各品类需求比例分配工时
-                for cat in cats:
-                    ratio = cat_demand_h[cat] / total_demand_h if total_demand_h > 0 else 0
-                    cat_h = need_h * ratio
-                    if is_auto:
-                        cat_auto_h_dict[cat][d_idx] += cat_h
-                    else:
-                        cat_manual_h_dict[cat][d_idx] += cat_h
+                # 整块工时直接挂到产线上，不按品类拆分（品类互斥在 Phase 2 由批次锁保证）
+                if is_auto:
+                    line_auto_h_dict[lid][d_idx] += need_h
+                else:
+                    line_manual_h_dict[lid][d_idx] += need_h
 
                 total_demand_h -= need_h
 
@@ -694,10 +691,12 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 if lot['rem'] <= 0.0001: break
 
                 is_auto = (line['veri_type'] == '02')
-                # 调取 Phase 1 算好的当天这条线的“宏观最大工时”
-                allowed_h = cat_auto_h_dict[cat][curr_idx] if is_auto else cat_manual_h_dict[cat][curr_idx]
+                # 调取 Phase 1 算好的当天这条线的宏观最大工时（线级整块）
+                allowed_h = line_auto_h_dict[line['line_id']][curr_idx] if is_auto else line_manual_h_dict[line['line_id']][curr_idx]
+                if allowed_h <= 0.0001:
+                    continue
 
-                # 减去被前面的批次占用的时间，剩下的就是当前可分配的连续空隙
+                # 减去已被前面批次占用的时间，剩余即当前可分配的空隙
                 avail_h = allowed_h - HoursUsed[d][line['line_id']]
 
                 if avail_h > 0:

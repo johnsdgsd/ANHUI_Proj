@@ -84,7 +84,7 @@ def execute_batch(sql_id, data_list):
     logging.info(f"[{sql_id}] 成功执行 {success_count}/{len(data_list)} 条指令")
 
 
-def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
+def run_check_deliver_process(preTime, preConcId=None):
     try:
         update_pre_conc_status(preConcId, '02')
 
@@ -274,37 +274,34 @@ def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
                     "global_scheme_id": global_scheme_id
                 })
 
-        if comp_flag == '02':
-            logging.info("================ 开始回写数据库 ================")
+        logging.info("================ 开始回写数据库 ================")
 
-            del_month_params = {
-                "pre_year": str(start_dt.year),
-                "pre_month": f"{start_dt.month:02d}"
-            }
+        del_month_params = {
+            "pre_year": str(start_dt.year),
+            "pre_month": f"{start_dt.month:02d}"
+        }
 
-            if is_mid_month:
-                logging.info(f"日检定: UPDATE{len(detect_update_list)}条, INSERT{len(detect_db_list)}条")
-                if detect_update_list:
-                    execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
-                if detect_db_list:
-                    execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+        if is_mid_month:
+            logging.info(f"日检定: UPDATE{len(detect_update_list)}条, INSERT{len(detect_db_list)}条")
+            if detect_update_list:
+                execute_batch("gk-adam-update_day_detect_plan_dates", detect_update_list)
+            if detect_db_list:
+                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
 
-                if month_detect_update_list:
-                    execute_batch("gk-adam-update_month_detect_plan_num", month_detect_update_list)
-                if month_detect_db_list:
-                    execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
-            else:
-                execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
-                if detect_db_list:
-                    execute_batch("gk-adam-insert_detect_plan", detect_db_list)
-
-                execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
-                if month_detect_db_list:
-                    execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
-
-            logging.info(f">>> [成功-检定] {target_month} 检定排程数据已落库。")
+            if month_detect_update_list:
+                execute_batch("gk-adam-update_month_detect_plan_num", month_detect_update_list)
+            if month_detect_db_list:
+                execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
         else:
-            logging.info(f">>> [comp_flag=01] 检定排程数据跳过回写，仅输出配送和排班。")
+            execute_batch("gk-adam-delete_day_detect_plan", [{"target_month": target_month}])
+            if detect_db_list:
+                execute_batch("gk-adam-insert_detect_plan", detect_db_list)
+
+            execute_batch("gk-adam-delete_month_detect_plan", [del_month_params])
+            if month_detect_db_list:
+                execute_batch("gk-adam-insert_month_detect_plan", month_detect_db_list)
+
+        logging.info(f">>> [成功-检定] {target_month} 检定排程数据已落库。")
 
         # 配送和排班始终回写
         execute_batch("gk-adam-delete_undelivered_scheme_det", [{"target_month": target_month}])
@@ -322,7 +319,7 @@ def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
 
         logging.info(f">>> [成功] {target_month} 检定与配送联动排程完毕，数据已落库。")
 
-        # ---- 联动日补库：从 preTime 计算当月整月范围，生成日补库计划（恢复副本适配，不阻断排程结果） ----
+        # ---- 联动日补库：从 preTime 计算当月整月范围，生成日补库计划（不阻断排程结果） ----
         try:
             from backend.inventory_optimization.DailyReplenishmentPlan import DailyReplenishmentPlan
             month_start = start_dt.strftime('%Y-%m-01')
