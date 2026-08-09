@@ -426,10 +426,11 @@ def handle_check_deliver_request():
 
         raw_date_str = str(data['preTime']).strip()
         preConcId = data.get('preConcId')
+        comp_flag = data.get('comp_flag', '02')
         dt_obj = datetime.strptime(raw_date_str, '%Y%m%d')
         algorithm_date_str = dt_obj.strftime('%Y-%m-%d')
 
-        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, preConcId)).start()
+        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, preConcId, comp_flag)).start()
 
         return jsonify({
             "code": 200,
