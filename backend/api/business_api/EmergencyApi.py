@@ -6,12 +6,14 @@ from flask import Blueprint, request, jsonify
 from backend.EmergReplenish.EmergReplenishV2 import run_emergency_replenishment_v2
 from backend.global_optimization.logger import logger
 from datetime import datetime
+from backend.api.concurrency_lock import one_at_a_time
 
 # 创建蓝图
 emergency_bp = Blueprint('emergency', __name__, url_prefix='/emergency')
 
 
 @emergency_bp.route('/run', methods=['POST'])
+@one_at_a_time('emergency', '紧急补库')
 def generate_emergency_scheme():
     """
     生成紧急补库方案

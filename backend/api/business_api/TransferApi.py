@@ -7,12 +7,14 @@ from backend.Transfer.GetTransferScheme import GetTransferSchemeAndInsert
 from backend.api.data_api.fetch_data import update_adam_pre_conc_stat
 from backend.global_optimization.logger import logger
 from datetime import datetime
+from backend.api.concurrency_lock import one_at_a_time
 
 # 创建蓝图
 transfer_bp = Blueprint('transfer', __name__, url_prefix='/transfer')
 
 
 @transfer_bp.route('/run', methods=['POST'])
+@one_at_a_time('transfer', '调拨方案生成(一阶段)')
 def generate_transfer_scheme():
     """
     生成调拨方案（一阶段：按优先级就近调拨）
@@ -51,6 +53,7 @@ def generate_transfer_scheme():
 
 
 @transfer_bp.route('/run-scenario1', methods=['POST'])
+@one_at_a_time('transfer-scenario1', '调拨场景一(月初高库龄)')
 def generate_transfer_scenario1():
     """
     调拨场景一：月初高库龄调拨（二阶段 ILP 算法）
@@ -108,6 +111,7 @@ def generate_transfer_scenario1():
 
 
 @transfer_bp.route('/run-scenario2', methods=['POST'])
+@one_at_a_time('transfer-scenario2', '调拨场景二(缺货调拨)')
 def generate_transfer_scenario2():
     """
     调拨场景二：缺货调拨（含紧急补库分流，二阶段）

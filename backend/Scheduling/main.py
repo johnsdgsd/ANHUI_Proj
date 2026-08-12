@@ -14,6 +14,7 @@ from backend.Scheduling.Service_CheckDeliver import run_check_deliver_process
 from backend.Scheduling.GetArrPlan import GetArrPlan
 from backend.Scheduling.Getworkday import Getworkday
 from backend.config.config import API_CONFIG
+from backend.api.concurrency_lock import try_acquire, release, busy_json
 
 bp = Blueprint('aps_scheduling', __name__, url_prefix='/api/aps')
 logger = logging.getLogger()
@@ -410,7 +411,22 @@ def handle_run_request():
 
         preConcId = data.get('preConcId')
 
-        threading.Thread(target=run_full_aps_process, args=(preMonth, preConcId)).start()
+        # 并发保护：同一接口同一时间只允许一次调用，拿不到锁立即 409
+        LOCK_KEY = 'scheduling-plan'
+        if not try_acquire(LOCK_KEY, f"月到货排程 {preMonth} preConcId={preConcId}"):
+            return jsonify(busy_json(LOCK_KEY)), 409
+
+        def _wrapped():
+            try:
+                run_full_aps_process(preMonth, preConcId)
+            finally:
+                release(LOCK_KEY)
+
+        try:
+            threading.Thread(target=_wrapped, daemon=True).start()
+        except Exception:
+            release(LOCK_KEY)
+            raise
 
         return jsonify({"code": 200, "msg": f"排程生成中: {preMonth}", "preConcId": preConcId}), 200
     except Exception as e:
@@ -430,7 +446,22 @@ def handle_check_deliver_request():
         dt_obj = datetime.strptime(raw_date_str, '%Y%m%d')
         algorithm_date_str = dt_obj.strftime('%Y-%m-%d')
 
-        threading.Thread(target=run_check_deliver_process, args=(algorithm_date_str, preConcId, comp_flag)).start()
+        # 并发保护：同一接口同一时间只允许一次调用，拿不到锁立即 409
+        LOCK_KEY = 'scheduling-check-deliver'
+        if not try_acquire(LOCK_KEY, f"检定+配送滚动排程 {raw_date_str} preConcId={preConcId} comp_flag={comp_flag}"):
+            return jsonify(busy_json(LOCK_KEY)), 409
+
+        def _wrapped():
+            try:
+                run_check_deliver_process(algorithm_date_str, preConcId, comp_flag)
+            finally:
+                release(LOCK_KEY)
+
+        try:
+            threading.Thread(target=_wrapped, daemon=True).start()
+        except Exception:
+            release(LOCK_KEY)
+            raise
 
         return jsonify({
             "code": 200,

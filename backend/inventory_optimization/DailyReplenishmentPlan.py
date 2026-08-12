@@ -402,6 +402,11 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
 
     DistSchemeDf = query_adam_dist_scheme_by_date_range(start_date , end_date)
     DistSchemeDf['PLAN_DIST_DATE'] = DistSchemeDf['PLAN_DIST_DATE'].str[:10]
+    # 仅从未确认配送方案(DIST_FLAG='01')生成日补库，已确认(02)不重建
+    DistSchemeDf = DistSchemeDf[DistSchemeDf['DIST_FLAG'] == '01']
+    if DistSchemeDf.empty:
+        logging.info(f"[日补库] {start_date}~{end_date} 无未确认配送方案，跳过重建")
+        return pd.DataFrame(), {"success": True, "success_count": 0}
     print(f"当前日期格式示例：{DistSchemeDf['PLAN_DIST_DATE'].iloc[0]}")
     Dist_Scheme_ID = DistSchemeDf['DIST_SCHEME_ID'].tolist()
     
@@ -450,10 +455,25 @@ def DailyReplenishmentPlan(start_date: str, end_date: str):
     ).reset_index(drop=True)
 
     # 合并相同(REC_ORG_NO, DEV_CODE, PRE_DATE)的行，PLAN_IAS_NUM求和
-    group_cols = ['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE', 'DEV_CLS', 'DEV_CATEG', 'GLOBAL_SCHEME_ID']
-    DaliyReplPlan = DaliyReplPlan.groupby(group_cols, as_index=False)['PLAN_IAS_NUM'].sum()
+    # 分组键只取(日, 单位, 设备码)，保证【一天一单位一设备码仅一条】；
+    # 其余列(DEV_CLS/DEV_CATEG/GLOBAL_SCHEME_ID)取组内首值（同设备码其分类一致；方案ID取首条即可）
+    DaliyReplPlan = DaliyReplPlan.groupby(
+        ['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE'], as_index=False
+    ).agg(
+        PLAN_IAS_NUM=('PLAN_IAS_NUM', 'sum'),
+        DEV_CLS=('DEV_CLS', 'first'),
+        DEV_CATEG=('DEV_CATEG', 'first'),
+        GLOBAL_SCHEME_ID=('GLOBAL_SCHEME_ID', 'first'),
+    )
     DaliyReplPlan = DaliyReplPlan[['REC_ORG_NO', 'DEV_CLS', 'DEV_CATEG', 'DEV_CODE',
                                      'PLAN_IAS_NUM', 'PRE_DATE', 'GLOBAL_SCHEME_ID']]
+
+    # 唯一性断言：一天一单位一设备码仅一条（分组键已保证，此处兜底校验）
+    _dup = DaliyReplPlan.duplicated(subset=['PRE_DATE', 'REC_ORG_NO', 'DEV_CODE']).sum()
+    if _dup > 0:
+        logging.warning(f"[日补库] 生成批次存在 {_dup} 个重复(日,单位,设备码)，请检查上游配送方案")
+    else:
+        logging.info(f"[日补库] 唯一性校验通过: 一天一单位一设备码仅一条 ({len(DaliyReplPlan)} 行)")
 
     timestamp = int(time.time()*1000)
     DaliyReplPlan['EST_STOCK_NUM'] = None

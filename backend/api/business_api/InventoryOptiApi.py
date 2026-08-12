@@ -14,6 +14,7 @@ from backend.inventory_optimization.SchedulingDeliveryAdapter import AdjustDaliy
 from backend.DelivPlanV4 import AdjustDaliyDeliveryV4
 from backend.inventory_optimization.GetMonthlyOrder import GenerateMonthlyThresholdAndOrder
 from backend.inventory_optimization.GaOptimization import GenerateMonthlyThresholdAndOrderGA
+from backend.api.concurrency_lock import one_at_a_time
 # 创建蓝图
 inventory_opti_bp = Blueprint('inventory_opti', __name__, url_prefix='/inventory')
 
@@ -69,6 +70,7 @@ def optimize():
 
 # 月度补库和月度阈值（分析版，保留备用）
 @inventory_opti_bp.route('/optimize-analytical', methods=['POST'])
+@one_at_a_time('inventory-optimize-analytical', '月度阈值(解析法)')
 def GetMonthThresholdAndOrderAnalytical():
     try:
         data = request.get_json() or {}
@@ -140,6 +142,7 @@ def GetMonthThresholdAndOrderAnalytical():
 
 # 月度补库和月度阈值（遗传算法版）
 @inventory_opti_bp.route('/optimize', methods=['POST'])
+@one_at_a_time('inventory-optimize', '月度阈值(遗传算法)')
 def GetMonthThresholdAndOrder():
     try:
         data = request.get_json() or {}
@@ -250,6 +253,7 @@ def GetMonthThresholdAndOrder():
 
 # 周度阈值
 @inventory_opti_bp.route('/generate-weekly-threshold', methods=['POST'])
+@one_at_a_time('inventory-weekly-threshold', '周度阈值')
 def GenerateWeeklyThresholdRoute():
     from backend.api.data_api.fetch_data import  update_adam_pre_conc_stat
     """生成周度库存阈值并插入数据库"""
@@ -320,6 +324,7 @@ def AdjustDailyDeliveryPlan():
 
 
 @inventory_opti_bp.route('/adjust-daily-delivery-v2', methods=['POST'])
+@one_at_a_time('inventory-adjust-daily-delivery-v2', '日配送调整V2')
 def AdjustDailyDeliveryPlanRange():
     """
     调整日补库计划接口
@@ -392,6 +397,7 @@ def AdjustDailyDeliveryPlanRange():
 
 
 @inventory_opti_bp.route('/generate-daily-replenishment', methods=['POST'])
+@one_at_a_time('inventory-daily-replenishment', '日补库生成')
 def GenerateDailyReplenishmentPlan():
     """
     生成日度补库计划接口
@@ -431,6 +437,7 @@ def GenerateDailyReplenishmentPlan():
 
 
 @inventory_opti_bp.route('/adjust-daily-delivery-v3', methods=['POST'])
+@one_at_a_time('inventory-adjust-daily-delivery-v3', '日配送调整V3')
 def AdjustDailyDeliveryPlanRangeV2():
     """
     调整日补库计划接口 V2（启发式算法）
@@ -505,6 +512,7 @@ def AdjustDailyDeliveryPlanRangeV2():
 
 
 @inventory_opti_bp.route('/adjust-daily-delivery-v4', methods=['POST'])
+@one_at_a_time('inventory-adjust-daily-delivery-v4', '日配送调整V4')
 def AdjustDailyDeliveryPlanV3():
     """
     调整日补库计划接口 V3（ALNS 算法，复用 Scheduling 模块）
@@ -579,6 +587,7 @@ def AdjustDailyDeliveryPlanV3():
 
 
 @inventory_opti_bp.route('/adjust-daily-delivery', methods=['POST'])
+@one_at_a_time('inventory-adjust-daily-delivery', '日配送调整(集合划分)')
 def AdjustDailyDeliveryPlanV4():
     """
     调整日补库计划接口 V4（集合划分 ILP 算法）

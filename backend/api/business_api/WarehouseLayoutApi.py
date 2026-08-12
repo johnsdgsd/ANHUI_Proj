@@ -7,6 +7,7 @@ import threading
 from flask import Blueprint, request, jsonify
 
 from backend.global_optimization.logger import logger
+from backend.api.concurrency_lock import try_acquire, release, busy_json
 
 warehouse_layout_bp = Blueprint(
     'warehouse_layout', __name__,
@@ -35,40 +36,52 @@ def run_warehouse_layout_optimization():
             run_warehouse_optimization,
         )
 
-        # 更新状态为处理中
-        update_adam_pre_conc_stat(int(preConcId), '02')
+        # 并发保护：同一接口同一时间只允许一次调用，拿不到锁立即 409
+        LOCK_KEY = 'warehouse-layout'
+        if not try_acquire(LOCK_KEY, f"仓网布局优化 preConcId={preConcId}"):
+            return jsonify(busy_json(LOCK_KEY)), 409
 
-        def _run():
-            try:
-                # 删除当日旧方案
-                from datetime import datetime
-                from backend.api.data_api.fetch_data import (
-                    delete_adam_layout_result_by_date,
-                    delete_adam_layout_result_det_by_date,
-                )
-                today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            # 更新状态为处理中
+            update_adam_pre_conc_stat(int(preConcId), '02')
+
+            def _run():
                 try:
-                    delete_adam_layout_result_det_by_date(today)
-                    delete_adam_layout_result_by_date(today)
-                    logger.info(f"[API] 已删除当日({today})旧方案")
+                    # 删除当日旧方案
+                    from datetime import datetime
+                    from backend.api.data_api.fetch_data import (
+                        delete_adam_layout_result_by_date,
+                        delete_adam_layout_result_det_by_date,
+                    )
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    try:
+                        delete_adam_layout_result_det_by_date(today)
+                        delete_adam_layout_result_by_date(today)
+                        logger.info(f"[API] 已删除当日({today})旧方案")
+                    except Exception as e:
+                        logger.warning(f"[API] 删除旧方案失败（继续执行）: {e}")
+
+                    result = run_warehouse_optimization()
+                    if result.get('success'):
+                        update_adam_pre_conc_stat(int(preConcId), '03')
+                    else:
+                        update_adam_pre_conc_stat(int(preConcId), '04')
+                    logger.info(f"[API] 仓网布局优化完成: {result.get('message', '')}")
                 except Exception as e:
-                    logger.warning(f"[API] 删除旧方案失败（继续执行）: {e}")
+                    logger.error(f"[API] 仓网布局优化异常: {e}", exc_info=True)
+                    try:
+                        update_adam_pre_conc_stat(int(preConcId), '04')
+                    except Exception:
+                        pass
+                finally:
+                    release(LOCK_KEY)
 
-                result = run_warehouse_optimization()
-                if result.get('success'):
-                    update_adam_pre_conc_stat(int(preConcId), '03')
-                else:
-                    update_adam_pre_conc_stat(int(preConcId), '04')
-                logger.info(f"[API] 仓网布局优化完成: {result.get('message', '')}")
-            except Exception as e:
-                logger.error(f"[API] 仓网布局优化异常: {e}", exc_info=True)
-                try:
-                    update_adam_pre_conc_stat(int(preConcId), '04')
-                except Exception:
-                    pass
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+        except Exception:
+            # update('02') 或起线程失败：释放锁，交由外层统一处理状态
+            release(LOCK_KEY)
+            raise
 
         return jsonify({
             "success": True,
