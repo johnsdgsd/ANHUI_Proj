@@ -4,9 +4,14 @@
 """
 
 import pandas as pd
+import math
 from datetime import datetime
 from backend.inventory_optimization.optimizer import InventoryOptimizer
 from backend.inventory_optimization.warehouse import CentralWarehouse
+
+# 01_04 设备（低需求、小库存）单独阈值上限系数：库存上限 ≤ CAP_MONTHS_01_04 个月需求。
+# 泊松高分位数在低需求时安全库存占比过大（需求1→阈值5，5倍），该帽让补库量与需求成正比。
+CAP_MONTHS_01_04 = 2
 
 
 def get_device_install_data(year:str):
@@ -236,13 +241,17 @@ def run_optimization_from_api(
 
         for wh in local_warehouses:
             for item_key, item in wh.items.items():
-                demand = item.generate_demand_quantile(target_month)
-                demand = round(demand)
-                order = max(0, demand - item.initial_inventory)
-
                 dev_info = spec_dev_dict.get(item.dev_code, {})
                 dev_cls = str(dev_info.get('DEV_CLS', '00')).replace('.0', '').strip().zfill(2)
                 dev_categ = str(dev_info.get('DEV_CATEG', '00_00'))
+
+                demand = item.generate_demand_quantile(target_month)
+                demand = round(demand)
+                # 01_04 单独阈值逻辑：库存上限 ≤ CAP_MONTHS_01_04 个月需求，避免泊松高分位数补库过量
+                if dev_categ == '01_04':
+                    monthly_demand = item.demand_distributions[target_month].lambda_
+                    demand = min(demand, math.ceil(CAP_MONTHS_01_04 * monthly_demand))
+                order = max(0, demand - item.initial_inventory)
 
                 order = _round_order_qty(int(order), dev_cls, dev_categ)
 

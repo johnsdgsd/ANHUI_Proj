@@ -3,34 +3,17 @@ import pandas as pd
 import pulp
 from pulp import lpSum
 import datetime
-import chinese_calendar
+import calendar
 import math
 import logging
 
-def get_nth_workday(n, date_str):
-    try:
-        target_datetime = datetime.datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-        year = target_datetime.year
-        month = target_datetime.month
-        first_day = datetime.date(year, month, 1)
+try:
+    import chinese_calendar
 
-        if month == 12:
-            last_day = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
-        else:
-            last_day = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    HAS_CALENDAR = True
+except ImportError:
+    HAS_CALENDAR = False
 
-        workday_count = 0
-        current_day = first_day
-        while current_day <= last_day:
-            if chinese_calendar.is_workday(current_day):
-                workday_count += 1
-                if workday_count == n:
-                    return current_day
-            current_day += datetime.timedelta(days=1)
-        return None
-    except Exception as e:
-        logging.error(f"日期推算错误: {e}")
-        return None
 
 def get_week_of_month(date):
     first_day = date.replace(day=1)
@@ -38,19 +21,54 @@ def get_week_of_month(date):
     adjusted_dom = dom + first_day.weekday()
     return math.ceil(adjusted_dom / 7)
 
-def GetArrPlan(LotList, TypeList, WorkDay):
+
+def GetArrPlan(LotList, TypeList, WorkDay_unused):
     """
-    核心排程求解器 (单日绝对不超 2500 箱，且强制平滑防止扎堆)
+    核心排程求解器
+    (单日绝对不超 2500 箱，优先填满工作日，超额自动溢出至节假日)
     """
     LotNum = len(LotList)
-    Ds = np.ones(LotNum) * WorkDay
-    Es = np.ones(LotNum)
+    if LotNum == 0:
+        return LotList
+
+    # 1. 动态解析当月所有自然日
+    ref_date_str = LotList['PLAN_ARR_DATE'].iloc[0]
+    if isinstance(ref_date_str, str):
+        ref_dt = datetime.datetime.strptime(ref_date_str, '%Y-%m-%d %H:%M:%S')
+    else:
+        ref_dt = ref_date_str
+
+    year = ref_dt.year
+    month = ref_dt.month
+    _, num_days = calendar.monthrange(year, month)
+
+    all_dates = [datetime.date(year, month, d) for d in range(1, num_days + 1)]
+
+    # 2. 标记每一天是否为工作日
+    is_workday = []
+    for d in all_dates:
+        # 五一、十一、元旦强硬限制兜底
+        if month == 5 and d.day in [1, 2, 3]:
+            is_workday.append(False)
+        elif month == 10 and d.day in [1, 2, 3, 4, 5, 6, 7]:
+            is_workday.append(False)
+        elif month == 1 and d.day == 1:
+            is_workday.append(False)
+        elif HAS_CALENDAR:
+            try:
+                is_workday.append(chinese_calendar.is_workday(d))
+            except:
+                is_workday.append(d.weekday() < 5)
+        else:
+            is_workday.append(d.weekday() < 5)
+
+    NumDays = num_days
     BoxCls = np.zeros(LotNum)
 
-    # 1. 将批次只数转换为箱数
-    for i in range(1, len(LotList) + 1):
-        LotSize = LotList['PLAN_ARR_NUM'].iloc[i - 1]
-        dev_code = LotList['DEV_CODE_NO'].iloc[i - 1]
+    # 3. 批次转换箱数
+    for i in range(LotNum):
+        LotSize = LotList['PLAN_ARR_NUM'].iloc[i]
+        dev_code = LotList['DEV_CODE_NO'].iloc[i]
 
         match_col = 'DEV_CODE_NO' if 'DEV_CODE_NO' in TypeList.columns else 'DEV_CODE'
         val_col = 'PACK_BOX_NUM' if 'PACK_BOX_NUM' in TypeList.columns else 'UNITPERBOX'
@@ -61,82 +79,71 @@ def GetArrPlan(LotList, TypeList, WorkDay):
         else:
             BoxCap = 5
 
-        BoxCls[i - 1] = math.ceil(LotSize / float(BoxCap))
+        BoxCls[i] = math.ceil(LotSize / float(BoxCap))
 
-    # 2. 创建线性规划问题
-    prob = pulp.LpProblem("arriveplan_boxes", sense=pulp.LpMinimize)
+    # 4. 创建线性规划问题 (全自然日映射)
+    prob = pulp.LpProblem("arriveplan_boxes_mixed", sense=pulp.LpMinimize)
 
-    XNum = LotNum * WorkDay
-    x = pulp.LpVariable.dicts("x", range(1, XNum + 3), lowBound=0, cat='Integer')
+    # x[i, j] 二元变量：表示第 i 个批次是否在当月第 j 天到货
+    x = pulp.LpVariable.dicts("x", ((i, j) for i in range(LotNum) for j in range(NumDays)), cat='Binary')
 
-    lb = np.zeros(XNum + 2)
-    ub = np.ones(XNum + 2)
-    ub[XNum] = sum(BoxCls)
-    ub[XNum + 1] = sum(BoxCls)
+    peak_1day = pulp.LpVariable("peak_1day", lowBound=0, cat='Continuous')
+    peak_2days = pulp.LpVariable("peak_2days", lowBound=0, cat='Continuous')
 
-    for i in range(1, XNum + 3):
-        x[i].lowBound = lb[i - 1]
-        x[i].upBound = ub[i - 1]
+    # 【物理硬红线】：无论是工作日还是节假日，单日卸货极限死死锁在 2500 箱！
+    prob += peak_1day <= 2500
 
-    # 【还原硬红线】：单日极限死死锁在 2500 箱！没有任何商量余地！
-    max_allowed_daily_boxes = 2500
-    prob += x[XNum + 1] <= max_allowed_daily_boxes
-
-    # 约束：每个批次必须安排在某一天
+    # 约束：每个批次必须被安排在某一天
     for i in range(LotNum):
-        prob += lpSum([x[i * WorkDay + j] for j in range(int(Es[i]), int(Ds[i]) + 1)]) == 1
+        prob += lpSum([x[i, j] for j in range(NumDays)]) == 1
 
-    # 约束：每天分配的批次累加箱数 <= 每日最大箱数变量
-    for i in range(WorkDay):
-        prob += lpSum([BoxCls[j] * x[i + j * WorkDay + 1] for j in range(LotNum)]) <= x[XNum + 1]
+    # 每日箱数统计变量
+    day_sums = [lpSum([BoxCls[i] * x[i, j] for i in range(LotNum)]) for j in range(NumDays)]
 
-    # 约束：连续两天分配的批次累加箱数 <= 连续两日最大箱数变量
-    for i in range(WorkDay - 1):
-        prob += lpSum([BoxCls[j] * x[i + j * WorkDay + 1] for j in range(LotNum)]) + \
-                lpSum([BoxCls[j] * x[i + 1 + j * WorkDay + 1] for j in range(LotNum)]) <= x[XNum + 2]
+    # 峰值约束
+    for j in range(NumDays):
+        prob += day_sums[j] <= peak_1day
 
-    # 【平滑防扎堆逻辑保留】：引入偏差惩罚变量，逼迫小单子散开
-    avg_boxes = sum(BoxCls) / max(1, WorkDay)
-    y_dev = pulp.LpVariable.dicts("y_dev", range(WorkDay), lowBound=0, cat='Continuous')
+    for j in range(NumDays - 1):
+        prob += day_sums[j] + day_sums[j + 1] <= peak_2days
 
-    for i in range(WorkDay):
-        day_sum = lpSum([BoxCls[j] * x[i + j * WorkDay + 1] for j in range(LotNum)])
-        prob += day_sum - avg_boxes <= y_dev[i]
-        prob += avg_boxes - day_sum <= y_dev[i]
+    # 平滑防扎堆
+    workday_count = sum(is_workday)
+    if workday_count == 0: workday_count = NumDays
+    avg_boxes = sum(BoxCls) / workday_count
 
-    # 目标函数：在遵守 2500 极限的前提下，压低峰值，惩罚扎堆 (权重 0.5)
-    prob += x[XNum + 2] + x[XNum + 1] + 0.5 * lpSum([y_dev[i] for i in range(WorkDay)])
+    y_dev = pulp.LpVariable.dicts("y_dev", range(NumDays), lowBound=0, cat='Continuous')
+    for j in range(NumDays):
+        prob += day_sums[j] - avg_boxes <= y_dev[j]
+        prob += avg_boxes - day_sums[j] <= y_dev[j]
 
-    # 3. 求解
-    solver = pulp.PULP_CBC_CMD(msg=False, options=['ratioGap=0.01', 'sec=15'])
+    # 【核心新增】：节假日惩罚金机制
+    # 计算所有被分配在非工作日(假日)的箱数总量
+    holiday_penalty_boxes = lpSum(
+        [BoxCls[i] * x[i, j] for i in range(LotNum) for j in range(NumDays) if not is_workday[j]])
+
+    # 目标函数：压低峰值 + 防扎堆 + 【极力避免占用节假日(每箱10万罚金)】
+    prob += peak_2days + peak_1day + 0.5 * lpSum([y_dev[j] for j in range(NumDays)]) + 100000 * holiday_penalty_boxes
+
+    # 5. 求解
+    solver = pulp.PULP_CBC_CMD(msg=False, options=['ratioGap=0.01', 'sec=30'])
     status = prob.solve(solver)
 
     if status != pulp.LpStatusOptimal:
-        logging.error(f"❌ [求解器报错] 排程失败！状态: {pulp.LpStatus[status]}。可能原因：当月总到货量远超 2500箱×工作天数 的极限！")
+        logging.warning(
+            f"⚠️ [到货排程] 求解状态: {pulp.LpStatus[status]}。本月工作日与节假日总产能均已逼近 2500 箱/天的物理极限！")
 
-    # 4. 组装结果矩阵
-    table = pd.DataFrame(index=range(LotNum), columns=range(WorkDay))
-
-    for i in range(1, XNum + 1):
-        row = (i - 1) // WorkDay
-        col = (i - 1) % WorkDay
-        table.iloc[row, col] = x[i].varValue
-
-    result = pd.DataFrame(columns=range(3), index=range(LotNum))
-
+    # 6. 组装结果映射回真实日期
+    result_dates = []
     for i in range(LotNum):
-        indices = table.columns[table.iloc[i] == 1].tolist()
-        result.iloc[i, 0] = LotList['PLAN_ARR_NUM'].iloc[i]
+        assigned_day_idx = 0
+        for j in range(NumDays):
+            if x[i, j].varValue and x[i, j].varValue >= 0.5:
+                assigned_day_idx = j
+                break
+        result_dates.append(all_dates[assigned_day_idx])
 
-        if len(indices) > 0:
-            result.iloc[i, 1] = indices[0] + 1
-        else:
-            result.iloc[i, 1] = WorkDay
-
-    reference_date_str = LotList['PLAN_ARR_DATE'].iloc[0]
-    result[2] = result[1].apply(lambda nth: get_nth_workday(int(nth), reference_date_str) if pd.notnull(nth) else None)
-
-    LotList['PLAN_ARR_DATE'] = result[2].values
+    LotList['PLAN_ARR_DATE'] = result_dates
     LotList['PLAN_ARR_DATE'] = pd.to_datetime(LotList['PLAN_ARR_DATE'], format='%Y-%m-%d')
     LotList['WEEK_SEQ'] = LotList['PLAN_ARR_DATE'].apply(get_week_of_month)
 

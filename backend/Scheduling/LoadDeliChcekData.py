@@ -173,6 +173,9 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
     locations = pd.concat([center_loc, locations], ignore_index=True)
 
     df_mapping = fetch_data("gk-adam-query_aps_pro_dev_mapping")
+    if df_mapping.empty:
+        logging.error("[致命错误] 设备映射表为空，无法继续排程！请检查数据库接口 gk-adam-query_aps_pro_dev_mapping 是否可用。")
+        raise RuntimeError("设备映射表(gk-adam-query_aps_pro_dev_mapping)查询结果为空，排程无法继续")
     df_mapping.columns = [c.upper() for c in df_mapping.columns]
 
     TypeList = df_mapping[['DEV_CODE_NO', 'PACK_BOX_NUM']].drop_duplicates().reset_index(drop=True)

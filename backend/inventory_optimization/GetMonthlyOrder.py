@@ -2,6 +2,7 @@
 生成月度库存阈值和补货订单
 """
 import time
+import math
 
 import pandas as pd
 import numpy as np
@@ -12,6 +13,10 @@ from numpy.matlib import empty
 from backend.inventory_optimization.item import Item
 from backend.inventory_optimization.demand_distribution import PoissonDistribution
 from backend.inventory_optimization.warehouse_initializer import LocalWarehouseInitializer
+
+# 01_04 设备（低需求、小库存）单独阈值上限系数：库存上限 ≤ CAP_MONTHS_01_04 个月需求。
+# 泊松高分位数在低需求时安全库存占比过大（需求1→阈值5，5倍），该帽让补库量与需求成正比。
+CAP_MONTHS_01_04 = 2
 
 
 def _ceil_to_multiple(qty: int, m: int) -> int:
@@ -28,7 +33,11 @@ def _round_order_qty(qty: int, dev_cls: str, dev_categ: str) -> int:
     elif dev_cls == '09':
         return _ceil_to_multiple(qty, 20)
     elif dev_cls == '01':
-        return _ceil_to_multiple(qty, 60) if dev_categ == '01_01' else _ceil_to_multiple(qty, 20)
+        if dev_categ == '01_01':
+            return _ceil_to_multiple(qty, 60)
+        elif dev_categ == '01_04':
+            return qty  # 01_04 低需求设备不取整（对齐 GA 版，否则阈值帽会被取整放大）
+        return _ceil_to_multiple(qty, 20)
     return qty
 
 
@@ -114,15 +123,19 @@ def GenerateMonthlyThresholdAndOrder(year: str, month: str,init_stock:pd.DataFra
     
     for warehouse in local_warehouses:
         for item_key, item in warehouse.items.items():
-            # 获取月度阈值
-            demand = item.generate_demand_quantile(int(month))
-            demand = round(demand)
-            # 月度补货量
-            order = demand - item.initial_inventory
-            order = max(0,order)
             # 获取设备分类和类别
             dev_cls = dev_cls_mapping.get(item.dev_code, '')
             dev_categ = dev_categ_mapping.get(item.dev_code, '')
+            # 获取月度阈值
+            demand = item.generate_demand_quantile(int(month))
+            demand = round(demand)
+            # 01_04 单独阈值逻辑：库存上限 ≤ CAP_MONTHS_01_04 个月需求，避免泊松高分位数补库过量
+            if dev_categ == '01_04':
+                monthly_demand = item.demand_distributions[int(month)].lambda_
+                demand = min(demand, math.ceil(CAP_MONTHS_01_04 * monthly_demand))
+            # 月度补货量
+            order = demand - item.initial_inventory
+            order = max(0, order)
             # 按设备类别/品类取整
             order = _round_order_qty(order, dev_cls, dev_categ)
 

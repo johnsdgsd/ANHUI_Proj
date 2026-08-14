@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份/压缩包
+*.zip
+*.rar
+*.7z
+*副本*
+
+# 数据文件（需求/库存/仿真输出等 Excel/CSV）
+*.xlsx
+*.xls
+*.csv
+data_cleaning/simulation/output/
+
+# 日志
+*.log
