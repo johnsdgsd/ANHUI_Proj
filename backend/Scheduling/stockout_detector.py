@@ -276,7 +276,13 @@ def detect_stockout(cur_date, beta=0.95):
                 '日期': cur_date.isoformat(),
             })
 
-    return pd.DataFrame(rows, columns=['ORG', 'DEV_CODE', '件数', '原始箱数', '当前库存', '日期'])
+    result_df = pd.DataFrame(rows, columns=['ORG', 'DEV_CODE', '件数', '原始箱数', '当前库存', '日期'])
+    # 最多保留缺货数量(件数)最大的 20 个网点
+    if not result_df.empty:
+        org_shortage = result_df.groupby('ORG')['件数'].sum()
+        top_orgs = set(org_shortage.nlargest(20).index)
+        result_df = result_df[result_df['ORG'].isin(top_orgs)].reset_index(drop=True)
+    return result_df
 
 
 # ================================================================

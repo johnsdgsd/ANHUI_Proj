@@ -4,9 +4,10 @@
 生产代码已有数据 → v5_5 格式映射:
   Demands矩阵 + SubTypeList → branches (网点箱数需求)
   DMAT距离矩阵 → d_center + full_d_ij
-  实时计算 → angle_matrix + compatible (余弦定理)
   VeCap/VNums → vehicles + transport_teams
   node_priority → priority_tasks
+
+angle_matrix / compatible 不由本模块计算，由 router.prepare_data 基于余弦定理统一生成。
 """
 import math
 import logging
@@ -37,7 +38,7 @@ FTL_CAPACITY = 1071
 FTL_DEMAND_THRESHOLD = 1071
 NON_TEAM_VEHICLES = [4, 3, 8]
 
-LOAD_RATE_TARGET = 0.80  # 软目标装载率（v5_61 用户 2026-08-10: 0.90→0.80，与硬80档一致，≥80% 无惩罚）
+LOAD_RATE_TARGET = 0.80
 PENALTY = 100.0
 LOAD_RATE_MID = 0.70
 PENALTY_MID = 400.0
@@ -57,21 +58,51 @@ LOAD_RATE_MIN_A_ONLY = 0.70
 DIST_MAX_KM = 750
 
 
-def get_params():
-    """返回 v5_5 全部业务参数字典"""
+def get_params(VeCap=None, VeUnitPrice=None):
+    """返回 v5_5 全部业务参数字典。
+
+    业务数据（车型容量 / 运输单价 / 整车直配容量）优先从数据库查询结果注入：
+      - VEHICLE_DEFS 容量  ← VeCap（按容量降序映射 大/中/小，与 VEHICLE_K 一致）
+      - C0 运输单价        ← VeUnitPrice（取容量最大车型的单价，元/箱·km）
+      - FTL_CAPACITY / FTL_DEMAND_THRESHOLD ← 大车（容量最大）容量
+    未传入（离线脚本）时回退到模块顶部默认常量。
+    算法超参（装载率 / 750km / 45° / 100箱）仍写死。
+    """
+    vehicle_defs = VEHICLE_DEFS
+    c0 = C0
+    ftl_capacity = FTL_CAPACITY
+    ftl_threshold = FTL_DEMAND_THRESHOLD
+
+    if VeCap is not None and len(VeCap) > 0:
+        # 按容量降序：大车=容量最大(k=0)，中车=k=1，小车=k=2（与 _build_vehicles 同口径）
+        order = sorted(range(len(VeCap)), key=lambda i: float(VeCap[i]), reverse=True)
+        names = ['大车', '中车', '小车'][:len(order)]
+        vehicle_defs = [{'name': names[k], 'capacity': int(float(VeCap[i]))}
+                        for k, i in enumerate(order)]
+        big_idx = order[0]
+        ftl_capacity = int(float(VeCap[big_idx]))
+        ftl_threshold = ftl_capacity
+        if VeUnitPrice is not None and big_idx < len(VeUnitPrice):
+            try:
+                up = float(VeUnitPrice[big_idx])
+                if up > 0:
+                    c0 = up
+            except (TypeError, ValueError):
+                pass
+
     return {
-        'VEHICLE_DEFS': VEHICLE_DEFS,
+        'VEHICLE_DEFS': vehicle_defs,
         'VEHICLE_NAMES': VEHICLE_NAMES,
         'VEHICLE_K': VEHICLE_K,
         'METERS_PER_KM': METERS_PER_KM,
         'EXPECTED_BRANCH_COUNT': EXPECTED_BRANCH_COUNT,
-        'C0': C0,
+        'C0': c0,
         'L_MAX': L_MAX,
         'THETA_MAX': THETA_MAX,
         'MISSING_DIST_SENTINEL': MISSING_DIST_SENTINEL,
         'FTL_VEHICLE_K': FTL_VEHICLE_K,
-        'FTL_CAPACITY': FTL_CAPACITY,
-        'FTL_DEMAND_THRESHOLD': FTL_DEMAND_THRESHOLD,
+        'FTL_CAPACITY': ftl_capacity,
+        'FTL_DEMAND_THRESHOLD': ftl_threshold,
         'NON_TEAM_VEHICLES': NON_TEAM_VEHICLES,
         'LOAD_RATE_TARGET': LOAD_RATE_TARGET,
         'PENALTY': PENALTY,
@@ -114,29 +145,23 @@ def build_data(Demands, LocationNum, TypeList, SubTypeList, DMAT,
     d_center, full_d_ij = _build_distance_data(
         DMAT, LocationNum, branch_codes, code_to_idx, center_code)
 
-    # ---- 4. 计算夹角矩阵 (angle_matrix, compatible) ----
-    angle_matrix, compatible = _build_angle_data(
-        DMAT, LocationNum, branch_codes, code_to_idx, center_code, d_center)
-
-    # ---- 5. 构建运输队 (transport_teams) ----
+    # ---- 4. 构建运输队 (transport_teams) ----
     transport_teams, team_vehicles_total = _build_transport_teams(
         daily_vehicle_limits, work_days, VNums, vehicle_types)
 
-    # ---- 6. 构建车辆参数 (vehicles in data['params']) ----
+    # ---- 5. 构建车辆参数 (vehicles in data['params']) ----
     vehicles = _build_vehicles(VeCap, team_vehicles_total, VNums, vehicle_types)
 
-    # ---- 7. 构建优先配送任务（新缺货检测算法） ----
+    # ---- 6. 构建优先配送任务（新缺货检测算法） ----
     cur_date = work_days[0] if work_days is not None and len(work_days) > 0 else None
     priority_tasks = _build_priority_tasks_v2(
         node_priority, branch_codes, demand_boxes, LocationNum, cur_date, code_to_idx)
 
-    # ---- 8. 组装 data dict ----
+    # ---- 7. 组装 data dict ----
+    # 字段与 data_loader.load_all() 对齐；angle_matrix/compatible 由 router.prepare_data 统一计算。
     data = {
         'branches': branches,
         'params': {'vehicles': vehicles},
-        'angle_matrix': angle_matrix,
-        'compatible': compatible,
-        'd_ij': full_d_ij,          # v5_5 router 用 d_ij 查分支间距离
         'd_center': d_center,
         'full_d_ij': full_d_ij,
         'center_code': center_code,
@@ -174,7 +199,12 @@ def _compute_demand_boxes(Demands, LocationNum, TypeList, SubTypeList):
 
 
 def _build_branches(node_org_map, demand_boxes, LocationNum, DMAT):
-    """从 node_org_map + DMAT 构建 v5_5 branches 字典"""
+    """从 node_org_map + DMAT 构建 v5_5 branches 字典。
+
+    与 data_loader 对齐：branches 只含网点（中心仓库不入 branches），branch 字段仅
+    name/group_code/dist_to_center_km/demand/has_demand；set_A/set_B 由
+    router._compute_sets 计算。中心仓库仅占位 branch_codes[0]/code_to_idx 供距离映射。
+    """
     branches = {}
     branch_codes = []
     code_to_idx = {}
@@ -184,18 +214,9 @@ def _build_branches(node_org_map, demand_boxes, LocationNum, DMAT):
     else:
         dmat = DMAT.values
 
-    # 索引 0 = 中心仓库（用 '34101' 兜底）
+    # 索引 0 = 中心仓库（用 '34101' 兜底）。仅占位 branch_codes/code_to_idx，
+    # 对应 DMAT 第 0 行/列（中心仓库 ↔ 网点），不写入 branches。
     center_code = '34101'
-    branches[center_code] = {
-        'name': '省级总库',
-        'code_len': len(center_code),
-        'group_code': center_code[:5],
-        'dist_to_center_km': 0.0,
-        'demand': 0,
-        'has_demand': False,
-        'set_A': False,
-        'set_B': False,
-    }
     branch_codes.append(center_code)
     code_to_idx[center_code] = 0
 
@@ -212,13 +233,10 @@ def _build_branches(node_org_map, demand_boxes, LocationNum, DMAT):
         boxes = int(demand_boxes[i - 1])  # demand_boxes 是 0-based
         branches[org_no] = {
             'name': org_no,
-            'code_len': len(org_no),
             'group_code': org_no[:5] if len(org_no) >= 5 else org_no,
             'dist_to_center_km': dist_center,
             'demand': boxes,
             'has_demand': boxes > 0,
-            'set_A': boxes > 0,    # 有需求的网点归类为 Set A
-            'set_B': False,
         }
         branch_codes.append(org_no)
         code_to_idx[org_no] = i
@@ -244,55 +262,16 @@ def _build_distance_data(DMAT, LocationNum, branch_codes, code_to_idx, center_co
             code_j = branch_codes[j] if j < len(branch_codes) else str(j)
             dist_km = float(dmat[i, j]) if not np.isnan(dmat[i, j]) else MISSING_DIST_SENTINEL
 
-            if i == 0:  # center → branch
+            if i == 0 and j != 0:  # center → branch
                 d_center[('center_to', code_j)] = dist_km
-            if j == 0:  # branch → center
+            elif j == 0 and i != 0:  # branch → center
                 d_center[(code_i, 'to_center')] = dist_km
-
-            if i != j:
+            elif i != j:  # branch ↔ branch（与 data_loader 一致，不含中心仓库）
                 full_d_ij[(code_i, code_j)] = dist_km
 
     logging.info(f"[adapter] 距离数据构建完成: d_center={len(d_center)}条, "
                  f"full_d_ij={len(full_d_ij)}条")
     return d_center, full_d_ij
-
-
-def _build_angle_data(DMAT, LocationNum, branch_codes, code_to_idx, center_code, d_center):
-    """用余弦定理计算网点间夹角和同方向兼容性"""
-    angle_matrix = {}
-    compatible = {}
-
-    if isinstance(DMAT, np.ndarray):
-        dmat = DMAT
-    else:
-        dmat = DMAT.values
-
-    for i in range(1, LocationNum + 1):
-        code_i = branch_codes[i]
-        d_ci = d_center.get(('center_to', code_i), MISSING_DIST_SENTINEL)
-
-        for j in range(i + 1, LocationNum + 1):
-            code_j = branch_codes[j]
-            d_cj = d_center.get(('center_to', code_j), MISSING_DIST_SENTINEL)
-            d_ij = dmat[i, j]
-
-            # 余弦定理: cos(θ) = (d_ci² + d_cj² - d_ij²) / (2 * d_ci * d_cj)
-            if d_ci > 0 and d_cj > 0:
-                cos_theta = (d_ci ** 2 + d_cj ** 2 - d_ij ** 2) / (2 * d_ci * d_cj)
-                cos_theta = max(-1.0, min(1.0, cos_theta))
-                angle_deg = math.degrees(math.acos(cos_theta))
-            else:
-                angle_deg = 90.0  # 兜底
-
-            angle_matrix[(code_i, code_j)] = angle_deg
-            angle_matrix[(code_j, code_i)] = angle_deg
-            is_same_dir = angle_deg <= THETA_MAX
-            compatible[(code_i, code_j)] = is_same_dir
-            compatible[(code_j, code_i)] = is_same_dir
-
-    logging.info(f"[adapter] 夹角矩阵: {len(angle_matrix)} 对, "
-                 f"同方向={sum(1 for v in compatible.values() if v)}")
-    return angle_matrix, compatible
 
 
 def _build_transport_teams(daily_vehicle_limits, work_days, VNums, vehicle_types=None):

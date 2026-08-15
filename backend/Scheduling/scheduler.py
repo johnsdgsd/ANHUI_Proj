@@ -46,15 +46,16 @@ from collections import defaultdict
 
 from ortools.sat.python import cp_model
 
-# reporter 模块不复制，内联 _branch_name 辅助函数
+# 绝对路径基准目录（子进程编排时 cwd 不固定，不能用相对路径）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def _branch_name(routes, code):
+    """网点编码 → 名称（本地实现，解除对 reporter 的依赖；用户 2026-08-10）。"""
     for r in routes:
         if code in r['stops']:
             return r['names'][r['stops'].index(code)]
     return code
-
-# 绝对路径基准目录（子进程编排时 cwd 不固定，不能用相对路径）
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ====== 算法超参数 ======
 SCHED_TIME_LIMIT = 30         # 单遍 min 峰值的求解时限（秒）
@@ -471,7 +472,7 @@ def validate(solution, routes, teams, params):
     return viol, checks
 
 
-def solve(routes, teams, params=None, time_limit=SCHED_TIME_LIMIT, verbose=True):
+def solve(routes, teams, params=None, time_limit=SCHED_TIME_LIMIT):
     """求解日程安排，返回日程解（不输出文件、不验证——由 main 分别调用 validate/输出）。
 
     由 main.py 调用（routes/teams/params 内存传递，不落盘交接）；
@@ -481,28 +482,27 @@ def solve(routes, teams, params=None, time_limit=SCHED_TIME_LIMIT, verbose=True)
         solution: 日程安排结果 dict（供 Stage-2 验证与输出报告使用）
     """
     t0 = time.time()
-    if verbose:
-        print("=" * 60)
-        print("  配送日程安排 (Step 2)")
-        print("  单遍 CP-SAT: min 非全优先日峰值 + 滑动窗口间隔硬约束")
-        print("=" * 60)
-        print("\n[1/2] 求解日程安排...")
+    print("=" * 60)
+    print("  配送日程安排 (Step 2)")
+    print("  单遍 CP-SAT: min 非全优先日峰值 + 滑动窗口间隔硬约束")
+    print("=" * 60)
 
-    solution = solve_schedule(routes, teams, time_limit=time_limit, verbose=verbose)
+    print("\n[1/2] 求解日程安排...")
+    solution = solve_schedule(routes, teams, time_limit=time_limit, verbose=True)
     solution['elapsed'] = time.time() - t0
 
-    if verbose:
-        # 控制台摘要
-        prio_routes = [r for r in routes if r['is_priority']]
-        print(f"\n  全优先日(工作日 1..{solution['n_prio_days']}): "
-              f"{len(prio_routes)} 条优先路线, "
-              f"{sum(solution['day_vol'][d] for d in range(1, solution['n_prio_days']+1))} 箱")
-        non_prio = solution['non_prio_days']
-        vols = [solution['day_vol'][d] for d in non_prio]
-        print(f"  非全优先日({len(non_prio)} 天): 峰值 {max(vols)} 箱, "
-              f"平均 {sum(vols)/len(vols):.0f} 箱, 范围 {min(vols)}~{max(vols)} 箱")
-        print(f"  到货间隔指标(事后,非目标): {solution['interval_cost']}")
-        print(f"  求解总耗时: {time.time()-t0:.1f}s")
+    # 控制台摘要
+    H = solution['H']
+    prio_routes = [r for r in routes if r['is_priority']]
+    print(f"\n  全优先日(工作日 1..{solution['n_prio_days']}): "
+          f"{len(prio_routes)} 条优先路线, "
+          f"{sum(solution['day_vol'][d] for d in range(1, solution['n_prio_days']+1))} 箱")
+    non_prio = solution['non_prio_days']
+    vols = [solution['day_vol'][d] for d in non_prio]
+    print(f"  非全优先日({len(non_prio)} 天): 峰值 {max(vols)} 箱, "
+          f"平均 {sum(vols)/len(vols):.0f} 箱, 范围 {min(vols)}~{max(vols)} 箱")
+    print(f"  到货间隔指标(事后,非目标): {solution['interval_cost']}")
+    print(f"  求解总耗时: {time.time()-t0:.1f}s")
     return solution
 
 

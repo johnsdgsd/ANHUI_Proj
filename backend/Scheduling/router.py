@@ -5,10 +5,13 @@ Stage 1 求解器：路径枚举 + 统一 MIP（两遍字典序）+ FTL 预处�
 参数传入各函数；本文件头部仅保留算法超参数。
 """
 import copy
+import logging
 import math
 import os
 import time
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)  # 进度日志(带时间戳,不受 verbose 门控)
 
 try:
     from ortools.sat.python import cp_model
@@ -34,6 +37,7 @@ MAX_ROUTES_AUTO_CAP = 2500     # 自适应 reduce：RPS=3 后路线数 ≤ 此�
 NUM_SEARCH_WORKERS = min(8, os.cpu_count() or 1)   # CP-SAT并行搜索线程数(用户 2026-08-09: 4→8,核数不足自动降)
 RATE_EPSILON = 0.001           # 装载率/占比浮点比较容差（validate 用）
 DIST_EPSILON = 0.1             # 距离浮点比较容差（validate 用）
+MAX_STOPS_PER_ROUTE = 3        # 枚举路径最多停靠点(1/2/3站);车队子任务数下界依赖此值,与 enumerate_routes 保持一致
 
 def _grade_pass2_time(n_mip_routes, construction=False):
     """Pass 2 时限分级（用户 2026-08-05）：按 MIP 路线数自动分档，替换固定超参。
@@ -59,7 +63,7 @@ def validate(solution, data, params):
     """Stage-1 路径划分验证（main 调用）：打印摘要 + 全部约束合规校验。
 
     与 scheduler.validate（Stage-2）对应；返回的 (viol, checks) 供
-    reporter.save_schedule 输出到合并 HTML 的校验段。
+    输出模块（reporter）渲染到合并 HTML 的校验段。
 
     Returns:
         (viol, checks): 违规明细列表 + 各约束检查项描述
@@ -87,6 +91,13 @@ def validate(solution, data, params):
     active = [c for c, b in branches.items() if b['has_demand']]
     total_demand = sum(branches[c]['demand'] for c in active)
     print(f"  需求满足: {solution['total_boxes']}/{total_demand} 箱")
+    # 需求完整校验(用户 2026-08-15): 已配送 < 总需求视为数据/求解缺陷,显式抛异常,
+    # 避免生成"需求没配完"的清单/报告(MIP 约束 (a) 本应保证满足;此处兜底拦截合并/提取缺陷)。
+    if solution['total_boxes'] < total_demand:
+        raise RuntimeError(
+            f"需求未完全配送: 已配送 {solution['total_boxes']}/{total_demand} 箱"
+            f"(缺 {total_demand - solution['total_boxes']} 箱)。"
+            f"请检查网点需求/运输队/距离数据是否一致。")
 
     vehicles = data['params']['vehicles']
     for k_idx, v in enumerate(vehicles):
@@ -281,19 +292,13 @@ def _ensure_full_load_routes(routes, routes_before, priority_tasks, cap_big):
             next_id += 1
     return routes
 
-def _team_volume_lb(params, subtasks, routes, branches, vehicles, hard_target):
-    """车队运量下界(快速预检):优先总量 + 无法与其它优先子任务拼装的子任务
-    单独成路线所需的最少拼车普通量。
+def _priority_cooccur(subtasks, routes):
+    """优先网点对是否共现于某枚举路线(能拼装的前提)。
 
-    用途:若 3000×N < 该下界则 N 车队必不可行,免去慢速 MIP 不可行证明。
-    例:1 车队下 阜阳城郊 532 无法与任何优先子任务拼装(其余优先网点同向角不符
-    无路线 / 利辛容量超限),单独路线需 ≥720(中车80%),下界 2841+188=3029 > 3000。
-    保守(低估)构造:可拼装者记 0 普通,故结果是真值的下界,不会误判可行为不可行。
+    返回 {branch_code: set(branch_code)}。供车队下界(运量结构下界 + 子任务数下界)共用,
+    避免两处重复计算。
     """
-    cap = [v['capacity'] for v in vehicles]
-    cap_big = cap[0]
     pri_branches = {c for _t, c, _s in subtasks}
-    # 优先网点对是否共现于某枚举路线(能拼装的前提)
     cooccur = {c: set() for c in pri_branches}
     for r in routes:
         stops = r['stops']
@@ -306,6 +311,22 @@ def _team_volume_lb(params, subtasks, routes, branches, vehicles, hard_target):
                 if b in pri_branches:
                     cooccur[a].add(b)
                     cooccur[b].add(a)
+    return cooccur
+
+
+def _team_volume_lb(params, subtasks, routes, branches, vehicles, hard_target, cooccur=None):
+    """车队运量下界(快速预检):优先总量 + 无法与其它优先子任务拼装的子任务
+    单独成路线所需的最少拼车普通量。
+
+    用途:若 3000×N < 该下界则 N 车队必不可行,免去慢速 MIP 不可行证明。
+    例:1 车队下 阜阳城郊 532 无法与任何优先子任务拼装(其余优先网点同向角不符
+    无路线 / 利辛容量超限),单独路线需 ≥720(中车80%),下界 2841+188=3029 > 3000。
+    保守(低估)构造:可拼装者记 0 普通,故结果是真值的下界,不会误判可行为不可行。
+    """
+    cap = [v['capacity'] for v in vehicles]
+    cap_big = cap[0]
+    if cooccur is None:
+        cooccur = _priority_cooccur(subtasks, routes)
     hard = hard_target if hard_target is not None else params['LOAD_RATE_TARGET_ANY_HARD_80']
     extra = 0
     for _tid, c, size in subtasks:
@@ -325,19 +346,47 @@ def _team_lower_bound(params, subtasks, team_mix, vehicles, max_teams=18,
                       routes=None, branches=None, hard_target=None):
     """车队下界:满足"车队池可承载优先子任务"的最小车队数。
 
-    size > 900 的子任务只能用大车(>中车容量),每个独占一辆大车;
-    其余优先量需车队池总容量覆盖(每队车一车一趟);
-    另受 params['TEAM_CAP_BOXES'](3000箱/队)日运量上限约束:车队数 ≥ ceil(优先总量/3000);
-    有 routes 时再叠加运量结构下界(_team_volume_lb,含不可拼装子任务所需普通量),
-    如当前实例 阜阳532 无法拼装 → 下界 ≥3029 → 车队数 ≥ 2,跳过 1 车队慢速探测。
+    四维下界(取最大,均低估优先、不会越过真实最少车队):
+    ① 大车独占:size > 900 的子任务只能用大车,每个独占一辆大车(pool[0] ≥ big_needed);
+    ② 箱量:优先总量 ≤ TEAM_CAP_BOXES×N → N ≥ ceil(优先总量/3000);
+    ③ 运量结构(_team_volume_lb):优先量 + 不可共载子任务单独成路线所需拼车普通量,
+       如 阜阳532 无法拼装 → 下界 ≥3029 → 车队数 ≥ 2;
+    ④ 子任务数/趟数(用户 2026-08-14):满载独占路线 + 不可共载各占一条 +
+       可共载最多 MAX_STOPS_PER_ROUTE 个/路线 = routes_needed;每队每天最多 sum(team_mix)
+       趟车(g2),⇒ N ≥ ceil(routes_needed/sum(team_mix))。碎片优先量(如 74 个)靠此跳过
+       大量慢速不可行探测。
     """
     cap = [v['capacity'] for v in vehicles]
+    cap_big = cap[0]
     big_needed = sum(1 for _t, _c, size in subtasks if size > 900)
     total_boxes = sum(size for _t, _c, size in subtasks)
     cap_lb = max(1, math.ceil(total_boxes / params['TEAM_CAP_BOXES']))
     if routes is not None:
-        vol_lb = _team_volume_lb(params, subtasks, routes, branches, vehicles, hard_target)
+        cooccur = _priority_cooccur(subtasks, routes)
+        vol_lb = _team_volume_lb(params, subtasks, routes, branches, vehicles,
+                                 hard_target, cooccur=cooccur)
         cap_lb = max(cap_lb, math.ceil(vol_lb / params['TEAM_CAP_BOXES']))
+        # ---- 子任务数/趟数下界(用户 2026-08-14): ----
+        # 满载(size==大车容量)子任务 h 约束限单站直达、独占一条路线;
+        # 不可共载碎片(无共现路线,或与任何其它优先子任务容量冲突)各占一条路线;
+        # 可共载碎片最多 MAX_STOPS_PER_ROUTE 个/路线。每队每天最多 sum(team_mix) 趟车
+        # (g2 允许的每队优先路线数)。有效下界: routes_needed ≤ R ≤ n_teams×sum(team_mix)
+        # ⇒ n_teams ≥ ceil(routes_needed / sum(team_mix))。低估优先,不会越过真实最少车队。
+        n_full = sum(1 for _t, _c, s in subtasks if s >= cap_big)
+        n_nonpack = 0
+        n_pack = 0
+        for _tid, c, size in subtasks:
+            if size >= cap_big:
+                continue
+            can_pack = any((c2 in cooccur[c] and size + size2 <= cap_big)
+                           for _t2, c2, size2 in subtasks if c2 != c)
+            if can_pack:
+                n_pack += 1
+            else:
+                n_nonpack += 1
+        routes_needed = n_full + n_nonpack + math.ceil(n_pack / MAX_STOPS_PER_ROUTE)
+        count_lb = math.ceil(routes_needed / max(1, sum(team_mix)))
+        cap_lb = max(cap_lb, count_lb)
     for N in range(cap_lb, max_teams + 1):
         pool = [team_mix[k] * N for k in range(3)]
         if pool[0] < big_needed:
@@ -846,6 +895,8 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     """
     if not HAS_ORTOOLS:
         raise RuntimeError("MIP 求解失败且无 OR-Tools，无法生成结果")
+    logger.info(f"[solve] Stage-1 MIP 开始: 枚举路线={len(routes)}条, "
+                f"enforce_load_rate={enforce_load_rate}")
 
     branches = data['branches']
     vehicles = data['params']['vehicles']
@@ -876,6 +927,8 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             print(f"  Auto MAX_ROUTES_PER_SET: 1 (RPS=3 后 {len(routes3)} routes > {MAX_ROUTES_AUTO_CAP}, "
                   f"降回 RPS=1 → {len(routes)} routes)")
     routes = _ensure_full_load_routes(routes, routes_before, priority_tasks, cap_big)
+    logger.info(f"[solve] 枚举={len(routes_before)}条 → Demand filter={len(routes_filt)}条 "
+                f"→ RPS后={len(routes3)}条(阈值{MAX_ROUTES_AUTO_CAP}) → 最终MIP={len(routes)}条")
     if verbose:
         print(f"Routes after reduction + full-load cloning: {len(routes)}")
 
@@ -907,22 +960,31 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             if result == 'feasible':
                 load_rate_hard_target = target
                 load_rate_probe = (s_probe, ctx_probe)   # 探测解共享:车队搜索/Pass 2 直接复用
+                logger.info(f"[solve] 装载率探测 {name}: 可行({el:.1f}s) → 采用硬{name}档")
                 if verbose:
                     print(f"  ✓ {name} hard feasible ({el:.1f}s) → using hard {name} for ANY")
                 break
             elif result == 'timeout':
                 load_rate_hard_target = target
+                logger.info(f"[solve] 装载率探测 {name}: 超时({el:.1f}s) → 按硬{name}档继续(可能不可行)")
                 if verbose:
                     print(f"  ⏱ {name} hard timeout ({el:.1f}s) → will try hard {name} in full solve")
                 break
             else:
+                logger.info(f"[solve] 装载率探测 {name}: 不可行({el:.1f}s) → 试更低档")
                 if verbose:
                     print(f"  ✗ {name} hard infeasible ({el:.1f}s)")
+        if load_rate_hard_target is None:
+            logger.info("[solve] 装载率探测: 硬档全不可行 → 回退软装载率档")
         if load_rate_hard_target is None and verbose:
             print("  → fallback to soft load rate")
 
     # ---- 车队搜索:递增尝试法(下界 → 逐 N 先贪心构造、再 MIP 探测) ----
+    # 用户 2026-08-14: 探测超时不再"假设可行并停"(那会令 Pass-2 400s×N 空烧),
+    # 改为继续探测更高 N(每 N 仍先试构造,构造成功直接给可行解+热启动);
+    # 首个超时 N 记入 fallback_N,仅当所有更高 N 都未证可行时才兜底采用。
     n_teams_opt = 0
+    fallback_N = None
     # warm_start = ('construct', plan, team_vols) 或 ('probe', solver, ctx)
     warm_start = None
     if has_teams:
@@ -933,6 +995,8 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
         if verbose:
             print(f"Team search: capacity lower bound N≥{lb} "
                   f"({len(subtasks)} priority subtasks)")
+        logger.info(f"[solve] 车队搜索: 下界N≥{lb}, {len(subtasks)}个优先子任务, "
+                    f"搜索范围[{lb}, {n_teams_max}]")
         hard_any = (load_rate_hard_target if load_rate_hard_target is not None
                     else params['LOAD_RATE_TARGET_ANY_HARD_80'])
         # 装载率档位探测可行解隐含的车队数:≤ N 时该解对 n_teams==N 模型仍合法,
@@ -979,23 +1043,30 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
                     print(f"  ✓ {N} team(s) feasible ({el:.1f}s) → min teams = {N}")
                 break
             elif result == 'timeout':
-                n_teams_opt = N
+                # 用户 2026-08-14: 不再"超时即假设可行并停"——继续探测更高 N,
+                # 每 N 仍先试贪心构造(构造成功直接拿到可行解+热启动)。
+                # 首个超时 N 记为 fallback,仅当所有更高 N 都未证可行时才兜底采用。
+                fallback_N = N if fallback_N is None else min(fallback_N, N)
                 if verbose:
-                    print(f"  ⏱ {N} team(s) timeout ({el:.1f}s) → assume feasible, "
-                          f"will verify in Pass 2")
-                break
+                    print(f"  ⏱ {N} team(s) timeout ({el:.1f}s) → try higher N")
             else:
                 if verbose:
                     print(f"  ✗ {N} team(s) infeasible ({el:.1f}s)")
         if n_teams_opt == 0:
-            n_teams_opt = n_teams_max
+            n_teams_opt = fallback_N if fallback_N is not None else n_teams_max
             if verbose:
-                print(f"  Fallback: n_teams = {n_teams_max}")
+                print(f"  Fallback: n_teams = {n_teams_opt}"
+                      + (f" (first timeout N={fallback_N})" if fallback_N is not None else ""))
+        logger.info(f"[solve] 车队搜索完成: n_teams_opt={n_teams_opt}, "
+                    f"fallback_N={fallback_N}, "
+                    f"warm_start={'construct' if warm_start and warm_start[0]=='construct' else ('probe' if warm_start else '无')}")
 
     # ---- Pass 2: 最低成本(含软装载率惩罚;无车辆数量目标) ----
     # 车队数递增回退:若探测假设的 N* 实际不可行(探测超时误判,或热启动未命中),
     # 逐步放大 max_n_teams 重试,得到合法解后再退出;避免整条流水线坠入贪心回退。
     solution = None
+    logger.info(f"[solve] Pass 2 开始: n_teams_opt={n_teams_opt}, n_teams_max={n_teams_max}, "
+                f"共尝试 {n_teams_max - n_teams_opt + 1} 次, 装载率档={load_rate_hard_target}")
     for trial_N in range(n_teams_opt, n_teams_max + 1):
         t0 = time.time()
         model2, ctx2 = _build_unified_model(params,
@@ -1006,6 +1077,15 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             effective_max_trips=effective_max_trips,
             transport_teams=transport_teams,
             qbar=qbar)
+
+        # 调试钩子(2026-08-15,四求解器对比用): DUMP_PROTO_PATH 环境变量设置时,
+        # 导出 Pass-2 首个试次的模型 proto(.proto,二进制),供外部求解器(HiGHS/CBC/SCIP)
+        # 读取同一数学模型做公平基准对比。
+        _dump = os.environ.get('DUMP_PROTO_PATH')
+        if _dump and trial_N == n_teams_opt:
+            model2.ExportToFile(_dump)
+            if verbose:
+                print(f"  [dump] Pass-2 模型 proto 已导出: {_dump}")
 
         # 热启动:首个尝试用探测/构造解做 hint,引导 CP-SAT 直接进入满足
         # 3000 箱/队上限的紧凑拼装可行域(否则 min-成本 会优先探索"宽松但超上限"的解)
@@ -1108,8 +1188,13 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
         if verbose:
             print(f"Pass 2 (n_teams ≤ {trial_N}): optimizing cost "
                   f"(limit {time_limit}s)...")
+        logger.info(f"[solve] Pass 2 求解 (≤{trial_N}队): 开始, limit={time_limit}s, "
+                    f"MIP路线={len(routes)}条")
         status = solver.Solve(model2)
         elapsed = time.time() - t0
+
+        logger.info(f"[solve] Pass 2 (≤{trial_N}队) 结束: {solver.StatusName(status)} "
+                    f"({elapsed:.1f}s)")
 
         if verbose:
             print(f"Status: {solver.StatusName(status)}, time: {elapsed:.1f}s")
@@ -1176,24 +1261,78 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             if trial_N >= n_teams_max:
                 break
 
+    # 档位回退(用户 2026-08-10):硬装载率档(90%/80%)Pass 2 无解 → 回退更低档重试。
+    # 探测档可能因构造 hard-fix / 装载率×3000队上限冲突而"伪不可行",硬档无解不一定是真无解;
+    # 只有软装载率档也失败才抛异常。回退顺序: 当前档 → 80% → 软。
+    if solution is None and load_rate_hard_target is not None:
+        for fb_tier in [params['LOAD_RATE_TARGET_ANY_HARD_80'], None]:
+            if fb_tier is not None and fb_tier >= load_rate_hard_target:
+                continue
+            fb_name = "硬80%" if fb_tier is not None else "软装载率"
+            logger.info(f"[solve] 硬{load_rate_hard_target:.0%}档 Pass 2 无解 → 回退{fb_name}档重试")
+            if verbose:
+                print(f"  ↻ 硬{load_rate_hard_target:.0%}档 Pass 2 无解 → 回退{fb_name}档重试...")
+            model_fb, ctx_fb = _build_unified_model(params,
+                data, routes, priority_tasks, n_teams_max, team_mix,
+                enforce_load_rate, fb_tier, objective='min_cost',
+                max_n_teams=(n_teams_max if has_teams else None),
+                effective_max_trips=effective_max_trips,
+                transport_teams=transport_teams, qbar=qbar)
+            # 软 hint 引导(构造/探测解,若可用)
+            if warm_start is not None and warm_start[0] == 'construct':
+                _plan = warm_start[1]
+                for rid, (k, subs, _t) in _plan.items():
+                    model_fb.AddHint(ctx_fb['x'][(rid, k)], 1)
+                    for tid, _br, _sz in subs:
+                        if (rid, tid) in ctx_fb['z']:
+                            model_fb.AddHint(ctx_fb['z'][(rid, tid)], 1)
+            elif load_rate_probe is not None:
+                s_hint, ctx_hint = load_rate_probe
+                for key, var in ctx_hint['x'].items():
+                    model_fb.AddHint(ctx_fb['x'][key], s_hint.Value(var))
+                for key, var in ctx_hint['z'].items():
+                    model_fb.AddHint(ctx_fb['z'][key], s_hint.Value(var))
+                for key, var in ctx_hint['y'].items():
+                    model_fb.AddHint(ctx_fb['y'][key], s_hint.Value(var))
+            tf = time.time()
+            solver_fb = cp_model.CpSolver()
+            solver_fb.parameters.max_time_in_seconds = _grade_pass2_time(len(routes), construction=False)
+            solver_fb.parameters.num_search_workers = NUM_SEARCH_WORKERS
+            solver_fb.parameters.linearization_level = 2
+            solver_fb.parameters.symmetry_level = 2
+            solver_fb.parameters.log_search_progress = verbose
+            if verbose:
+                print(f"  Pass 2 (n_teams ≤ {n_teams_max}, {fb_name}): optimizing cost...")
+            status_fb = solver_fb.Solve(model_fb)
+            elapsed_fb = time.time() - tf
+            logger.info(f"[solve] 回退{fb_name}档结束: {solver_fb.StatusName(status_fb)} "
+                        f"({elapsed_fb:.1f}s)")
+            if verbose:
+                print(f"  Status: {solver_fb.StatusName(status_fb)}, time: {elapsed_fb:.1f}s")
+            if status_fb in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                n_teams_actual = n_teams_max
+                if has_teams and ctx_fb['n_teams'] is not None:
+                    n_teams_actual = solver_fb.Value(ctx_fb['n_teams'])
+                solution = _extract_solution(params, solver_fb, routes, vehicles, branches, set_a,
+                    ctx_fb['x'], ctx_fb['y'], elapsed_fb,
+                    solver_fb.StatusName(status_fb),
+                    solver_fb.ObjectiveValue() / COST_SCALE,
+                    p=ctx_fb['p'], n_teams=n_teams_actual,
+                    n_teams_max=n_teams_max, team_mix=team_mix,
+                    z=ctx_fb['z'], eligible_by_route=ctx_fb['eligible_by_route'])
+                if verbose:
+                    print(f"  ✓ 回退{fb_name}档成功: {solver_fb.StatusName(status_fb)} "
+                          f"objective {solver_fb.ObjectiveValue()/COST_SCALE:.2f} yuan")
+                break
+
     if solution is None:
-        print("ERROR: MIP solver failed to find a solution.")
-        print("Falling back to greedy solution...")
-        vehicles_w = data['params']['vehicles']
-        greedy_sol = greedy_warm_start(params, data, routes)
-        solution = {
-            'routes': greedy_sol,
-            'total_cost': sum(s['cost'] for s in greedy_sol),
-            'total_boxes': sum(s['total_load'] for s in greedy_sol),
-            'vehicle_usage': {},
-            'delivered': {},
-            'solver_status': 'GREEDY_FALLBACK',
-            'solve_time': 0,
-            'teams_activated': 0,
-        }
-        for k_idx in range(len(vehicles_w)):
-            solution['vehicle_usage'][k_idx] = sum(
-                1 for s in greedy_sol if s.get('vehicle_k') == k_idx)
+        # 用户 2026-08-10：装载率(含软档)仍无可行解 → 抛异常，不再用贪心兜底。
+        # 贪心兜底会静默少送需求（原 202605 只送 94%），宁可显式失败让上层发现数据问题。
+        logger.error(f"[solve] Stage-1 MIP 全部档位(硬90/硬80/软)均无解, 抛异常终止 "
+                     f"(n_teams_max={n_teams_max}, MIP路线={len(routes)}条)")
+        raise RuntimeError(
+            f"Stage-1 MIP 在软装载率下仍找不到可行解（车队数升至 {n_teams_max} 仍失败）。"
+            f"请检查网点需求/运输队车辆池/角度距离数据是否一致。")
 
     # 合并 FTL + MIP 路线，补车队/优先任务字段，返回 merged（供 main 验证与日程安排）
     merged = merge_solutions(ftl_routes, solution)
@@ -1201,11 +1340,20 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     merged['total_teams'] = len(transport_teams) if transport_teams else 0
     merged['priority_tasks'] = priority_tasks or {}
     merged['teams_saturated'] = solution.get('teams_saturated')
+    logger.info(f"[solve] Stage-1 MIP 完成: {len(solution.get('routes', []))}条路线, "
+                f"总成本={solution.get('total_cost', 0):.0f}元, "
+                f"求解耗时={solution.get('solve_time', 0):.1f}s")
     return merged
 
 def _extract_solution(params, solver, routes, vehicles, branches, set_a, x, y, solve_time,
                       status_name, solver_obj, p=None, n_teams=0, n_teams_max=0,
                       team_mix=None, z=None, eligible_by_route=None):
+    """把 CP-SAT 解提取为 route_solution,并给优先路线标注车队号。
+
+    车队标注用"先填满前 n-1 队"回溯(含 MAX_BT_EXTRACT 迭代上限,防碎片优先量大时
+    指数爆炸;超限走贪心兜底,兜底保证每条优先路线 team≠0,避免 Step-2 日程把
+    team=0 当成"第 0 天"崩溃,最后一招放宽 3000 箱/队仅保槽位)。
+    """
     solution_routes = []
     total_cost = 0
     total_boxes = 0
@@ -1292,7 +1440,16 @@ def _extract_solution(params, solver, routes, vehicles, branches, set_a, x, y, s
                        for _ in range(n_teams)]
         assign_res = [None] * n_ord
 
+        # 回溯迭代上限:碎片优先量大 + 车队多时"先填满前 n-1 队"回溯可能指数爆炸
+        # (用户 2026-08-15 实测:74 碎片/11 队 Pass-2 后在此卡数分钟)。超限视为
+        # 标注失败,走下方贪心兜底(与 _construct_priority_packing 的 MAX_BT 一致)。
+        _bt_cnt = [0]
+        MAX_BT_EXTRACT = 50000
+
         def _assign(idx):
+            _bt_cnt[0] += 1
+            if _bt_cnt[0] > MAX_BT_EXTRACT:
+                return False
             if idx >= n_ord:
                 return True
             sr = ordered[idx]
@@ -1342,21 +1499,46 @@ def _extract_solution(params, solver, routes, vehicles, branches, set_a, x, y, s
                 print(f"  ✓ teams 1..{n_teams-1} saturated: no team can accept "
                       f"more priority routes")
         else:
-            # 兜底:按车型槽位贪心(极端情况下聚合可行但回溯未找到,打印警告)
+            # 兜底:按车型槽位贪心(极端情况下聚合可行但回溯未找到,打印警告)。
+            # 尊重 每队车型槽位 + 每队运量 ≤ 3000;最后仍放不下的路线放宽 3000 限
+            # (否则 team=0 会让 Step-2 日程把优先路线固定到"第 0 天"崩溃),仅保槽位。
             print(f"  WARNING: no team assignment fits {params['TEAM_CAP_BOXES']}/team; "
                   f"falling back to greedy type-slot labeling")
             teams_saturated = False
             remaining = {}
-            for t in range(n_teams_max):
+            for t in range(n_teams):
                 for k in range(len(vehicles)):
                     remaining[(t, k)] = team_mix[k]
-            for sr in sorted(priority_carriers, key=lambda s: -s['vehicle_k']):
+            team_vol = [0] * n_teams
+            unassigned = []
+            for sr in sorted(priority_carriers,
+                             key=lambda s: (-s['total_load'], -s['vehicle_k'])):
                 k = sr['vehicle_k']
-                for t in range(n_teams):
-                    if remaining.get((t, k), 0) > 0:
+                load = sr['total_load']
+                placed = False
+                for t in range(n_teams):   # 先填早车队,尽量贴合"前队饱和"
+                    if remaining.get((t, k), 0) > 0 \
+                            and team_vol[t] + load <= params['TEAM_CAP_BOXES']:
                         sr['team'] = t + 1
                         remaining[(t, k)] -= 1
+                        team_vol[t] += load
+                        placed = True
                         break
+                if not placed:   # 放宽 3000/队,仅保槽位 → 保证 team≠0,日程不崩
+                    for t in range(n_teams):
+                        if remaining.get((t, k), 0) > 0:
+                            sr['team'] = t + 1
+                            remaining[(t, k)] -= 1
+                            team_vol[t] += load
+                            placed = True
+                            print(f"  ⚠ route {sr['id']} overflowed team {t+1} volume "
+                                  f"(+{load}箱, >{params['TEAM_CAP_BOXES']})")
+                            break
+                if not placed:
+                    unassigned.append(sr['id'])
+            if unassigned:
+                print(f"  ⚠ unassigned priority routes (team=0 reaches scheduler): "
+                      f"{unassigned}")
 
     print(f"\nSelected routes: {len(solution_routes)} ({len(priority_carriers)} priority)")
     print(f"Total cost: {total_cost:.2f} yuan (solver obj: {solver_obj:.2f})")
@@ -1517,12 +1699,11 @@ def enumerate_routes(params, data, verbose=True):
         key = (i, j)
         if key in d_ij:
             return d_ij[key]
-        # fallback: try reversed or from angle CSV
         key_rev = (j, i)
         if key_rev in d_ij:
             return d_ij[key_rev]
-        # last resort: approximate from angle data
-        return data['d_ij'].get(key, data['d_ij'].get(key_rev, params['MISSING_DIST_SENTINEL']))
+        # 距离缺失由 data_loader 完整性检查抛异常; 此处兜底哨兵(不应触发)
+        return data['full_d_ij'].get(key, data['full_d_ij'].get(key_rev, params['MISSING_DIST_SENTINEL']))
 
     # 预计算每个网点的"邻居"（同方向兼容的网点）
     if verbose:
@@ -1888,15 +2069,78 @@ def merge_solutions(ftl_routes, mip_solution):
         'solve_time': mip_solution.get('solve_time', 0),
     }
 
-def prepare_data(data):
-    """车辆池（运输队.xlsx 各队车辆之和 → 每车 max_trips）+ 合并优先需求（取较大值）。
+# Set A/B 由算法内部确定(用户 2026-08-10), 不从数据库读取:
+#   Set A = 合肥本部(34401)/肥东(3440101)/肥西(3440102)/长丰(3440103) 的网点编码;
+#   Set B = 距中心仓库距离 > 150km 的网点。
+SET_A_CODES = {'34401', '3440101', '3440102', '3440103'}
+SET_B_DIST_KM = 150.0
 
-    就地修改 data（main 调用，作为求解前的数据准备）。
+
+def _compute_compatibility(data):
+    """用余弦定理从距离计算夹角/同向兼容性（用户 2026-08-10）。
+
+    正式环境数据库无夹角矩阵.csv，改用 中心↔网点(d_center) + 网点↔网点(full_d_ij) 距离：
+        cos(∠AOB) = (d_A² + d_B² − d_AB²) / (2·d_A·d_B)
+    同向兼容 = ∠ ≤ THETA_MAX(45°)。写入 data['compatible']（布尔,双向）与
+    data['angle_matrix']（角度度数,双向）。已验证与旧 CSV 的"同方向"列 100% 一致。
+    """
+    d_center = data['d_center']
+    full = data['full_d_ij']
+    branches = data['branches']
+    codes = list(branches.keys())
+    # THETA_MAX = 45° 是 get_params() 的算法常量(Excel 参数配置表已删除, 用户 2026-08-10)
+    thresh = 45.0
+    compatible = {}
+    angle_matrix = {}
+    for a in range(len(codes)):
+        ca = codes[a]
+        d_a = d_center.get(('center_to', ca), branches[ca].get('dist_to_center_km', 0)) or 0
+        for b in range(a + 1, len(codes)):
+            cb = codes[b]
+            d_b = d_center.get(('center_to', cb), branches[cb].get('dist_to_center_km', 0)) or 0
+            d_ab = full.get((ca, cb), full.get((cb, ca)))
+            if not d_ab or d_a <= 0 or d_b <= 0:
+                continue   # 距离缺失由 data_loader 完整性检查抛异常; 此处跳过
+            cos_v = (d_a ** 2 + d_b ** 2 - d_ab ** 2) / (2 * d_a * d_b)
+            cos_v = max(-1.0, min(1.0, cos_v))
+            deg = math.degrees(math.acos(cos_v))
+            ok = deg <= thresh
+            for key in [(ca, cb), (cb, ca)]:
+                compatible[key] = ok
+                angle_matrix[key] = deg
+    data['compatible'] = compatible
+    data['angle_matrix'] = angle_matrix
+    return data
+
+
+def _compute_sets(data):
+    """Set A/B 由算法内部确定（用户 2026-08-10），不从数据库读取：
+      - Set A = 硬编码 合肥本部/肥东/肥西/长丰 的网点编码；
+      - Set B = 距中心仓库距离 > 150km 的网点。
+    写入 branches[c]['set_A'] / ['set_B']，供枚举分类(ANY/A_ONLY/A_B)与装载率档位使用。
+    """
+    branches = data['branches']
+    for c, b in branches.items():
+        b['set_A'] = c in SET_A_CODES
+        b['set_B'] = (b.get('dist_to_center_km', 0) > SET_B_DIST_KM)
+    return data
+
+
+def prepare_data(data):
+    """计算夹角兼容性(余弦定理) + Set A/B(硬编码/距离) + 车辆池 + 合并优先需求。
+
+    就地修改 data（main 调用，作为求解前的数据准备）。夹角/Set A/B 均由算法内部
+    计算，不再依赖 夹角矩阵.csv / 数据库 Set A/B 列（正式环境数据库无这些）。
     """
     transport_teams = data.get('transport_teams', [])
     priority_tasks = data.get('priority_tasks', {})
 
-    # 车辆池 = 运输队.xlsx 各队车辆之和（旧 max_trips 大22/中66/小44 作废）
+    # ① 夹角/同向兼容性: 用余弦定理从距离计算（不再依赖 夹角矩阵.csv, 用户 2026-08-10）
+    _compute_compatibility(data)
+    # ② Set A/B: 硬编码(合肥本部/肥东/肥西/长丰) + 距中心>150km（不再读数据库, 用户 2026-08-10）
+    _compute_sets(data)
+
+    # ③ 车辆池 = 运输队.xlsx 各队车辆之和（旧 max_trips 大22/中66/小44 作废）
     if transport_teams:
         team_pool = [0, 0, 0]
         for t in transport_teams:

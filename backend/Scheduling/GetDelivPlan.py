@@ -35,7 +35,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay,
     # =========================================================================
     # 1. 准备 v5_5 参数和数据
     # =========================================================================
-    params = get_params()
+    params = get_params(VeCap=VeCap, VeUnitPrice=VeUnitPrice)
     data, branch_codes, code_to_idx = build_data(
         Demands, LocationNum, TypeList, SubTypeList, DMAT,
         VeCap=VeCap, VNums=VNums,
@@ -92,7 +92,7 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay,
     teams = build_teams_dict(transport_teams)
 
     logging.info(f">>> [v5.5] Stage-2 CP-SAT 日程安排 ({len(teams)} 个工作日)...")
-    schedule_solution = scheduler_solve(schedule_routes, teams, params, verbose=False)
+    schedule_solution = scheduler_solve(schedule_routes, teams, params)
 
     if schedule_solution is None:
         logging.warning("[v5.5] Stage-2 求解失败，所有路线放第0天")

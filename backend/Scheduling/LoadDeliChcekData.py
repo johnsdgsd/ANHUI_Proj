@@ -158,6 +158,13 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
     if df_demand.empty: raise ValueError("当月无需求数据")
     df_demand.columns = [c.upper() for c in df_demand.columns]
 
+    # 【中心库排除】34101=省级总库是配送起点，不是需求网点。若 remain_demand 带出
+    # 34101 的行，会导致 org_idx_map 索引错位、中心库被误当有需求网点(dist=0)→MIP 无解。
+    _before = len(df_demand)
+    df_demand = df_demand[df_demand['ORG_NO'].astype(str).str.strip() != '34101']
+    if len(df_demand) < _before:
+        logging.warning(f"[中心库排除] 已剔除 {_before - len(df_demand)} 行 ORG_NO=34101 的需求记录")
+
     # 【新增】：提取 GLOBAL_SCHEME_ID
     global_scheme_id = None
     if 'GLOBAL_SCHEME_ID' in df_demand.columns:

@@ -84,7 +84,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     # =========================================================================
     # 阶段一：调用空间运筹模型 (ALNS)，生成车辆配送明细方案
     # =========================================================================
-    # 0.5 构建网点优先级数组（索引 → 缺货概率），供 ILP 排序使用
+    # 0.5 构建网点优先级数组（索引 → 优先级），供 ILP 排序使用
     # =========================================================================
     node_priority = np.zeros(LocationNum + 1)  # 索引 0 = 省级总库，优先级为 0
     if org_priority:
@@ -93,7 +93,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             if org_no in org_priority:
                 node_priority[i] = org_priority[org_no]
         high_pri_nodes = np.sum(node_priority > 0.5)
-        logging.info(f"网点优先级已加载: {high_pri_nodes} 个网点缺货概率 > 0.5, "
+        logging.info(f"网点优先级已加载: {high_pri_nodes} 个高优先级网点, "
                      f"最大={node_priority.max():.4f}, 平均={node_priority[node_priority > 0].mean():.4f}")
     else:
         logging.info("网点优先级未传入，所有路线优先级为 0（无优先级惩罚）")
@@ -241,51 +241,6 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             logging.info(f"第{week}周   {date_range:<16} {week_routes[week]:<8} "
                         f"{week_boxes[week]:<10.0f} {veh_detail}")
         logging.info("=" * 70)
-
-    # ---- 缺货概率 TOP5 网点 + 设备码，含配送日期 ----
-    if org_priority or (dev_stock and dev_forecast):
-        logging.info("=" * 60)
-        logging.info(">>> 缺货概率 TOP5 及配送日期")
-        # 构建网点索引 → 最早配送日期
-        loc_earliest_day = {}  # loc_1based → date_str
-        for trip in ScheduledRoutes:
-            day_idx = trip.get('schedule_day_idx', 0)
-            if day_idx < len(work_days_list):
-                d_str = work_days_list[day_idx].strftime('%Y-%m-%d') if hasattr(work_days_list[day_idx], 'strftime') else str(work_days_list[day_idx])[:10]
-                for cid, _ in trip['deliveries']:
-                    if cid not in loc_earliest_day or d_str < loc_earliest_day[cid]:
-                        loc_earliest_day[cid] = d_str
-
-        if org_priority:
-            top_orgs = sorted(org_priority.items(), key=lambda x: x[1], reverse=True)[:5]
-            logging.info("--- TOP5 高缺货网点 ---")
-            for org_no, prob in top_orgs:
-                # 找该网点对应的 location index
-                loc_idx = None
-                for i in range(1, LocationNum + 1):
-                    if str(locations.loc[i, 'ORG_NO']).strip() == str(org_no).strip():
-                        loc_idx = i
-                        break
-                deliv_date = loc_earliest_day.get(loc_idx, '未配送')
-                logging.info(f"  网点={org_no} 缺货概率={prob:.4f} 最早配送日期={deliv_date}")
-
-        if dev_stock and dev_forecast:
-            dev_probs = []
-            for (org_no, dev_code), forecast in dev_forecast.items():
-                stock = dev_stock.get((org_no, dev_code), 0)
-                prob = max(0.0, 1.0 - stock / forecast) if forecast > 0 else 1.0
-                dev_probs.append((org_no, dev_code, prob, stock, forecast))
-            dev_probs.sort(key=lambda x: x[2], reverse=True)
-            logging.info("--- TOP5 高缺货设备码 ---")
-            for org_no, dev_code, prob, stock, forecast in dev_probs[:5]:
-                loc_idx = None
-                for i in range(1, LocationNum + 1):
-                    if str(locations.loc[i, 'ORG_NO']).strip() == str(org_no).strip():
-                        loc_idx = i
-                        break
-                deliv_date = loc_earliest_day.get(loc_idx, '未配送')
-                logging.info(f"  {org_no}/{dev_code} 库存={stock:.0f} 14天预测={forecast:.0f} 缺货概率={prob:.4f} 最早配送日期={deliv_date}")
-        logging.info("=" * 60)
 
     # 装箱前先跑检定规划
     DevCodeToIndex = {str(SubTypeList.loc[i, 'DEV_CODE_NO']).strip(): i for i in range(SubTypeNum)}
@@ -628,6 +583,15 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     # 可装箱设备码列表（预过滤：存在需求且在 dev_forecast 中有记录）
     active_dev_indices = list(range(SubTypeNum))
 
+    # 【修复·车型容量映射】ve_type 来自 v5_5 的 vehicle_k+1，是按容量降序的语义
+    # （1=大车/容量最大，2=中车，3=小车/容量最小）；而 VeCap/VeUnitPrice 是按 CAR_TYPE
+    # 升序排列（容量最小的车型在前）。直接用 VeCap[ve_type-1] 会把大车取成小车容量(459)，
+    # 小车取成大车容量(1071)，导致大车装到 459 箱就"假满载"，库存充足的设备码也装不满。
+    _order_desc = sorted(range(len(VeCap)), key=lambda i: float(VeCap[i]), reverse=True)
+    VeCap_desc = [float(VeCap[i]) for i in _order_desc]
+    VeUnitPrice_desc = [float(VeUnitPrice[i]) if i < len(VeUnitPrice) else 0.0695 for i in _order_desc]
+    VeCarType_desc = [all_vehicle_types[i] if i < len(all_vehicle_types) else (i + 1) for i in _order_desc]
+
     cumulative_shipped = np.zeros(SubTypeNum)  # 跨日累计已发货量，永不清零
     prev_date = None
     for trip in sorted_trips:
@@ -641,7 +605,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         de_nums = [amt for _, amt in trip['deliveries']]
 
         total_vol_used = 0.0
-        max_cap_boxes = float(VeCap[int(ve_type) - 1])
+        max_cap_boxes = VeCap_desc[int(ve_type) - 1]
         details_data = []
         prev_node = 0
 
@@ -696,9 +660,12 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 avail = day_stock[sub_idx] - cumulative_shipped[sub_idx]
                 if avail <= 0:
                     continue  # 库存不足，顺延到下个配送日
-                # 能装多少装多少：需求、库存、容量、剩余箱位的四重上限
+                # 能装多少装多少：需求、库存、整车容量、本网点本车配送箱数 四重上限
                 max_can_fit = math.floor(remaining_cap / vm)  # 按体积最多装几箱
-                max_qty = min(demand, avail, max_can_fit * unit_per_box)  # 最多装多少只
+                # 关键修复：本网点本车的配送箱数(vol_remaining)也必须是上限，
+                # 否则排序靠前的缺货设备码会超装、提前吃满整车容量，挤占排序靠后的库存充足设备码
+                max_by_vol_remaining = math.floor(vol_remaining / vm) * unit_per_box
+                max_qty = min(demand, avail, max_can_fit * unit_per_box, max_by_vol_remaining)  # 最多装多少只
                 if max_qty <= 0:
                     continue
                 # 一次性装完（同一设备码不拆散）
@@ -741,11 +708,13 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
         if details_data:
             actual_load_rate = min(1.0, total_vol_used / max_cap_boxes) if max_cap_boxes > 0 else 0
-            unit_price = float(VeUnitPrice[int(ve_type) - 1]) if len(VeUnitPrice) >= int(ve_type) and float(
-                VeUnitPrice[int(ve_type) - 1]) > 0 else 0.0695
+            unit_price = VeUnitPrice_desc[int(ve_type) - 1] if len(VeUnitPrice_desc) >= int(ve_type) and float(
+                VeUnitPrice_desc[int(ve_type) - 1]) > 0 else 0.0695
             actual_price = sum(d['PLAN_BOX_NUM'] * d['DIST_SEGMENT'] * unit_price for d in details_data)
 
-            master_data = {'CAR_TYPE': f"0{int(ve_type)}", 'PLAN_DIST_DATE': current_date.strftime('%Y-%m-%d'),
+            # CAR_TYPE 回写也必须按容量降序还原真实车型号（ve_type 是容量降序语义）
+            car_type = int(VeCarType_desc[int(ve_type) - 1]) if int(ve_type) - 1 < len(VeCarType_desc) else int(ve_type)
+            master_data = {'CAR_TYPE': f"0{car_type}", 'PLAN_DIST_DATE': current_date.strftime('%Y-%m-%d'),
                            'PRICE': actual_price, 'LOAD_RATE': f"{actual_load_rate * 100:.1f}%",
                            'UNIT_PRICE': unit_price}
             GlobalDelivPlan.append({'master': master_data, 'details': details_data})
@@ -762,42 +731,31 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                  f"{' ←缺口!' if boxing_remaining_units > 0.5 else ''}")
 
     # =========================================================================
-    # 配送 vs 月补库计划对比
+    # 装箱后：按设备码汇总缺口（根因：检定合格品库存不足，配送运力已覆盖）
     # =========================================================================
     logging.info("=" * 60)
-    logging.info(">>> 配送执行 vs 月补库计划 对比核验")
-    total_demand = 0.0
-    total_delivered = 0.0
-    mismatch_count = 0
-    mismatch_details = []
+    logging.info(">>> 装箱后设备码缺口汇总（根因：检定合格品库存不足）")
+    dev_gap_list = []
+    for j in range(SubTypeNum):
+        plan_qty = Demands[:, j].sum()
+        gap = Sim_Demands[:, j].sum()
+        if gap > 0.001:
+            dev_code = str(SubTypeList.loc[j, 'DEV_CODE_NO']).strip()
+            dev_gap_list.append((dev_code, plan_qty, plan_qty - gap, gap))
 
-    location_org_map = {i + 1: str(locations.loc[i + 1, 'ORG_NO']).strip() for i in range(LocationNum)}
-
-    for i in range(LocationNum):
-        org_no = location_org_map.get(i + 1, f'LOC_{i+1}')
-        for j in range(SubTypeNum):
-            plan_qty = Demands[i, j]
-            if plan_qty <= 0:
-                continue
-            remaining = Sim_Demands[i, j]
-            delivered = plan_qty - remaining
-            total_demand += plan_qty
-            total_delivered += delivered
-            if remaining > 0.001:
-                dev_code = str(SubTypeList.loc[j, 'DEV_CODE_NO']).strip()
-                mismatch_count += 1
-                mismatch_details.append(f"  [{mismatch_count}] 网点={org_no} 设备码={dev_code} "
-                                       f"月计划={plan_qty:.0f}只 实际配送={delivered:.0f}只 缺口={remaining:.0f}只")
-
-    coverage_pct = (total_delivered / total_demand * 100) if total_demand > 0 else 100
-    logging.info(f"总量: 月计划={total_demand:,.0f}只 → 实际配送={total_delivered:,.0f}只, "
+    total_demand = float(Demands.sum())
+    total_delivered = total_demand - float(Sim_Demands.sum())
+    coverage_pct = (total_delivered / total_demand * 100) if total_demand > 0 else 100.0
+    logging.info(f"总量: 月计划={total_demand:,.0f}只 → 实际装箱={total_delivered:,.0f}只, "
                  f"满足率={coverage_pct:.2f}%")
-    if mismatch_count > 0:
-        logging.warning(f"[配送缺口] 共 {mismatch_count} 处网点-设备码未满足月补库计划:")
-        for detail in mismatch_details:
-            logging.warning(detail)
+    if dev_gap_list:
+        dev_gap_list.sort(key=lambda x: -x[3])
+        logging.warning(f"[检定缺口] 共 {len(dev_gap_list)} 个设备码因检定合格品库存不足未装满:")
+        for dev_code, plan_qty, delivered, gap in dev_gap_list:
+            logging.warning(f"  设备码={dev_code} 月计划={plan_qty:,.0f}只 "
+                            f"实际装箱={delivered:,.0f}只 缺口={gap:,.0f}只")
     else:
-        logging.info("[配送核验] 所有网点-设备码月补库计划100%满足!")
+        logging.info("[装箱后] 所有设备码100%装箱完成，无缺口")
     logging.info("=" * 60)
 
     return pd.DataFrame(DetectPlanResult), GlobalDelivPlan, pd.DataFrame(WorkArrangeResult)
