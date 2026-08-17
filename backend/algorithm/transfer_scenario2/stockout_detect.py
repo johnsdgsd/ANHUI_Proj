@@ -43,7 +43,7 @@ def _stockout_check(
     以库存快照为驱动：逐日累加真实日需求预测 + 下次补库日期，判断缺货风险。
     对每个 (ORG_NO, DEV_CODE):
         - check_days = 距下次补库天数（无计划→max_lead 窗口）
-        - 窗口内峰值单日需求 peak，阈值 = Poisson(peak) 的 α 分位
+        - 窗口内需求总和 total，阈值 = Poisson(total) 的 α 分位
         - 当前库存 < 阈值 → 触发
         - 建议量 Q = max(0, Poisson(窗口累计需求) 的 β 分位 − 当前库存)
         - 建议日期 = today + 当前库存能覆盖的最大天数
@@ -131,18 +131,17 @@ def _stockout_check(
         demand_days = demand_lookup.get((org, dev), {})
         daily_demands = [demand_days.get(d, 0) for d in range(1, check_days + 1)]
 
-        # 窗口内最大单日需求用于触发判断
-        peak_demand = max(daily_demands) if daily_demands else 0
-        if peak_demand <= 0:
+        # 窗口内需求总和用于触发判断（触发与目标库存统一口径：均基于窗口累计需求）
+        period_total = sum(daily_demands)
+        if period_total <= 0:
             continue
 
-        threshold = poisson.ppf(threshold_percentile, peak_demand)
+        threshold = poisson.ppf(threshold_percentile, period_total)
         if current >= threshold:
             continue
 
         # 触发: 逐日累计需求
         cumulative = list(np.cumsum(daily_demands))
-        period_total = cumulative[-1]
         target = poisson.ppf(target_percentile, period_total)
         recommend_qty = max(0, target - current)
 
@@ -170,7 +169,7 @@ def _stockout_check(
         })
         logger.info(
             f"[场景2缺货判定] 触发 {org} 设备码 {dev} | 当前库存 {current:.0f} "
-            f"窗口内峰值日需求 {peak_demand:.0f} 目标库存 {target:.0f} "
+            f"窗口需求总和 {period_total:.0f} 目标库存 {target:.0f} "
             f"缺货量 {recommend_qty:.0f} 建议日期 {recommend_date}")
 
     result_df = pd.DataFrame(results)

@@ -47,6 +47,34 @@ from backend.config.scheme_config import get_approved_scheme_config
 logger = logging.getLogger(__name__)
 
 
+def _check_stock_snapshot_date(stock_df, snapshot_date):
+    """校验实时库存快照日期（UPDATE_TIME 最大值）与运行日是否相符。
+
+    Returns:
+        (stock_snapshot_date, stock_lag_days): 快照日期字符串 / 滞后天数；
+        无法校验时返回 (None, None)。
+    """
+    if stock_df is None or stock_df.empty or 'UPDATE_TIME' not in stock_df.columns:
+        logger.warning("库存快照日期校验: 库存数据无 UPDATE_TIME 列, 无法校验")
+        return None, None
+    try:
+        snap = stock_df['UPDATE_TIME'].max()
+        if isinstance(snap, str):
+            snap_dt = datetime.strptime(snap[:10], '%Y-%m-%d').date()
+        else:
+            snap_dt = snap.date() if hasattr(snap, 'date') else snap
+        run_dt = datetime.strptime(snapshot_date, '%Y-%m-%d').date()
+        lag = (run_dt - snap_dt).days
+        logger.info(f"库存快照日期校验: 快照={snap_dt} 运行日={snapshot_date} 滞后={lag}天")
+        if lag > 1:
+            logger.warning(f"⚠ 库存快照滞后 {lag} 天: 补货决策基于 {snap_dt} 的库存, "
+                           f"而非运行日 {snapshot_date} 的实时库存, 结果可能失真")
+        return str(snap_dt), lag
+    except Exception as e:
+        logger.warning(f"库存快照日期校验失败: {e}")
+        return None, None
+
+
 def run_transfer_scenario2(year_month, snapshot_date=None,
                            window_upper_days=UPPER_WINDOW_DAYS):
     """调拨场景二主流程（仅分流，业务逻辑在各独立模块）。
@@ -78,6 +106,7 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
                 f"可达率 {net['stats']['reachable_ratio']:.1%}")
 
     stock_df = query_adam_stock_count_sample_all()
+    stock_snapshot_date, stock_lag_days = _check_stock_snapshot_date(stock_df, snapshot_date)
     dplan_df = query_adam_plan_day_ias_pre_by_month(year_month)
     ddmd_df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year, month, '05')
     yqm_df = query_adam_yqm_dmd_pre_by_year_month(year, month)
@@ -91,6 +120,7 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
         return {
             'code': 0, 'message': '无缺货风险组合, 未落库',
             'year_month': year_month, 'snapshot_date': snapshot_date,
+            'stock_snapshot_date': stock_snapshot_date, 'stock_lag_days': stock_lag_days,
             'n_shortages': 0, 'n_emergency': 0, 'n_transfer_rows': 0,
             'total_qty': 0, 'total_dist': 0.0, 'unmet_demand': 0.0,
             'insert_result': None,
@@ -159,6 +189,7 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
         'message': f"调拨场景二完成: 缺货 {len(shortages)} 组合, "
                    f"紧急补库 {n_emergency} 条, 调拨 {n_transfer_rows} 条",
         'year_month': year_month, 'snapshot_date': snapshot_date,
+        'stock_snapshot_date': stock_snapshot_date, 'stock_lag_days': stock_lag_days,
         'n_shortages': len(shortages),
         'n_emergency': n_emergency,
         'n_transfer_rows': n_transfer_rows,

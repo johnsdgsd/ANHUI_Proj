@@ -13,8 +13,8 @@ from backend.api.concurrency_lock import one_at_a_time
 transfer_bp = Blueprint('transfer', __name__, url_prefix='/transfer')
 
 
-@transfer_bp.route('/run', methods=['POST'])
-@one_at_a_time('transfer', '调拨方案生成(一阶段)')
+# 原 /transfer/run 路由已移至 generate_transfer_scheme_v2（二阶段场景一）；
+# 本函数保留源文件，不再挂载路由。
 def generate_transfer_scheme():
     """
     生成调拨方案（一阶段：按优先级就近调拨）
@@ -32,6 +32,52 @@ def generate_transfer_scheme():
         update_adam_pre_conc_stat(int(preConcId), '02')
 
         res = GetTransferSchemeAndInsert()
+
+        update_adam_pre_conc_stat(int(preConcId), '03')
+
+        return jsonify(res)
+
+    except Exception as e:
+        logger.error(f"生成调拨方案失败: {str(e)}", exc_info=True)
+        try:
+            data = request.get_json() or {}
+            preConcId = data.get('preConcId')
+            if preConcId:
+                update_adam_pre_conc_stat(int(preConcId), '04')
+        except Exception:
+            pass
+        return jsonify({
+            "code": 500,
+            "message": f"生成调拨方案失败: {str(e)}"
+        }), 500
+
+
+@transfer_bp.route('/run', methods=['POST'])
+@one_at_a_time('transfer', '调拨方案生成(二阶段场景一)')
+def generate_transfer_scheme_v2():
+    """
+    调拨方案（映射到二阶段场景一：月初高库龄调拨）。
+
+    入参与原 /transfer/run 一致：preConcId 必填；yearMonth 可选，默认当月。
+    """
+    try:
+        data = request.get_json() or {}
+        preConcId = data.get('preConcId')
+
+        if not preConcId:
+            return jsonify({
+                "code": 400,
+                "message": "参数错误：缺少 preConcId"
+            }), 400
+
+        year_month = data.get('yearMonth') or data.get('year_month') \
+            or datetime.now().strftime('%Y%m')
+
+        update_adam_pre_conc_stat(int(preConcId), '02')
+
+        # 延迟导入，避免循环导入
+        from backend.algorithm.transfer.orchestrator import run_transfer_scenario1
+        res = run_transfer_scenario1(year_month)
 
         update_adam_pre_conc_stat(int(preConcId), '03')
 
