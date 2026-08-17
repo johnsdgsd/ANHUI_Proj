@@ -37,7 +37,7 @@ def generate_emergency_scheme_v2():
     紧急补库+调拨联动（映射到二阶段场景二：缺货调拨）。
 
     入参与原 /emergency/run 一致（无必填业务参数）；yearMonth 可选，默认当月。
-    对每个缺货组合做省中心分流：中心有货→紧急补库，无货→调拨。
+    对每个缺货组合做省中心分流：省中心合格品 ≥ 缺货量 → 紧急补库，否则 → 调拨。
     """
     try:
         body = request.get_json() or {}

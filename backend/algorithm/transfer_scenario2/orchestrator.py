@@ -5,7 +5,7 @@
     1. 取数（库存/日需求/日计划/月度需求/规格/实时合格品/调拨网络/全局方案）
     2. 调独立模块: stockout_detect(缺货判定) / supplier_select(调出判定)
     3. 省中心分流（orchestrator 唯一业务逻辑）:
-        省中心实时合格品 > 0 → 紧急补库(emergency)；否则 → 调拨(transfer)
+        省中心实时合格品 ≥ 缺货量 → 紧急补库(emergency)；否则 → 调拨(transfer)
     4. 汇总返回
 
 更换任一核心模块（缺货判定算法/库存上限口径/贪心改ILP/补库落库）不影响本文件。
@@ -37,6 +37,7 @@ from backend.algorithm.transfer_scenario2.transfer import (
 )
 from backend.api.data_api.fetch_data import (
     query_adam_stock_count_sample_all,
+    query_adam_realtime_stocknum,
     query_adam_plan_day_ias_pre_by_month,
     query_adam_wd_dmd_pre_by_year_month_and_pretype,
     query_adam_yqm_dmd_pre_by_year_month,
@@ -107,6 +108,9 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
 
     stock_df = query_adam_stock_count_sample_all()
     stock_snapshot_date, stock_lag_days = _check_stock_snapshot_date(stock_df, snapshot_date)
+    # 缺货判定改用全网格库存(04级 87×12 + NVL补0)：让无库存行/0库存但有需求的组合也能进入判定。
+    # 调出侧 stock_df 保持"有库存行"口径(874)，0 库存组合不作为供应点，不受影响。
+    stock_full_grid = query_adam_realtime_stocknum()
     dplan_df = query_adam_plan_day_ias_pre_by_month(year_month)
     ddmd_df = query_adam_wd_dmd_pre_by_year_month_and_pretype(year, month, '05')
     yqm_df = query_adam_yqm_dmd_pre_by_year_month(year, month)
@@ -114,7 +118,7 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
     global_scheme_id, _ = get_approved_scheme_config(year_month)
 
     # ---- 2. 缺货判定（独立模块）----
-    shortages = detect_shortage(stock_df, dplan_df, ddmd_df)
+    shortages = detect_shortage(stock_full_grid, dplan_df, ddmd_df)
     if not shortages:
         logger.info("调拨场景二: 无缺货组合, 空方案不落库")
         return {
@@ -133,20 +137,21 @@ def run_transfer_scenario2(year_month, snapshot_date=None,
     high_stock = high_stock_orgs(stock_df)
 
     # ---- 4. 省中心分流（orchestrator 唯一业务逻辑）----
-    emergency_list = []      # [(org, dev, qty, date)] 省中心有货 → 紧急补库
-    transfer_list = []       # [(org, dev, qty)] 省中心无货 → 调拨
+    # 整单判定: 省中心对该设备码合格品 ≥ 缺货量 → 紧急补库(补全量)；否则 → 调拨(全量)
+    emergency_list = []      # [(org, dev, qty, date)] 省中心可满足缺货量 → 紧急补库
+    transfer_list = []       # [(org, dev, qty)] 省中心不能满足 → 调拨
     for org, dev, qty, date in shortages:
         center_stock = _query_province_center_stock(dev)
-        if center_stock > 0:
+        if center_stock >= qty:
             emergency_list.append((org, dev, qty, date))
             logger.info(
                 f"省中心分流: {org} 设备码 {dev} 缺货 {qty:.0f} 台, "
-                f"中心库当前库存 {center_stock:.0f} 台 → 紧急补库")
+                f"中心库当前库存 {center_stock:.0f} 台 ≥ 缺货量 → 紧急补库")
         else:
             transfer_list.append((org, dev, qty))
             logger.info(
                 f"省中心分流: {org} 设备码 {dev} 缺货 {qty:.0f} 台, "
-                f"中心库无货 → 调拨")
+                f"中心库当前库存 {center_stock:.0f} 台 < 缺货量 → 调拨")
     logger.info(
         f"省中心分流: 缺货 {len(shortages)} 组合 → 紧急补库 {len(emergency_list)}, "
         f"调拨 {len(transfer_list)}")
