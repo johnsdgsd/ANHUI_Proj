@@ -223,9 +223,13 @@ def _workdays(year):
 
 
 # ================================================================
+# 缺货检测输出上限：最多保留缺货件数最大的 N 个网点（可配置）
+TOP_SHORTAGE_ORGS = 10
+
+
 # 核心接口：输入日期 → 输出当日缺货风险数据 DataFrame
 # ================================================================
-def detect_stockout(cur_date, beta=0.95):
+def detect_stockout(cur_date, beta=0.95, top_n=TOP_SHORTAGE_ORGS):
     """检测指定日期的缺货风险，只返回存在缺货风险（库存 < Demand5）的组合。
 
     每行一个 (管理单位, 设备码)，列: ORG, DEV_CODE, 件数, 原始箱数, 当前库存, 日期
@@ -238,6 +242,7 @@ def detect_stockout(cur_date, beta=0.95):
     Args:
         cur_date: 'YYYY-MM-DD' 或 date/datetime
         beta:     需求满足率（默认 0.95）
+        top_n:    输出上限，仅保留缺货件数最大的 top_n 个网点（默认 10，可配置）
     """
     cur_date = _parse_date(cur_date)
     year, month = cur_date.year, cur_date.month
@@ -277,10 +282,10 @@ def detect_stockout(cur_date, beta=0.95):
             })
 
     result_df = pd.DataFrame(rows, columns=['ORG', 'DEV_CODE', '件数', '原始箱数', '当前库存', '日期'])
-    # 最多保留缺货数量(件数)最大的 20 个网点
+    # 最多保留缺货数量(件数)最大的 top_n 个网点
     if not result_df.empty:
         org_shortage = result_df.groupby('ORG')['件数'].sum()
-        top_orgs = set(org_shortage.nlargest(20).index)
+        top_orgs = set(org_shortage.nlargest(top_n).index)
         result_df = result_df[result_df['ORG'].isin(top_orgs)].reset_index(drop=True)
     return result_df
 

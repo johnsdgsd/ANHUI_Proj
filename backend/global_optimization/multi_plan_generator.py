@@ -617,7 +617,8 @@ def GetStorageCost(detail: pd.DataFrame):
     """
     计算仓储成本 = 管理费 + 资金占用
 
-    1. 管理费: 二级市(ORG_NO 长度=5) 41万/年 ÷ 12月 = 34,166.67元/月
+    1. 管理费: 二级市(ORG_NO 长度=5) 从配置表读取 (LINK_TYPE='04', COST_TYPE='05',
+       BASE_COST_TYPE='10', 年管理费元), 缺省 41万/年 ÷ 12月 = 34,166.67元/月;
        其他单位 0, 按各市内部 AVG_INV 占比分摊到行
     2. 资金占用: UNIT_PRICE × 年利率 × AVG_INV × 30
        年利率从配置表读取: LINK_TYPE='04', COST_TYPE='04', BASE_COST_TYPE='13'
@@ -641,8 +642,22 @@ def GetStorageCost(detail: pd.DataFrame):
         except Exception:
             annual_rate = 0.05
 
-    # 二级市管理费: 410,000 / 12 = 34,166.67 元/月
-    MONTHLY_MGMT_FEE = 410000.0 / 12.0
+    # 二级市固定场地管理费: 从配置表读取 (LINK_TYPE='04', COST_TYPE='05', BASE_COST_TYPE='10'),
+    # BASE_COST_VALUE = 年管理费(元); 缺省 410,000 元/年 (与 2026-08 口径一致)
+    ANNUAL_MGMT_FEE = 410000.0
+    mask_mgmt = (
+        (cost_df['LINK_TYPE'] == '04') &
+        (cost_df['COST_TYPE'] == '05') &
+        (cost_df['BASE_COST_TYPE'] == '10')
+    )
+    matched_mgmt = cost_df[mask_mgmt]
+    if not matched_mgmt.empty:
+        try:
+            ANNUAL_MGMT_FEE = float(matched_mgmt.iloc[0]['BASE_COST_VALUE'])
+        except Exception:
+            pass  # 值异常沿用默认
+    # 410,000 / 12 = 34,166.67 元/月
+    MONTHLY_MGMT_FEE = ANNUAL_MGMT_FEE / 12.0
 
     # 标记二级市 (ORG_NO 长度=5，排除省中心34101)
     detail['IS_CITY'] = (detail['ORG_NO'].astype(str).str.len() == 5) & (detail['ORG_NO'].astype(str) != '34101')
