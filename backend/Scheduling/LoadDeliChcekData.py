@@ -202,7 +202,11 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
 
     # 构建哈希索引字典，提升查找效率
     org_idx_map = {locations.loc[i + 1, 'ORG_NO']: i for i in range(LocationNum)}
-    dev_idx_map = {SubTypeList.loc[j, 'DEV_CODE_NO']: j for j in range(SubTypeNum)}
+    dev_idx_map = {}
+    for j in range(SubTypeNum):
+        _raw = SubTypeList.loc[j, 'DEV_CODE_NO']
+        dev_idx_map[_raw] = j
+        dev_idx_map[str(_raw).replace('.0', '').strip()] = j
 
     # ================= 1. 盘点需求与扣减 =================
     logging.info(">>> 开始盘点发货需求与扣减已配送明细...")
@@ -325,6 +329,20 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
     DeviceCaps = fetch_data("gk-adam-query_check_line")
     if not DeviceCaps.empty:
         DeviceCaps.columns = [c.upper() for c in DeviceCaps.columns]
+
+    # ================= 4.5 按开关加载检修仓明细（逐日产能联动） =================
+    # UNDER_POSI_NUM 作开关：任一检定线存在检修中仓位时才查 ADAM_LINE_DTL 明细
+    maint_posi_df = pd.DataFrame()
+    if not DeviceCaps.empty and 'UNDER_POSI_NUM' in DeviceCaps.columns:
+        under_sum = pd.to_numeric(DeviceCaps['UNDER_POSI_NUM'], errors='coerce').fillna(0).sum()
+        if under_sum > 0:
+            logging.info(f">>> 检定线存在检修仓（UNDER_POSI_NUM 合计={int(under_sum)}），加载检修仓明细...")
+            maint_posi_df = fetch_data("gk-adam-query_line_maint_posi")
+            if not maint_posi_df.empty:
+                maint_posi_df.columns = [c.upper() for c in maint_posi_df.columns]
+                logging.info(f"检修仓明细: {len(maint_posi_df)} 条（MAINT_STAT=02）")
+        else:
+            logging.info(">>> 无检修仓（UNDER_POSI_NUM 全为 0），跳过检修仓明细查询")
 
     logging.info(">>> 从数据库加载网点实际运输距离矩阵...")
     num_nodes = LocationNum + 1
@@ -483,4 +501,4 @@ def LoadDeliChcekData(target_month, start_date_str, is_mid_month=False):
         logging.info("=" * 70)
 
     # 【核心】：将 global_scheme_id、org_priority、设备码级数据作为最后参数返回
-    return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast
+    return Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast, maint_posi_df

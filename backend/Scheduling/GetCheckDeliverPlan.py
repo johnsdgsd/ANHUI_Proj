@@ -20,7 +20,7 @@ from backend.Scheduling.GetDelivPlan import GetDelivPlan
 
 def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap,
                         VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, record_start_date_str,
-                        locations, org_priority=None, dev_stock=None, dev_forecast=None):
+                        locations, org_priority=None, dev_stock=None, dev_forecast=None, maint_posi_df=None):
     """
     【核心运筹引擎：检定与配送联合排程 (Two-Phase Scheduling)】
 
@@ -107,7 +107,8 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     for i in range(SubTypeNum):
         dc = str(SubTypeList.loc[i, 'DEV_CODE_NO']).strip()
         unit_arr = TypeList.loc[TypeList['DEV_CODE_NO'] == dc, 'UnitPerBox'].values
-        UnitPerBoxI = unit_arr[0] if len(unit_arr) > 0 else 5
+        UnitPerBoxI = pd.to_numeric(unit_arr[0], errors='coerce') if len(unit_arr) > 0 else 5
+        UnitPerBoxI = UnitPerBoxI if (pd.notna(UnitPerBoxI) and UnitPerBoxI > 0) else 5
         cls_val = str(SubTypeList.loc[i, 'DEV_CLS']).replace('.0', '').strip().zfill(2) if 'DEV_CLS' in SubTypeList.columns else '01'
         vol_mult = 2.5 if cls_val == '02' else 1.0
         demand_boxes_by_loc += np.ceil(np.ceil(Demands[:, i] / UnitPerBoxI) * vol_mult)
@@ -265,22 +266,26 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             veri_cat = str(row['VERI_CATEG']).strip().zfill(2)
             veri_type = str(row['VERI_TYPE']).strip().zfill(2)
 
-            p_num = int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1)
-            pc_num = int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
-            cap_per_line = p_num * pc_num  # POSI_NUM × POSI_CHECK_NUM = 单线总容量
-            if cap_per_line <= 0: cap_per_line = 200
+            total_posi = int(pd.to_numeric(row['POSI_NUM'], errors='coerce') or 1)
+            posi_check_num = int(pd.to_numeric(row['POSI_CHECK_NUM'], errors='coerce') or 200)
+            if total_posi <= 0: total_posi = 1
+            if posi_check_num <= 0: posi_check_num = 200
 
             dev_categ_str = str(row.get('DEV_CATEG', '')).strip()
             cats = [dc.strip() for dc in dev_categ_str.replace('，', ',').split(',') if dc.strip()]
 
             line_idx += 1
-            unique_line_id = f"L_{line_idx}"
+            # 【逐日产能】改用真实主键 DETECT_LINE_CONFIG_ID 作为 line_id，便于联动检修仓明细表 ADAM_LINE_DTL
+            unique_line_id = str(row.get('DETECT_LINE_CONFIG_ID', '')).replace('.0', '').strip()
+            if not unique_line_id or unique_line_id in ('nan', 'None'):
+                unique_line_id = f"L_{line_idx}"  # 空值兜底回退自增序号
             for dc in cats:
                 DevCatToLines[dc].append({
                     'line_id': unique_line_id,
                     'veri_cat': veri_cat,
                     'veri_type': veri_type,
-                    'batch_cap': cap_per_line
+                    'total_posi': total_posi,
+                    'posi_check_num': posi_check_num
                 })
 
     # =========================================================================
@@ -288,7 +293,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     # =========================================================================
     LotObjects = []
     for idx, row in LotList.iterrows():
-        dev_code_str = row['DEV_CODE_NO']
+        dev_code_str = str(row['DEV_CODE_NO']).strip()
         sub_idx = DevCodeToIndex.get(dev_code_str)
         if sub_idx is None: continue
 
@@ -351,6 +356,34 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
             unique_lines[lid]['cats'].add(cat)
 
     # =========================================================================
+    # 【逐日产能】构建每条物理产线的逐日批容量 cap_by_day[line_id][d_idx]
+    # 满产能 = POSI_NUM × POSI_CHECK_NUM；检修仓在检修时间段内每天扣减 1 个仓位（= 减 POSI_CHECK_NUM）
+    # =========================================================================
+    cap_by_day = {}  # {line_id: np.array(total_sim_days)}
+    for lid in unique_lines:
+        line = unique_lines[lid]['line']
+        cap_by_day[lid] = np.full(total_sim_days,
+                                  float(line['total_posi']) * float(line['posi_check_num']))
+
+    if maint_posi_df is not None and not maint_posi_df.empty:
+        for _, mr in maint_posi_df.iterrows():
+            lid = str(mr['DETECT_LINE_CONFIG_ID']).replace('.0', '').strip()
+            if lid not in cap_by_day:
+                continue
+            try:
+                m_start = pd.to_datetime(mr['MAINT_START_TIME']).date()
+                m_end = pd.to_datetime(mr['MAINT_END_TIME']).date()
+            except Exception:
+                continue
+            pc = unique_lines[lid]['line']['posi_check_num']  # 扣 1 仓位 = 减每仓检定数
+            for d_idx, d in enumerate(all_days):
+                if m_start <= d.date() <= m_end:
+                    cap_by_day[lid][d_idx] -= pc
+        for lid in cap_by_day:
+            cap_by_day[lid] = np.clip(cap_by_day[lid], 0, None)  # 兜底不为负
+        logging.info(f"[逐日产能] 已按检修仓明细扣减 {len(maint_posi_df)} 条检修记录")
+
+    # =========================================================================
     # Phase 1: 以物理产线为单位进行宏观产能规划
     # =========================================================================
     for lid, info in unique_lines.items():
@@ -359,42 +392,39 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         veri_type_str = '02' if is_auto else '01'
         cats = info['cats']
 
-        # ----- 预计算各品类的需求(小时)和 PPH -----
-        cat_demand_h = {}   # {cat: 总需求小时}
-        cat_pph = {}        # {cat: pph}
-        total_demand_h = 0.0
-
+        # ----- 需求只数按品类 + 加权平均检定时长（多品类共享一条线） -----
+        total_units = 0.0
+        weighted_num = 0.0
         for cat in cats:
             lots_cat = [lot for lot in LotObjects if get_cat(lot['row']['DEV_CODE_NO']) == cat]
             rem = sum(lot['rem'] for lot in lots_cat)
-            if rem > 0 and lots_cat:
-                sample_code = lots_cat[0]['row']['DEV_CODE_NO']
-                dur = get_detect_time(sample_code, veri_type_str)
-                pph = line['batch_cap'] / dur if dur > 0 else 9999
-                cat_pph[cat] = pph
-                cat_demand_h[cat] = rem / pph
-                total_demand_h += rem / pph
-            else:
-                cat_pph[cat] = 9999
-                cat_demand_h[cat] = 0.0
+            if rem <= 0:
+                continue
+            sample_code = lots_cat[0]['row']['DEV_CODE_NO']
+            dur = get_detect_time(sample_code, veri_type_str)
+            total_units += rem
+            weighted_num += rem * dur
 
-        if total_demand_h <= 0.0001:
+        if total_units <= 0.0001:
             continue
 
-        num_l = 1  # 一条物理产线，产能不能倍数化
+        weighted_dur = weighted_num / total_units          # 加权平均单只检定时长（小时）
+        daily_pph = cap_by_day[lid] / weighted_dur if weighted_dur > 0 else np.full(total_sim_days, 9999.0)  # 逐日 pph（只/小时）
 
-        # 按优先级阶梯，依次将工时铺设到日历上
+        remaining = total_units
+
+        # 按优先级阶梯，依次将产能（只数）铺设到日历上，逐日真实产能
         for p in passes:
             if p['is_auto'] != is_auto:
                 continue  # 自动线/人工线只走各自对应的 pass
 
             # 非基础班 → 产能缺口已填满则停止
-            if not p.get('is_base', False) and total_demand_h <= 0.0001:
+            if not p.get('is_base', False) and remaining <= 0.0001:
                 break
 
             # 【完美月初优先】：永远从 day 0 (1号) 开始循环
             for d_idx in range(total_sim_days):
-                if not p.get('is_base', False) and total_demand_h <= 0.0001:
+                if not p.get('is_base', False) and remaining <= 0.0001:
                     break
 
                 d = all_days[d_idx]
@@ -405,20 +435,24 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
                 if p['target'] == 'we' and is_wd:
                     continue
 
+                pph_d = daily_pph[d_idx]
+                add_units = pph_d * p['add_h']  # 该班次当天满产只数
+
                 if p.get('is_base', False):
                     # 基础班次无条件全月铺设，即使需求已满也铺（产能溢出无所谓）
-                    need_h = p['add_h'] * num_l
+                    need_h = float(p['add_h'])
+                    remaining -= add_units
                 else:
-                    # 加班班次极度克制：只吃掉剩余缺口
-                    need_h = min(total_demand_h, p['add_h'] * num_l)
+                    # 加班班次极度克制：只吃掉剩余缺口，工时按实际所需折算
+                    need_units = min(remaining, add_units)
+                    need_h = (need_units / pph_d) if pph_d > 0 else 0.0
+                    remaining -= need_units
 
                 # 整块工时直接挂到产线上，不按品类拆分（品类互斥在 Phase 2 由批次锁保证）
                 if is_auto:
                     line_auto_h_dict[lid][d_idx] += need_h
                 else:
                     line_manual_h_dict[lid][d_idx] += need_h
-
-                total_demand_h -= need_h
 
     # =========================================================================
     # 【核心：Phase 2 微观批次物理落盘 (绝不撕裂)】
@@ -458,7 +492,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
 
                 if avail_h > 0:
                     dur = get_detect_time(dev_code, line['veri_type'])
-                    pph = line['batch_cap'] / dur if dur > 0 else 9999
+                    pph = cap_by_day[line['line_id']][curr_idx] / dur if dur > 0 else 9999
 
                     do_qty = min(lot['rem'], avail_h * pph)
                     if do_qty > 0.0001:
@@ -578,15 +612,16 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         dc = str(SubTypeList.loc[sub_idx, 'DEV_CODE_NO']).strip()
         dev_vol_mult[dc] = 2.5 if get_cls(dc) == '02' else 1.0
         unit_arr = TypeList.loc[TypeList['DEV_CODE_NO'] == dc, 'UnitPerBox'].values
-        dev_unit_box[dc] = unit_arr[0] if len(unit_arr) > 0 else 5
+        _upb = pd.to_numeric(unit_arr[0], errors='coerce') if len(unit_arr) > 0 else 5
+        dev_unit_box[dc] = _upb if (pd.notna(_upb) and _upb > 0) else 5
 
     # 可装箱设备码列表（预过滤：存在需求且在 dev_forecast 中有记录）
     active_dev_indices = list(range(SubTypeNum))
 
-    # 【修复·车型容量映射】ve_type 来自 v5_5 的 vehicle_k+1，是按容量降序的语义
-    # （1=大车/容量最大，2=中车，3=小车/容量最小）；而 VeCap/VeUnitPrice 是按 CAR_TYPE
-    # 升序排列（容量最小的车型在前）。直接用 VeCap[ve_type-1] 会把大车取成小车容量(459)，
-    # 小车取成大车容量(1071)，导致大车装到 459 箱就"假满载"，库存充足的设备码也装不满。
+    # 【车型容量映射】ve_type 来自 v5_5 的 vehicle_k+1，按容量降序语义（1=大车/容量最大，
+    # 2=中车，3=小车/容量最小）。承运商接口下 CAR_TYPE=01 即大车（容量最大），VeCap 按
+    # CAR_TYPE 升序 = 容量降序（大→中→小）。但为稳妥仍按容量降序显式重排（不依赖 CAR_TYPE
+    # 编号顺序），得到 VeCap_desc / VeCarType_desc，供 ve_type-1 直接索引：大车→[0]，小车→[2]。
     _order_desc = sorted(range(len(VeCap)), key=lambda i: float(VeCap[i]), reverse=True)
     VeCap_desc = [float(VeCap[i]) for i in _order_desc]
     VeUnitPrice_desc = [float(VeUnitPrice[i]) if i < len(VeUnitPrice) else 0.0695 for i in _order_desc]
@@ -605,7 +640,8 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         de_nums = [amt for _, amt in trip['deliveries']]
 
         total_vol_used = 0.0
-        max_cap_boxes = VeCap_desc[int(ve_type) - 1]
+        _vt = int(ve_type)
+        max_cap_boxes = VeCap_desc[_vt - 1] if 1 <= _vt <= len(VeCap_desc) else (VeCap_desc[-1] if VeCap_desc else 0)
         details_data = []
         prev_node = 0
 

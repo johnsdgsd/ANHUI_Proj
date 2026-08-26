@@ -3,20 +3,21 @@ import random
 import requests
 import pandas as pd
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 import calendar
 import sys
 
 # 强制绑定控制台输出，防止 Flask 多线程吞掉日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", stream=sys.stdout)
 
-from backend.config.config import API_CONFIG
 from backend.Scheduling.LoadDeliChcekData import LoadDeliChcekData
 from backend.Scheduling.GetCheckDeliverPlan import GetCheckDeliverPlan
+from backend.config.config import API_CONFIG
 
 host = API_CONFIG["database"]["host"]
 port = API_CONFIG["database"]["port"]
 SQL_API_URL = f"http://{host}:{port}/exec"
-PK_API_URL = f"http://{host}:{port}/pk/next"
+PK_API_URL = f"http://{host}:{port}/pk/next"  # 发号器接口地址
 
 
 def generate_safe_id():
@@ -100,10 +101,14 @@ def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
 
         if is_mid_month:
             logging.info(f">>> [当月滚动重排启动] 目标月份: {target_month}。将提取真实到货时间并追加旧主键...")
+            # 【新增】重排前先删除上月状态01的日检定计划，让上月未检完批次重新回到待检池
+            prev_dt = start_dt - relativedelta(months=1)
+            prev_month = prev_dt.strftime('%Y%m')
+            execute_batch("gk-adam-delete_prev_month_day_detect_plan_01", [{"prev_month": prev_month}])
         else:
             logging.info(f">>> [下月全局初始排程启动] 目标月份: {target_month}。将执行先删后增...")
 
-        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast = LoadDeliChcekData(
+        Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT, LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, locations, global_scheme_id, org_priority, dev_stock, dev_forecast, maint_posi_df = LoadDeliChcekData(
             target_month, sim_start_date_str, is_mid_month)
 
         old_month_plan_map = {}
@@ -143,7 +148,7 @@ def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
         df_detect, GlobalDelivPlan, df_work_arrange = GetCheckDeliverPlan(
             Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList, TypeList, DMAT,
             LocationNum, VeCap, VNums, VeUnitPrice, VeTypeNum, sim_start_date_str, total_sim_days, preTime, locations,
-            org_priority, dev_stock, dev_forecast
+            org_priority, dev_stock, dev_forecast, maint_posi_df
         )
 
         detect_db_list = []
@@ -268,7 +273,8 @@ def run_check_deliver_process(preTime, preConcId=None, comp_flag='02'):
             work_ids = fetch_primary_keys("SEQ_ADAM_WORK_ARRANGE_PRE", len(df_work_arrange))
             for i, (_, row) in enumerate(df_work_arrange.iterrows()):
                 work_arrange_db_list.append({
-                    "work_arrange_pre_id": work_ids[i], "veri_categ": str(row['VERI_CATEG']),
+                    "work_arrange_pre_id": work_ids[i],
+                    "veri_categ": str(row['VERI_CATEG']),
                     "work_date": str(row['WORK_DATE']), "work_flag": str(row['WORK_FLAG']),
                     "detect_dur": str(row['DETECT_DUR']), "capacity_num": int(row['CAPACITY_NUM']),
                     "global_scheme_id": global_scheme_id
