@@ -2571,6 +2571,38 @@ def query_adam_org_stock_sample_estimated(target_month: str):
     return result[['ORG_NO', 'ORG_NAME', 'DEV_CODE', 'STOCK_NUM']]
 
 
+def query_aio_supply_quota_by_month(month: str):
+    """查询年度剩余补库量（设备类别口径）。
+
+    AIO_SUPPLY_QUOTA 的 DEV_CODE 列实际存的是设备类别；DS_SQL 已按业务口径
+    将设备码列命名为 DEV_CATEG（设备类别）返回。
+
+    Args:
+        month: 月份，格式 YYYYMM
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, DEV_CATEG(设备类别), QUOTA(年度剩余量),
+                      Y_PRE_NUM, MONTH, SUPPLY_QUOTA_ID
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-aio-supply-quota-by-month'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"month": month})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        return pd.DataFrame([data]) if data else pd.DataFrame()
+    except requests.exceptions.RequestException:
+        logging.exception('年度剩余补库量查询网络异常')
+        raise
+    except Exception:
+        logging.exception('年度剩余补库量查询失败')
+        raise
+
+
 # ============================================================
 # 二阶段 (R,S) 补货算法 — 数据访问函数
 # ============================================================

@@ -106,6 +106,11 @@ def GetMonthThresholdAndOrderAnalytical():
         Threshold,Order,_ = GenerateMonthlyThresholdAndOrder(year,month,init_stock,global_scheme_id,epsilon)
         print(f'生成月度阈值数据{len(Threshold)}条，生成月度补货量数据{len(Order)}条', flush=True)
 
+        # 年度剩余补库量配额检查（超配额按比例压减，保持整箱倍数）
+        from backend.inventory_optimization.quota_check import apply_annual_quota_check
+        Order = apply_annual_quota_check(Order, yearMonth)
+        print(f'年度配额检查完成，补货量 {len(Order)} 条', flush=True)
+
         # 删除旧数据（防御性处理，删除失败不影响后续插入）
         try:
             del_res = delete_adam_stock_month_limit_pre_by_ym(year, month)
@@ -206,6 +211,12 @@ def GetMonthThresholdAndOrder():
         t_ga_end = time.time()
         print(f'[GA] → 寻优完成, 耗时 {t_ga_end - t_ga_start:.1f}s', flush=True)
         print(f'[GA] → 阈值 {len(Threshold)} 条, 补货量 {len(Order)} 条', flush=True)
+
+        # Step 3.5: 年度剩余补库量配额检查（超配额按比例压减，保持整箱倍数）
+        print('[GA] Step 3.5/6: 年度剩余配额检查...', flush=True)
+        from backend.inventory_optimization.quota_check import apply_annual_quota_check
+        Order = apply_annual_quota_check(Order, yearMonth)
+        print(f'[GA] → 配额检查完成, 补货量 {len(Order)} 条', flush=True)
 
         # Step 4: 删旧阈值 + 插新
         print('[GA] Step 4/6: 写入月度阈值表...', flush=True)
