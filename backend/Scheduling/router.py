@@ -5,13 +5,10 @@ Stage 1 求解器：路径枚举 + 统一 MIP（两遍字典序）+ FTL 预处�
 参数传入各函数；本文件头部仅保留算法超参数。
 """
 import copy
-import logging
 import math
 import os
 import time
 from collections import defaultdict
-
-logger = logging.getLogger(__name__)  # 进度日志(带时间戳,不受 verbose 门控)
 
 try:
     from ortools.sat.python import cp_model
@@ -38,6 +35,9 @@ NUM_SEARCH_WORKERS = min(8, os.cpu_count() or 1)   # CP-SAT并行搜索线程数
 RATE_EPSILON = 0.001           # 装载率/占比浮点比较容差（validate 用）
 DIST_EPSILON = 0.1             # 距离浮点比较容差（validate 用）
 MAX_STOPS_PER_ROUTE = 3        # 枚举路径最多停靠点(1/2/3站);车队子任务数下界依赖此值,与 enumerate_routes 保持一致
+A_B_MAX_B_STOPS = 1            # A_B 路线最多含 1 个 Set B 网点(用户 2026-09-11: "每车只带 1 个 B")。
+                               # 仅约束【含 Set A】的路线;ANY 路线(无 Set A)不受限,B 网点数任意。
+                               # 注意:按"B 网点个数"判定而非站数——2A+1B(3站)合法,1A+2B(3站)非法。
 
 def _grade_pass2_time(n_mip_routes, construction=False):
     """Pass 2 时限分级（用户 2026-08-05）：按 MIP 路线数自动分档，替换固定超参。
@@ -895,8 +895,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     """
     if not HAS_ORTOOLS:
         raise RuntimeError("MIP 求解失败且无 OR-Tools，无法生成结果")
-    logger.info(f"[solve] Stage-1 MIP 开始: 枚举路线={len(routes)}条, "
-                f"enforce_load_rate={enforce_load_rate}")
 
     branches = data['branches']
     vehicles = data['params']['vehicles']
@@ -927,8 +925,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             print(f"  Auto MAX_ROUTES_PER_SET: 1 (RPS=3 后 {len(routes3)} routes > {MAX_ROUTES_AUTO_CAP}, "
                   f"降回 RPS=1 → {len(routes)} routes)")
     routes = _ensure_full_load_routes(routes, routes_before, priority_tasks, cap_big)
-    logger.info(f"[solve] 枚举={len(routes_before)}条 → Demand filter={len(routes_filt)}条 "
-                f"→ RPS后={len(routes3)}条(阈值{MAX_ROUTES_AUTO_CAP}) → 最终MIP={len(routes)}条")
     if verbose:
         print(f"Routes after reduction + full-load cloning: {len(routes)}")
 
@@ -960,22 +956,17 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             if result == 'feasible':
                 load_rate_hard_target = target
                 load_rate_probe = (s_probe, ctx_probe)   # 探测解共享:车队搜索/Pass 2 直接复用
-                logger.info(f"[solve] 装载率探测 {name}: 可行({el:.1f}s) → 采用硬{name}档")
                 if verbose:
                     print(f"  ✓ {name} hard feasible ({el:.1f}s) → using hard {name} for ANY")
                 break
             elif result == 'timeout':
                 load_rate_hard_target = target
-                logger.info(f"[solve] 装载率探测 {name}: 超时({el:.1f}s) → 按硬{name}档继续(可能不可行)")
                 if verbose:
                     print(f"  ⏱ {name} hard timeout ({el:.1f}s) → will try hard {name} in full solve")
                 break
             else:
-                logger.info(f"[solve] 装载率探测 {name}: 不可行({el:.1f}s) → 试更低档")
                 if verbose:
                     print(f"  ✗ {name} hard infeasible ({el:.1f}s)")
-        if load_rate_hard_target is None:
-            logger.info("[solve] 装载率探测: 硬档全不可行 → 回退软装载率档")
         if load_rate_hard_target is None and verbose:
             print("  → fallback to soft load rate")
 
@@ -995,8 +986,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
         if verbose:
             print(f"Team search: capacity lower bound N≥{lb} "
                   f"({len(subtasks)} priority subtasks)")
-        logger.info(f"[solve] 车队搜索: 下界N≥{lb}, {len(subtasks)}个优先子任务, "
-                    f"搜索范围[{lb}, {n_teams_max}]")
         hard_any = (load_rate_hard_target if load_rate_hard_target is not None
                     else params['LOAD_RATE_TARGET_ANY_HARD_80'])
         # 装载率档位探测可行解隐含的车队数:≤ N 时该解对 n_teams==N 模型仍合法,
@@ -1057,16 +1046,11 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             if verbose:
                 print(f"  Fallback: n_teams = {n_teams_opt}"
                       + (f" (first timeout N={fallback_N})" if fallback_N is not None else ""))
-        logger.info(f"[solve] 车队搜索完成: n_teams_opt={n_teams_opt}, "
-                    f"fallback_N={fallback_N}, "
-                    f"warm_start={'construct' if warm_start and warm_start[0]=='construct' else ('probe' if warm_start else '无')}")
 
     # ---- Pass 2: 最低成本(含软装载率惩罚;无车辆数量目标) ----
     # 车队数递增回退:若探测假设的 N* 实际不可行(探测超时误判,或热启动未命中),
     # 逐步放大 max_n_teams 重试,得到合法解后再退出;避免整条流水线坠入贪心回退。
     solution = None
-    logger.info(f"[solve] Pass 2 开始: n_teams_opt={n_teams_opt}, n_teams_max={n_teams_max}, "
-                f"共尝试 {n_teams_max - n_teams_opt + 1} 次, 装载率档={load_rate_hard_target}")
     for trial_N in range(n_teams_opt, n_teams_max + 1):
         t0 = time.time()
         model2, ctx2 = _build_unified_model(params,
@@ -1188,13 +1172,8 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
         if verbose:
             print(f"Pass 2 (n_teams ≤ {trial_N}): optimizing cost "
                   f"(limit {time_limit}s)...")
-        logger.info(f"[solve] Pass 2 求解 (≤{trial_N}队): 开始, limit={time_limit}s, "
-                    f"MIP路线={len(routes)}条")
         status = solver.Solve(model2)
         elapsed = time.time() - t0
-
-        logger.info(f"[solve] Pass 2 (≤{trial_N}队) 结束: {solver.StatusName(status)} "
-                    f"({elapsed:.1f}s)")
 
         if verbose:
             print(f"Status: {solver.StatusName(status)}, time: {elapsed:.1f}s")
@@ -1269,7 +1248,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             if fb_tier is not None and fb_tier >= load_rate_hard_target:
                 continue
             fb_name = "硬80%" if fb_tier is not None else "软装载率"
-            logger.info(f"[solve] 硬{load_rate_hard_target:.0%}档 Pass 2 无解 → 回退{fb_name}档重试")
             if verbose:
                 print(f"  ↻ 硬{load_rate_hard_target:.0%}档 Pass 2 无解 → 回退{fb_name}档重试...")
             model_fb, ctx_fb = _build_unified_model(params,
@@ -1305,8 +1283,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
                 print(f"  Pass 2 (n_teams ≤ {n_teams_max}, {fb_name}): optimizing cost...")
             status_fb = solver_fb.Solve(model_fb)
             elapsed_fb = time.time() - tf
-            logger.info(f"[solve] 回退{fb_name}档结束: {solver_fb.StatusName(status_fb)} "
-                        f"({elapsed_fb:.1f}s)")
             if verbose:
                 print(f"  Status: {solver_fb.StatusName(status_fb)}, time: {elapsed_fb:.1f}s")
             if status_fb in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -1328,8 +1304,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     if solution is None:
         # 用户 2026-08-10：装载率(含软档)仍无可行解 → 抛异常，不再用贪心兜底。
         # 贪心兜底会静默少送需求（原 202605 只送 94%），宁可显式失败让上层发现数据问题。
-        logger.error(f"[solve] Stage-1 MIP 全部档位(硬90/硬80/软)均无解, 抛异常终止 "
-                     f"(n_teams_max={n_teams_max}, MIP路线={len(routes)}条)")
         raise RuntimeError(
             f"Stage-1 MIP 在软装载率下仍找不到可行解（车队数升至 {n_teams_max} 仍失败）。"
             f"请检查网点需求/运输队车辆池/角度距离数据是否一致。")
@@ -1340,9 +1314,6 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     merged['total_teams'] = len(transport_teams) if transport_teams else 0
     merged['priority_tasks'] = priority_tasks or {}
     merged['teams_saturated'] = solution.get('teams_saturated')
-    logger.info(f"[solve] Stage-1 MIP 完成: {len(solution.get('routes', []))}条路线, "
-                f"总成本={solution.get('total_cost', 0):.0f}元, "
-                f"求解耗时={solution.get('solve_time', 0):.1f}s")
     return merged
 
 def _extract_solution(params, solver, routes, vehicles, branches, set_a, x, y, solve_time,
@@ -1719,22 +1690,26 @@ def enumerate_routes(params, data, verbose=True):
     if verbose:
         print(f"Average neighbors per branch: {avg_neighbors:.1f}")
 
+    routes = []
+    route_id = 0
+    stats = {'1stop': 0, '2stop': 0, '3stop': 0, 'invalid': 0,
+             'invalid_multi_b': 0, 'dist_fail': 0, 'angle_fail': 0}
+
     # 路径分类函数
     def classify(stops):
         has_a = any(s in set_a for s in stops)
         if not has_a:
-            return "ANY"
-        has_b = any(s in set_b for s in stops)
+            return "ANY"                      # 无 Set A → ANY; B 网点数不限(新规则只针对 A_B)
         has_other = any(s not in set_a and s not in set_b for s in stops)
         if has_other:
+            return "INVALID"                  # 既有规则(保持不变): 含 A 则不得出现"非A非B"网点
+        # 新规则(用户 2026-09-11): A_B 路线最多含 A_B_MAX_B_STOPS 个 Set B 网点("每车只带 1 个 B")。
+        # 按【B 网点个数】判定而非站数: 2A+1B(3站) 合法, 1A+2B(3站) 非法。
+        n_b = sum(1 for s in stops if s in set_b)
+        if n_b > A_B_MAX_B_STOPS:
+            stats['invalid_multi_b'] += 1     # 独立桶, 便于观测新规则剔除量
             return "INVALID"
-        if has_b:
-            return "A_B"
-        return "A_ONLY"
-
-    routes = []
-    route_id = 0
-    stats = {'1stop': 0, '2stop': 0, '3stop': 0, 'invalid': 0, 'dist_fail': 0, 'angle_fail': 0}
+        return "A_B" if n_b > 0 else "A_ONLY"
 
     # ---- 1站路径 ----
     if verbose:
@@ -1936,6 +1911,8 @@ def enumerate_routes(params, data, verbose=True):
             cat_counts[r['category']] += 1
         for cat in ['ANY', 'A_ONLY', 'A_B']:
             print(f"  {cat}: {cat_counts[cat]}")
+        if stats['invalid_multi_b']:
+            print(f"  A_B dropped (B stops > {A_B_MAX_B_STOPS}): {stats['invalid_multi_b']}")
         print(f"Filtered: angle_fail={stats['angle_fail']}, dist_fail={stats['dist_fail']}, invalid_structure={stats['invalid']}")
         print(f"Time: {elapsed:.1f}s")
 
