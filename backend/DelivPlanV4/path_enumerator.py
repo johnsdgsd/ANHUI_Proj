@@ -36,7 +36,8 @@ from backend.DelivPlanV4.geometry import (
 
 def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                                hefei_node_ids=None, node_to_group=None,
-                               depot_coord=None, node_coords=None):
+                               depot_coord=None, node_coords=None,
+                               node_real_boxes=None):
     """
     枚举所有满足约束的候选配送路径。
 
@@ -61,6 +62,9 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         node_to_group: dict[int, str] | None, node_id → 城市编码（ORG_NO 前5位），用于约束 1
         depot_coord: (lon, lat) | None, 省库经纬度，None 时用距离模式
         node_coords: {node_id: (lon, lat)} | None, 网点经纬度映射，None 时用距离模式
+        node_real_boxes: dict[int, float] | None, node_id → 实际箱合计（业务口径）。
+                        None 时约束1按体积箱判定（向后兼容）；传入后约束1
+                        「量大先行」改按实际箱判定，容量/成本仍按体积箱。
 
     Returns:
         list[dict]: 候选路径列表，每项格式:
@@ -82,6 +86,28 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
     node_to_uids = defaultdict(list)
     for uid, nid, _ in demand_units:
         node_to_uids[nid].append(uid)
+
+    # ---- 1.5 实际箱按 unit 按比例拆分（供约束1按实际箱判定） ----
+    # 拆分口径: 某节点实际箱总数 R 按其各 unit 体积占比分摊到 unit，
+    #           最大余数法保证 Σ unit 实际箱 = R（节点拆分到多条路线时也精确）
+    uid_to_real = {}
+    if node_real_boxes:
+        for nid, uids in node_to_uids.items():
+            r_total = node_real_boxes.get(nid, 0)
+            vols = [uid_to_info[uid][1] for uid in uids]
+            v_total = sum(vols)
+            if v_total <= 0 or r_total <= 0:
+                for uid in uids:
+                    uid_to_real[uid] = 0
+                continue
+            shares = [r_total * v / v_total for v in vols]
+            base = [int(s) for s in shares]
+            leftover = int(r_total) - sum(base)
+            order = sorted(range(len(uids)), key=lambda i: -(shares[i] - base[i]))
+            for i in order[:leftover]:
+                base[i] += 1
+            for uid, b in zip(uids, base):
+                uid_to_real[uid] = b
 
     unique_nodes = sorted(set(nid for _, nid, _ in demand_units))
     logging.info(f"[Stage1] 开始枚举: {len(unique_nodes)}个物理节点, {len(demand_units)}个demand_unit")
@@ -200,9 +226,18 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                             nid, boxes = uid_to_info[uid]
                             node_load[nid] += boxes
 
+                        # 实际箱口径（仅约束1使用）：按 node 汇总本组合内各 unit 的实际箱
+                        node_load_real = None
+                        if node_real_boxes:
+                            node_load_real = defaultdict(float)
+                            for uid in unit_combo:
+                                nid, _ = uid_to_info[uid]
+                                node_load_real[nid] += uid_to_real.get(uid, 0)
+
                         best_seq, best_dist, best_cost = _find_best_sequence(
                             combo_nodes, node_load, total_load, dmat_arr, max_route_dist,
-                            node_to_group=node_to_group if node_to_group else None
+                            node_to_group=node_to_group if node_to_group else None,
+                            node_load_real=node_load_real
                         )
 
                         if best_seq is not None:
@@ -301,7 +336,7 @@ def _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes=None,
 
 
 def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_dist,
-                        node_to_group=None):
+                        node_to_group=None, node_load_real=None):
     """
     对给定节点集合，枚举所有排列，找成本最低的。
 
@@ -309,11 +344,13 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
 
     Args:
         combo_nodes: 节点集合
-        node_load: {node_id: boxes}，各节点在该路径中的装箱数
+        node_load: {node_id: boxes}，各节点在该路径中的体积箱数（成本/容量口径）
         total_load: 总装载量
         dmat_arr: 距离矩阵
         max_route_dist: 最大闭环距离
         node_to_group: dict | None, node_id → 城市编码（None 时跳过约束1）
+        node_load_real: dict | None, node_id → 实际箱数；传入后约束1
+                        「量大先行」按实际箱判定（None 时按体积箱，向后兼容）
 
     Returns:
         (best_sequence, best_distance, best_cost) 或 (None, 0, inf)
@@ -324,7 +361,8 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
 
     for perm in itertools.permutations(combo_nodes):
         # ---- V4 约束1: 同城组内首站必须是最大箱数节点 ----
-        if node_to_group is not None and not _check_max_first(perm, node_load, node_to_group):
+        if node_to_group is not None and not _check_max_first(
+                perm, node_load, node_to_group, node_load_real=node_load_real):
             continue
 
         load, dist, cost = compute_path_cost(perm, node_load, dmat_arr)
@@ -338,7 +376,7 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
     return best_seq, best_dist, best_cost
 
 
-def _check_max_first(perm, node_load, node_to_group):
+def _check_max_first(perm, node_load, node_to_group, node_load_real=None):
     """
     V4 约束1辅助函数：检查同城组内首站是否为最大箱数节点。
 
@@ -347,14 +385,18 @@ def _check_max_first(perm, node_load, node_to_group):
 
     Args:
         perm: 节点排列 tuple
-        node_load: {node_id: boxes}，各节点装箱数
+        node_load: {node_id: boxes}，各节点体积箱数
         node_to_group: {node_id: city_code} | None，城市编码映射（None 时跳过检查）
+        node_load_real: {node_id: boxes} | None，各节点实际箱数；
+                        None 时按体积箱判定（向后兼容），传入后「量大先行」按实际箱判定
 
     Returns:
         bool: 满足约束返回 True
     """
     if node_to_group is None:
         return True
+    # 「量大」口径：优先实际箱，缺省回退体积箱（不影响旧调用方）
+    load_map = node_load_real if node_load_real is not None else node_load
     # 按城市分组，记录各节点在排列中的位置
     groups = {}  # {city_code: [(position, node_id), ...]}
     for pos, node in enumerate(perm):
@@ -368,7 +410,7 @@ def _check_max_first(perm, node_load, node_to_group):
         if len(entries) < 2:
             continue  # 单节点组无需检查
         # 找该组箱数最大的节点
-        max_node = max(entries, key=lambda e: node_load.get(e[1], 0))
+        max_node = max(entries, key=lambda e: load_map.get(e[1], 0))
         # 最大箱数节点必须是该组在排列中最先出现的（即 pos 最小）
         first_in_group = min(entries, key=lambda e: e[0])
         if first_in_group[1] != max_node[1]:

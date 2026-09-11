@@ -21,6 +21,7 @@ from backend.inventory_optimization.SchedulingDeliveryAdapter import (
 
 from backend.DelivPlanV4.demand import (
     compute_volume_boxes,
+    compute_real_boxes,
     build_vehicle_config,
     split_large_demand,
 )
@@ -135,6 +136,8 @@ def run_deliv_plan_v4(date_str):
     t0 = time.time()
     logging.info(f"[V4] Step 2/6: 需求件数→体积箱转换...")
     unit_sum = compute_volume_boxes(demands, sub_type_list)
+    # 实际箱（业务口径）：仅用于「同城量大先行」约束1判定；容量/装载率仍按体积箱
+    real_sum = compute_real_boxes(demands, sub_type_list)
     total_demand_boxes = sum(unit_sum.values())
     timing['demand'] = time.time() - t0
 
@@ -215,7 +218,8 @@ def run_deliv_plan_v4(date_str):
         demand_units, dmat_arr, max_cap, MAX_ROUTE_DIST,
         hefei_node_ids=hefei_node_ids if hefei_node_ids else None,
         node_to_group=node_to_group if node_to_group else None,
-        depot_coord=depot_coord, node_coords=node_coords
+        depot_coord=depot_coord, node_coords=node_coords,
+        node_real_boxes=real_sum if real_sum else None
     )
     timing['stage1'] = time.time() - t0
 

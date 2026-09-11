@@ -66,6 +66,39 @@ def compute_volume_boxes(demands, sub_type_list):
     return unit_sum
 
 
+def compute_real_boxes(demands, sub_type_list):
+    """将需求件数矩阵转换为各网点的实际箱合计（不含 2.5 体积系数）。
+
+    公式: boxes(loc, dev) = ceil(pieces / PACK_BOX_NUM)
+    用途: 「同城量大先行」约束按实际箱判定（业务口径），
+          车辆容量/装载率仍按体积箱口径，两者互不影响。
+
+    Args:
+        demands: (LocationNum × SubTypeNum) DataFrame 或 numpy array，需求件数
+        sub_type_list: 设备规格 DataFrame，需含 PACK_BOX_NUM 列
+
+    Returns:
+        dict[int, float]: {node_id (1-indexed): total_real_boxes}
+    """
+    location_num = demands.shape[0]
+    sub_type_num = len(sub_type_list)
+    demands_arr = demands.values if isinstance(demands, pd.DataFrame) else demands
+    demands_boxes = np.zeros((location_num, sub_type_num))
+
+    for i in range(sub_type_num):
+        unit_per_box = float(sub_type_list.iloc[i]['PACK_BOX_NUM'])
+        if unit_per_box <= 0:
+            unit_per_box = 1.0
+        demands_boxes[:, i] = np.ceil(demands_arr[:, i] / unit_per_box)
+
+    total_boxes_per_loc = np.sum(demands_boxes, axis=1)
+    return {
+        i + 1: float(total_boxes_per_loc[i])
+        for i in range(location_num)
+        if total_boxes_per_loc[i] > 0
+    }
+
+
 def build_vehicle_config(ve_cap, v_nums, ve_type_num):
     """
     构建车辆配置列表，按容量升序排列。
