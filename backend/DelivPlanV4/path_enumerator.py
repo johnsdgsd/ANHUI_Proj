@@ -10,14 +10,15 @@ Stage 1: 候选路径枚举
     - 闭环距离 ≤ max_route_dist
     - [约束1] 同城节点首站必须是最大箱数节点
     - [约束2] 合肥四库房不能与各自150km内非合肥节点同路
+    - [约束4] 由近及远：跨城相邻站点距省库单调不降（同城豁免，与 约束1 分工）
 
 算法:
     1. 计算网点极角排序
     2. 滑动窗口构建极角兼容的网点组（注入合肥四库房）
     3. 预计算各合肥节点的排斥集（约束2）
     4. 窗口内枚举节点组合 → 枚举 demand_unit 子集 → 枚举节点排列
-    5. 排列过滤：约束1（同城首站最大）+ 约束2（排斥集检查）
-    6. 保留每个 demand_unit 组合的最优排列
+    5. 排列过滤：约束1（同城首站最大）+ 约束4（由近及远）+ 约束2（排斥集检查）
+    6. 保留每个 demand_unit 组合的最优排列（成本目标只定候选，不定站内顺序）
     7. 单点单 unit 直达兜底
 """
 
@@ -48,6 +49,7 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         - 闭环距离 ≤ max_route_dist
         - [约束1] 同城节点首站必须最大箱数
         - [约束2] 合肥四库房不能与各自 150km 内非合肥节点同路
+        - [约束4] 由近及远：跨城相邻站点距省库单调不降（同城豁免）
 
     V4.1: 支持基于经纬度的地理方位角约束
         - 传入 depot_coord + node_coords → 用地理方位角差（≤45°）
@@ -338,9 +340,13 @@ def _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes=None,
 def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_dist,
                         node_to_group=None, node_load_real=None):
     """
-    对给定节点集合，枚举所有排列，找成本最低的。
+    对给定节点集合，枚举所有排列，先按业务硬约束过滤，再在幸存排列里取成本最低的。
 
-    V4 新增约束1: 同城组内首站必须是最大箱数节点。
+    过滤的硬约束:
+        - 约束1: 同城组内首站必须是最大箱数节点
+        - 约束4: 由近及远 —— 跨城相邻站点距省库距离单调不降（同城豁免）
+
+    成本目标只用于在满足硬约束的排列中挑一条，不参与决定站内顺序。
 
     Args:
         combo_nodes: 节点集合
@@ -348,7 +354,7 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
         total_load: 总装载量
         dmat_arr: 距离矩阵
         max_route_dist: 最大闭环距离
-        node_to_group: dict | None, node_id → 城市编码（None 时跳过约束1）
+        node_to_group: dict | None, node_id → 城市编码（None 时跳过约束1，约束4按全跨城判定）
         node_load_real: dict | None, node_id → 实际箱数；传入后约束1
                         「量大先行」按实际箱判定（None 时按体积箱，向后兼容）
 
@@ -363,6 +369,10 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
         # ---- V4 约束1: 同城组内首站必须是最大箱数节点 ----
         if node_to_group is not None and not _check_max_first(
                 perm, node_load, node_to_group, node_load_real=node_load_real):
+            continue
+
+        # ---- V4 约束4: 由近及远（跨城距省库升序，同城豁免） ----
+        if not _check_near_to_far(perm, dmat_arr, node_to_group):
             continue
 
         load, dist, cost = compute_path_cost(perm, node_load, dmat_arr)
@@ -414,5 +424,41 @@ def _check_max_first(perm, node_load, node_to_group, node_load_real=None):
         # 最大箱数节点必须是该组在排列中最先出现的（即 pos 最小）
         first_in_group = min(entries, key=lambda e: e[0])
         if first_in_group[1] != max_node[1]:
+            return False
+    return True
+
+
+def _check_near_to_far(perm, dmat_arr, node_to_group=None):
+    """
+    V4 约束4辅助函数：检查排列是否满足「由近及远」。
+
+    规则: 相邻两站中，后一站距省库的距离不得小于前一站（单调不降）。
+    **同城相邻两站豁免** —— 同城内顺序由约束1「量大先行」管辖
+    （同城站点间距离极小，距离排序无业务意义）；这也与
+    reschedule_engine.optimize_route_sequence「距离升序 + 同城内箱量降序」
+    的既有口径一致，同时避免两条规则互相夹死导致候选路径丢失。
+
+    Args:
+        perm: 节点排列 tuple
+        dmat_arr: 距离矩阵，dmat_arr[0, n] 为省库→节点 n 的距离
+        node_to_group: {node_id: city_code} | None；None 时无同城信息，全部按跨城判定
+
+    Returns:
+        bool: 满足约束返回 True
+    """
+    tolerance = 0.01  # km，防浮点噪声
+    for idx in range(len(perm) - 1):
+        prev, cur = perm[idx], perm[idx + 1]
+        if node_to_group is not None:
+            g_prev = node_to_group.get(prev)
+            g_cur = node_to_group.get(cur)
+            if g_prev is not None and g_prev == g_cur:
+                continue  # 同城豁免，顺序交给约束1「量大先行」
+        d_prev = dmat_arr[0, prev]
+        d_cur = dmat_arr[0, cur]
+        # 距离数据缺失时不阻塞（与 geometry.check_angle_constraint 同一约定）
+        if d_prev <= 0.001 or d_cur <= 0.001:
+            continue
+        if d_cur < d_prev - tolerance:
             return False
     return True

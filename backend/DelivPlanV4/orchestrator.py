@@ -29,6 +29,11 @@ from backend.DelivPlanV4.path_enumerator import enumerate_candidate_paths
 from backend.DelivPlanV4.ilp_solver import solve_set_partition_ilp
 from backend.DelivPlanV4.config import MAX_ROUTE_DIST
 
+# 省库（营销服务中心）在 ADAM_DEL_SITE_CONF 中的 ORG_NO。
+# 注意：'34101' 是距离矩阵(ADAM_DIST_MIST)与组织表的省库编码，该表中不存在；
+# ADAM_DEL_SITE_CONF 里省库行编码为 '3410117'，且带有效经纬度。
+DEPOT_SITE_ORG = '3410117'
+
 
 def run_deliv_plan_v4(date_str):
     """
@@ -395,7 +400,8 @@ def _load_coordinates(org_labels, hefei_node_ids):
 
     Returns:
         (depot_coord, node_coords):
-            depot_coord: (lon, lat) 或 None（合肥四库房均值，DB 中 34101 为 0,0）
+            depot_coord: (lon, lat) 或 None（取 ADAM_DEL_SITE_CONF 中 3410117 营销服务中心，
+                         缺失时回退合肥四库房均值）
             node_coords: {node_id: (lon, lat)} 或 None
     """
     try:
@@ -419,20 +425,28 @@ def _load_coordinates(org_labels, hefei_node_ids):
             if coord and coord[0] != 0:
                 node_coords[i] = coord
 
-        # 省库坐标：合肥四库房均值（34101 在 DB 中为 0,0）
+        # 省库坐标：优先取 3410117(营销服务中心) 的真实经纬度；缺失时回退合肥四库房均值
         depot_coord = None
-        hf_coords = [node_coords[n] for n in hefei_node_ids if n in node_coords]
-        if hf_coords:
-            depot_coord = (sum(c[0] for c in hf_coords) / len(hf_coords),
-                           sum(c[1] for c in hf_coords) / len(hf_coords))
+        site_coord = coords_by_org.get(DEPOT_SITE_ORG)
+        if site_coord and (site_coord[0] != 0 or site_coord[1] != 0):
+            depot_coord = site_coord
             logging.info(
                 f"[V4] 角度约束: haversine模式, "
-                f"省库=({depot_coord[0]:.4f},{depot_coord[1]:.4f}), "
+                f"省库={DEPOT_SITE_ORG}({depot_coord[0]:.4f},{depot_coord[1]:.4f}), "
                 f"{len(node_coords)}个站点有坐标"
             )
         else:
-            logging.warning("[V4] 无法确定省库坐标，回退道路距离角度约束")
-            return None, None
+            hf_coords = [node_coords[n] for n in hefei_node_ids if n in node_coords]
+            if hf_coords:
+                depot_coord = (sum(c[0] for c in hf_coords) / len(hf_coords),
+                               sum(c[1] for c in hf_coords) / len(hf_coords))
+                logging.warning(
+                    f"[V4] ADAM_DEL_SITE_CONF 中无 {DEPOT_SITE_ORG}(营销服务中心) 坐标，"
+                    f"回退合肥四库房均值=({depot_coord[0]:.4f},{depot_coord[1]:.4f})"
+                )
+            else:
+                logging.warning("[V4] 无法确定省库坐标，回退道路距离角度约束")
+                return None, None
 
         return depot_coord, node_coords
     except Exception as e:
