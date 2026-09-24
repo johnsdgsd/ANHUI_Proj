@@ -77,6 +77,19 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
     # extra_types=1: 允许最小+次小车型（小型车配额不够的兜底）
     # extra_types=num_types-1: 允许全部车型（最终兜底，等价于原始行为）
     # no_small_first=True: 跳过前两轮，直接全车型单轮求解
+    # V4 约束3 豁免判定: 若候选路径中不存在任何「合肥+远距」混合路径，
+    # 混装无从满足（当天无远距需求/混合路径未枚举出），此时放行合肥独占路线，
+    # 避免约束3 死锁导致整个求解无可行解（误报「运力不足」）
+    has_mixable_candidate = any(
+        c.get('has_hefei', False) and c.get('has_far_node', False)
+        for c in candidates
+    )
+    if not has_mixable_candidate:
+        logging.info(
+            "[Stage2] 约束3豁免: 候选路径中无「合肥+远距」混合路径可混装, "
+            "放行合肥独占路线（不受70%装载率限制）"
+        )
+
     last_error = None
     last_error_detail = ""
     x, prob, status_str, obj_val = None, None, None, None
@@ -107,9 +120,11 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
                 # ---- V4 约束3: 合肥独占路线装载率 <70% 必须混装远距节点 ----
                 # 含义：如果路线只含合肥四库房（无远距节点）且装不满 70%，则拒绝，
                 # 强制要求搭配 >150km 的远距节点来提高装载率
+                # 豁免：无可混装的混合路径时放行（has_mixable_candidate=False）
                 has_hefei = candidates[r].get('has_hefei', False)
                 has_far = candidates[r].get('has_far_node', False)
-                if has_hefei and not has_far and cap > 0:
+                if (has_hefei and not has_far and cap > 0
+                        and has_mixable_candidate):
                     load_rate = load / cap
                     if load_rate < HEFEI_DEDICATED_LOAD_RATE - 0.001:
                         constraint3_rejected += 1
@@ -261,10 +276,10 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
             )
         else:
             raise ValueError(
-                f"【运力不足，请增加车辆】ILP无可行解 ({last_error_detail}), "
-                f"总需求={total_dmd:.0f}箱 ≤ 总运力={total_veh_cap:.0f}箱, "
-                f"但角度/距离/站点数约束导致无法覆盖全部需求, "
-                f"请增加车辆或放宽约束后重试"
+                f"【配送方案无可行解，非运力不足】总需求={total_dmd:.0f}箱 ≤ "
+                f"总运力={total_veh_cap:.0f}箱, 运力充足, "
+                f"失败原因: {last_error_detail}, "
+                f"请检查路径约束（角度/距离/合肥混装/站点数）与车辆配置"
             )
 
     # ---- 6. 提取结果 → best_sol ----
