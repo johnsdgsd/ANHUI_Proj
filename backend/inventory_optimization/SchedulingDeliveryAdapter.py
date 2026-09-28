@@ -432,16 +432,23 @@ def _v3_generate_main_scheme(best_sol, VeCap, CarTypeStrList, date):
 # ==================== V3 拆箱 → 明细表 ====================
 
 def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
-                         DMAT_arr, org_labels):
+                         DMAT_arr, org_labels, demand_units=None, uid_to_dev=None):
     """
     从 best_sol 拆箱生成 DetailScheme。
 
+    两种模式:
+        - demand_units + uid_to_dev 传入（V4 按码拆分链路）: demand_unit 精确对应
+          (网点, 设备码)，按 unit 1:1 分配件数——同一设备码不会被按比例打散到多条
+          路线，仅单码超容内部切分时才按比例分摊（现场规则）。
+        - 不传（V3 旧链路兼容）: 按网点体积箱占比(ratio)分摊各设备码（旧行为）。
+
     核心逻辑:
-        - 追踪剩余需求，每次分配基于剩余量动态计算体积箱占比
-        - 硬封顶不超过剩余需求，确保 Σ配送件数 ≤ 原始需求
+        - 追踪剩余需求，硬封顶不超过剩余需求，确保 Σ配送件数 ≤ 原始需求
     """
     LocationNum = Demands.shape[0]
     SubTypeNum = len(SubTypeList)
+    uid_to_unit = {u[0]: u for u in (demand_units or [])}
+    use_unit_mode = demand_units is not None and uid_to_dev is not None
 
     # 预计算设备属性
     dev_attrs = []
@@ -497,6 +504,49 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
             if vol_boxes_delivered <= 0:
                 continue
 
+            # ---- V4 按码模式: 路线 unit_ids 精确对应 (网点, 设备码)，1:1 分配 ----
+            if use_unit_mode:
+                stop_units = sorted(
+                    (uid_to_unit[uid][2], uid) for uid in route.get('unit_ids', ())
+                    if uid in uid_to_unit and uid_to_unit[uid][1] == node_id
+                )
+                for unit_boxes, uid in stop_units:
+                    dev_idx = uid_to_dev[uid]
+                    rem = remaining.iloc[loc_idx, dev_idx]
+                    if rem <= 0:
+                        continue
+                    box_cap, vol_mult, dev_code, dev_cls, dev_categ = dev_attrs[dev_idx]
+                    # 按剩余需求算整码体积箱，内部切分场景按比例折算
+                    unit_reg = np.ceil(rem / box_cap)
+                    unit_vol = np.ceil(unit_reg * vol_mult)
+                    ratio = min(float(unit_boxes) / unit_vol, 1.0) if unit_vol > 0 else 1.0
+                    alloc_regular = int(np.ceil(unit_reg * ratio))
+                    alloc_pieces = int(min(alloc_regular * box_cap, rem))
+                    if alloc_pieces <= 0:
+                        continue
+                    remaining.iloc[loc_idx, dev_idx] -= alloc_pieces
+                    plan_box_num = int(np.ceil(alloc_pieces / box_cap))
+                    seg_dist = seg_dists[stop_idx]
+                    det_seq += 1
+
+                    rows.append({
+                        'DIST_SCHEME_DET_ID': base_ts * 1000 + det_seq,
+                        'DIST_SCHEME_ID': scheme_id,
+                        'REC_ORG_NO': str(org_labels[node_id]),
+                        'DEV_CODE': dev_code,
+                        'DEV_CLS': dev_cls,
+                        'DEV_CATEG': dev_categ,
+                        'DIST_SEQ': stop_idx + 1,
+                        'LOAD_SEQ': len(deliveries) - stop_idx,
+                        'PLAN_DIST_NUM': alloc_pieces,
+                        'PLAN_BOX_NUM': plan_box_num,
+                        'EST_TOT_DIST_MIST': round(seg_dist, 4),
+                        'DIST_EXP': round(unit_price * plan_box_num * seg_dist, 4),
+                        'GLOBAL_SCHEME_ID': GlobalSchemeId
+                    })
+                continue
+
+            # ---- V3 旧模式: 按网点体积箱占比分摊 ----
             # 基于剩余需求动态计算体积箱构成
             cur_devs = []
             cur_total_vol = 0.0

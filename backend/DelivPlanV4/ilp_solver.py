@@ -35,7 +35,8 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
 
     Returns:
         list[dict]: best_sol 格式:
-            [{'vehicle_type': int, 'deliveries': [(node_id, boxes), ...]}, ...]
+            [{'vehicle_type': int, 'deliveries': [(node_id, boxes), ...],
+              'unit_ids': frozenset[int]}, ...]
 
     Raises:
         ValueError: ILP 无可行解时
@@ -311,6 +312,7 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
             best_sol.append({
                 'vehicle_type': vehicle_type,
                 'deliveries': deliveries,
+                'unit_ids': cand['unit_ids'],
             })
             type_usage[vehicle_type] += 1
             selected_routes.append((r, t, vehicle_type, cand['load'], cand['distance'], cand['base_cost']))

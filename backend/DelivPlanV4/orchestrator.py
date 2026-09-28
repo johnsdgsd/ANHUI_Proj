@@ -23,7 +23,7 @@ from backend.DelivPlanV4.demand import (
     compute_volume_boxes,
     compute_real_boxes,
     build_vehicle_config,
-    split_large_demand,
+    split_demand_by_dev,
 )
 from backend.DelivPlanV4.path_enumerator import enumerate_candidate_paths
 from backend.DelivPlanV4.ilp_solver import solve_set_partition_ilp
@@ -176,10 +176,10 @@ def run_deliv_plan_v4(date_str):
         f"余量{capacity_margin:.1f}%"
     )
 
-    # ---- 4. 大需求拆分 ----
+    # ---- 4. 大需求拆分（按设备码粒度，现场规则：仅单一设备码超容才内部切分） ----
     t0 = time.time()
-    logging.info(f"[V4] Step 4/6: 大需求拆分 (阈值={max_cap:.0f}箱)...")
-    demand_units = split_large_demand(unit_sum, max_cap)
+    logging.info(f"[V4] Step 4/6: 大需求拆分-按码 (阈值={max_cap:.0f}箱)...")
+    demand_units, uid_to_dev = split_demand_by_dev(demands, sub_type_list, max_cap)
     timing['split'] = time.time() - t0
 
     # ---- 5. Stage 1: 候选路径枚举 ----
@@ -254,7 +254,8 @@ def run_deliv_plan_v4(date_str):
     logging.info("[V4] 生成配送方案表...")
     main_scheme = _v3_generate_main_scheme(best_sol, ve_cap, car_type_str_list, date_str)
     detail_scheme = _v3_unbox_to_detail(
-        best_sol, main_scheme, demands, sub_type_list, ve_unit_price, dmat_arr, org_labels
+        best_sol, main_scheme, demands, sub_type_list, ve_unit_price, dmat_arr, org_labels,
+        demand_units=demand_units, uid_to_dev=uid_to_dev
     )
     timing['output'] = time.time() - t0
     # 拆箱后统计

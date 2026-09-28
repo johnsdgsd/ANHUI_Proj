@@ -132,6 +132,9 @@ def split_large_demand(unit_sum, max_cap):
     将超过 max_cap 的网点需求拆分为多个 demand_unit。
     每个 demand_unit 的 boxes ≤ max_cap，确保任何车型都能装载单个 unit。
 
+    【已被 split_demand_by_dev 取代（V4 生产链路）】：本函数为网点级体积切分，
+    会导致拆箱时各设备码按比例分摊到多条路线（货物打散）；保留供旧仿真脚本使用。
+
     Args:
         unit_sum: {node_id: total_boxes} 字典
         max_cap: 最大单车容量
@@ -160,3 +163,59 @@ def split_large_demand(unit_sum, max_cap):
         f"(其中{split_count}个站点超容拆分)"
     )
     return units
+
+
+def split_demand_by_dev(demands, sub_type_list, max_cap):
+    """按(网点×设备码)生成不可分装载单元（现场规则版）
+
+    现场要求：同一设备码的货物必须整码装同一辆车，仅当单一设备码自身的
+    体积箱超过最大车容时，才允许对该码内部切分。
+
+    Args:
+        demands: (LocationNum × SubTypeNum) DataFrame 或 numpy array，需求件数
+        sub_type_list: 设备规格 DataFrame，需含 PACK_BOX_NUM 和 DEV_CLS 列
+        max_cap: 最大单车容量
+
+    Returns:
+        (units, uid_to_dev):
+            units: [(unit_id, node_id, boxes), ...] 三元组（与 split_large_demand
+                   格式一致，node_id 1-indexed），可直接传入下游枚举/求解
+            uid_to_dev: {unit_id: dev_idx}，unit 对应的设备码列索引，
+                        供拆箱时按码 1:1 分配件数（货物不再打散）
+    """
+    demands_arr = demands.values if isinstance(demands, pd.DataFrame) else demands
+    units = []
+    uid_to_dev = {}
+    uid = 0
+    split_count = 0
+    for loc_idx in range(demands_arr.shape[0]):
+        for dev_idx in range(demands_arr.shape[1]):
+            pieces = float(demands_arr[loc_idx, dev_idx])
+            if pieces <= 0:
+                continue
+            box_cap = float(sub_type_list.iloc[dev_idx]['PACK_BOX_NUM'])
+            if box_cap <= 0:
+                box_cap = 1.0
+            cls_val = str(sub_type_list.iloc[dev_idx].get('DEV_CLS', '')).replace('.0', '').strip().zfill(2)
+            vol_mult = 2.5 if cls_val == '02' else 1.0
+            vol = float(np.ceil(np.ceil(pieces / box_cap) * vol_mult))
+            nid = loc_idx + 1
+            if vol > max_cap:
+                split_count += 1
+                logging.info(
+                    f"[需求拆分-按码] 站点{nid} 设备码{sub_type_list.iloc[dev_idx]['DEV_CODE']} "
+                    f"{vol:.0f}箱 > 最大容量{max_cap:.0f}箱, 该码内部切分"
+                )
+            remaining = vol
+            while remaining > 0.001:
+                take = min(remaining, max_cap)
+                units.append((uid, nid, take))
+                uid_to_dev[uid] = dev_idx
+                uid += 1
+                remaining -= take
+
+    logging.info(
+        f"[需求拆分-按码] {demands_arr.shape[0]}站点 × {demands_arr.shape[1]}设备码 → "
+        f"{len(units)}个demand_unit (其中{split_count}个码超容内部切分)"
+    )
+    return units, uid_to_dev
