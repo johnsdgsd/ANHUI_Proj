@@ -3202,3 +3202,237 @@ def delete_adam_layout_result_det_by_date(today: str):
     except Exception:
         logger.exception("仓网布局-删除方案明细表失败")
         raise
+
+
+def query_adam_sub_dmd_pre_latest_date():
+    """查询供电所需求预测数据实际覆盖的最新日期（诊断用）
+
+    口径与窗口查询一致（PRE_TYPE='05' 且仅有效供电所），用于判断预测数据
+    是否已滚动到需求窗口，窗口超出该日期时编排器记录告警日志。
+
+    Returns:
+        str | None: 最新需求日期 'YYYY-MM-DD'；无数据时返回 None
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sub-dmd-pre-latest-date'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            if not data:
+                return None
+            data = data[0]
+        latest = data.get('LATEST_DATE') if isinstance(data, dict) else None
+        if latest is None:
+            logger.warning("[阈值] 需求预测表查询不到最新日期（表内无 PRE_TYPE='05' 数据）")
+            return None
+        return str(latest)[:10]
+    except requests.exceptions.RequestException:
+        logger.exception("[阈值] 查询需求预测最新日期网络异常")
+        raise
+    except Exception:
+        logger.exception("[阈值] 查询需求预测最新日期失败")
+        raise
+
+
+def query_adam_sub_dmd_pre_window(start_date: str, down_end: str, up_end: str,
+                                  org_no: str = 'ALL'):
+    """查询供电所需求预测的窗口需求合计（ADAM_SUB_DMD_PRE, PRE_TYPE='05'）
+
+    一条 SQL 返回每个 (供电所, 设备码) 组合在两个窗口内的需求合计：
+      DOWN_NUM: PRE_DATE ∈ [start_date, down_end]   —— 下限窗口（默认 1 周）
+      UP_NUM:   PRE_DATE ∈ [start_date, up_end]     —— 上限窗口（默认 2 周）
+
+    范围下钻与有效供电所过滤均在 DS_SQL 内完成，Python 端不再过滤。
+
+    Args:
+        start_date: 窗口起始日期，格式 'YYYY-MM-DD'
+        down_end: 下限窗口截止日期，格式 'YYYY-MM-DD'
+        up_end: 上限窗口截止日期，格式 'YYYY-MM-DD'
+        org_no: 范围组织编码（5位市/7位县/9位供电所），'ALL' 表示全省
+
+    Returns:
+        pd.DataFrame: 列 ORG_NO, PRNT_ORG_CODE, DEV_CODE, DOWN_NUM, UP_NUM
+    """
+    logger.info(f"[阈值] 查询窗口需求 (PRE_TYPE='05', 窗口 {start_date}~{up_end}, 范围={org_no})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sub-dmd-pre-window'
+        url = f"http://{host}:{port}{endpoint}"
+        json_data = {
+            "start_date": start_date,
+            "down_end": down_end,
+            "up_end": up_end,
+            # org_no 必须为字符串：SQL 中与 'ALL' 字面量比较，数字会被判为类型不匹配
+            "org_no": str(org_no).strip() or 'ALL',
+        }
+        response = session.post(url, json=json_data)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            logger.warning(f"[阈值] 窗口需求返回数据为空 (范围={org_no}, 窗口 {start_date}~{up_end})")
+            return pd.DataFrame()
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        logger.info(f"[阈值] 窗口需求查询成功: {len(df)} 条, "
+                    f"单位 {df['ORG_NO'].nunique()} 个, 设备码 {df['DEV_CODE'].nunique()} 个")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("[阈值] 窗口需求查询网络异常")
+        raise
+    except Exception:
+        logger.exception("[阈值] 窗口需求查询失败")
+        raise
+
+
+def delete_adam_sub_stock_limt_pre(org_no: str = 'ALL'):
+    """按范围删除旧的供电所库存阈值（重算前先删后插，避免重复）
+
+    Args:
+        org_no: 范围组织编码，'ALL' 表示全表删除
+
+    Returns:
+        dict: 删除结果
+    """
+    logger.info(f"[阈值] 删除范围内旧阈值 (范围={org_no})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-delete-adam-sub-stock-limt-pre'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"org_no": org_no})
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"[阈值] 删除旧阈值 (范围={org_no}): {data}")
+        return data
+    except requests.exceptions.RequestException:
+        logger.exception("[阈值] 删除旧阈值网络异常")
+        raise
+    except Exception:
+        logger.exception("[阈值] 删除旧阈值失败")
+        raise
+
+
+def query_adam_sub_stock_limt_pre(org_no: str = 'ALL'):
+    """查询已有的供电所库存阈值（页面展示 / 手工维护）
+
+    Args:
+        org_no: 范围组织编码，'ALL' 表示全省
+
+    Returns:
+        pd.DataFrame: 列 SUB_STOCK_LIMT_ID, ORG_NO, PRNT_ORG_CODE, DEV_CLS,
+                      DEV_CATEG, DEV_CODE, PRE_UP, PRE_DOWN, UPDATE_TIME
+    """
+    logger.info(f"[阈值] 查询已有阈值 (范围={org_no})...")
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query-adam-sub-stock-limt-pre'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={"org_no": org_no})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) == 0:
+            logger.info(f"[阈值] 查询已有阈值: 无数据 (范围={org_no})")
+            return pd.DataFrame()
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = pd.DataFrame([data])
+        logger.info(f"[阈值] 查询已有阈值成功: {len(df)} 条")
+        return df
+    except requests.exceptions.RequestException:
+        logger.exception("[阈值] 查询已有阈值网络异常")
+        raise
+    except Exception:
+        logger.exception("[阈值] 查询已有阈值失败")
+        raise
+
+
+def insert_into_adam_sub_stock_limt_pre(df: pd.DataFrame):
+    """批量插入供电所库存阈值到 ADAM_SUB_STOCK_LIMT_PRE 表
+
+    Args:
+        df: DataFrame，包含以下列：
+            - SUB_STOCK_LIMT_ID: 主键
+            - ORG_NO: 供电单位（供电所/网格）
+            - PRNT_ORG_CODE: 上级单位（市/县级）
+            - DEV_CLS: 设备分类
+            - DEV_CATEG: 设备类别
+            - DEV_CODE: 设备码
+            - PRE_UP: 库存阈值上限
+            - PRE_DOWN: 库存阈值下限
+            - UPDATE_TIME: 更新时间
+
+    Returns:
+        dict: 插入结果
+    """
+    import math
+    batch_size = 100
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-insert-into-adam-sub-stock-limt-pre'
+        url = f"http://{host}:{port}{endpoint}"
+
+        # NaN/Inf / 日期序列化处理
+        import datetime as _dt
+        df = df.astype(object).where(df.notna(), None)
+        records = df.rename(columns=str.lower).to_dict('records')
+        for r in records:
+            for k, v in r.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    r[k] = None
+                elif isinstance(v, (_dt.datetime, pd.Timestamp)):
+                    # datetime/Timestamp → 'YYYY-MM-DD HH:MM:SS'（中间件 TIMESTAMP 无法解析 ISO T 格式）
+                    r[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+                elif isinstance(v, _dt.date):
+                    # 纯日期 → 'YYYY-MM-DD'
+                    r[k] = v.isoformat()
+
+        total = len(records)
+        batches = math.ceil(total / batch_size)
+        logger.info(f"[阈值] 批量插入 ADAM_SUB_STOCK_LIMT_PRE: 共 {total} 条, "
+                    f"分 {batches} 批(每批 {batch_size} 条)")
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for i in range(0, total, batch_size):
+            chunk = records[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                response = session.post(url, json=chunk)
+                response.raise_for_status()
+                success_count += len(chunk)
+                logger.info(f"[阈值] 批量插入 ADAM_SUB_STOCK_LIMT_PRE "
+                            f"第 {batch_no}/{batches} 批成功, {len(chunk)} 条")
+            except Exception as e:
+                failed_count += len(chunk)
+                errors.append({"batch": batch_no, "count": len(chunk), "error": str(e)})
+                logger.error(f"[阈值] 批量插入 ADAM_SUB_STOCK_LIMT_PRE "
+                             f"第 {batch_no}/{batches} 批失败: {e}")
+
+        result = {
+            "success": failed_count == 0,
+            "message": f"阈值批量插入完成, 成功 {success_count} 条, 失败 {failed_count} 条",
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "batches": batches,
+            "errors": errors if errors else None
+        }
+        logger.info(f"[阈值] 阈值插入完毕: 成功 {success_count}/{total} 条")
+        return result
+    except requests.exceptions.RequestException:
+        logger.exception("[阈值] 批量插入 ADAM_SUB_STOCK_LIMT_PRE 网络异常")
+        raise
+    except Exception:
+        logger.exception("[阈值] 批量插入 ADAM_SUB_STOCK_LIMT_PRE 失败")
+        raise
