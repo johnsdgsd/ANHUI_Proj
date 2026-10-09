@@ -8,6 +8,9 @@
 
 与供电所补货 (R,S) 的区别: 补货算 q = max(0, S - I)（减现有库存），
 阈值预测直接输出 S 本身，不减库存。
+
+落库口径: λ_down=0 但 λ_up>0（下限窗口无需求、上限窗口有）仍生成记录，
+PRE_DOWN=0；仅当 λ_up=0（两个窗口皆无需求）才整条不落库。
 """
 import logging
 from typing import Dict
@@ -19,6 +22,9 @@ from scipy.stats import poisson
 from .config_loader import DEFAULT_ALPHA
 
 logger = logging.getLogger(__name__)
+
+# λ_down=0 的样例组合在日志里最多列几条（便于排查，不刷屏）
+SAMPLE_MAX = 5
 
 
 def poisson_quantile(alpha: float, lam: float) -> float:
@@ -90,10 +96,12 @@ def compute_threshold_plan(
     results = []
     stats = {
         'total_pairs': len(win),
-        'zero_down': 0,       # λ_down == 0，不落库
+        'zero_both': 0,       # λ_up == 0，两窗口皆无需求，不落库
+        'down_zero': 0,       # λ_down == 0 但 λ_up > 0，落库且 PRE_DOWN=0
         'generated': 0,
         'error_skip': 0,
     }
+    down_zero_sample = []     # λ_down=0 的样例组合，便于排查（最多 SAMPLE_MAX 条）
 
     for _, row in win.iterrows():
         org = row['ORG_NO']
@@ -102,14 +110,21 @@ def compute_threshold_plan(
         lam_up = float(row['UP_NUM'])
 
         try:
-            # 3a. λ_down == 0 → 无需求，不生成记录（避免空记录膨胀）
-            if lam_down <= 0:
-                stats['zero_down'] += 1
+            # 3a. λ_up == 0 → 两个窗口皆无需求，不生成记录（避免空记录膨胀）
+            #     业务口径: λ_down=0 但 λ_up>0（本周无需求、下周有）仍要落库，下限给 0
+            if lam_up <= 0:
+                stats['zero_both'] += 1
                 continue
 
             # 3b. 计算上下限（alpha 全量统一，来自请求参数或默认 0.95）
+            #     λ_down=0 时 poisson_quantile 返回 0，即 PRE_DOWN=0
             pre_down = poisson_quantile(alpha, lam_down)
             pre_up = poisson_quantile(alpha, lam_up)
+
+            if lam_down <= 0:
+                stats['down_zero'] += 1
+                if len(down_zero_sample) < SAMPLE_MAX:
+                    down_zero_sample.append(f"{org}/{dev}(λ_up={lam_up:.0f})")
 
             # 上限窗口天数 >= 下限窗口天数，理论上 PRE_UP >= PRE_DOWN；
             # 若数据异常导致反转，兜底对齐，保证业务约束
@@ -141,12 +156,17 @@ def compute_threshold_plan(
     # ---- 4. 输出统计 ----
     logger.info(
         f"[阈值算法] 完成: 总组合 {stats['total_pairs']}, "
-        f"无需求跳过(λ_down=0) {stats['zero_down']}, "
-        f"生成阈值 {stats['generated']}, "
+        f"生成阈值 {stats['generated']} "
+        f"(其中下限为0 {stats['down_zero']}), "
+        f"双窗口无需求跳过(λ_up=0) {stats['zero_both']}, "
         f"异常跳过 {stats['error_skip']}, "
         f"alpha={alpha}, "
         f"窗口 下限{down_days}天/上限{up_days}天"
     )
+    if down_zero_sample:
+        logger.info(
+            f"[阈值算法] 下限为0样例(最多 {SAMPLE_MAX} 条): " + ", ".join(down_zero_sample)
+        )
 
     if not results:
         logger.info("[阈值算法] 无阈值生成")
