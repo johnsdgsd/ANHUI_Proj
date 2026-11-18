@@ -77,8 +77,15 @@ def GenerateMutiOrderScheme(yearMonth:str):
         logger.info('准备计算成本明细')
         global_scheme_cost = GetGlobalSchemeCost(detail,tag,yearMonth)
 
-        global_scheme_cost['PRE_SINGLE_COST'] = global_scheme_cost['PRE_STAT_COST'].div(
-            global_shceme_lps['PRE_STAT_NUM'], fill_value=0).replace([float('inf'), -float('inf')], 0)
+        # 安全除法：PRE_STAT_NUM 为 0（如 AVG_INV=0 的分组）时单只成本置 0，
+        # 避免 object dtype 下逐元素除法抛 ZeroDivisionError
+        pre_stat_num = pd.to_numeric(global_shceme_lps['PRE_STAT_NUM'], errors='coerce')
+        pre_stat_cost = pd.to_numeric(global_scheme_cost['PRE_STAT_COST'], errors='coerce')
+        global_scheme_cost['PRE_SINGLE_COST'] = (
+            pre_stat_cost.div(pre_stat_num.where(pre_stat_num != 0))
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
 
         global_scheme_item['PRE_STAT_COST'] = global_scheme_item['PRE_STAT_COST'].astype(float).round(2)
         GlobalSchemeItems[tag] = global_scheme_item
@@ -442,8 +449,24 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str, cen
         I_END_SUM=('I_END', 'sum'),
         RUNNING_SUM=('RUNNING_NUM', 'sum')
     )
-    grouped['PRE_ITT'] = (grouped['PRE_NUM_SUM'] / grouped['AVG_INV_SUM']).fillna(0).round(4)
-    grouped['PRE_ITR'] = (grouped['I_END_SUM'] / grouped['RUNNING_SUM'] * 100).replace([float('inf'), -float('inf')], 0).fillna(0)
+    # 统一转数值后再做安全除法：上游 detail 可能因 merge/concat 变成 object dtype，
+    # 此时 0 分母会按 Python 语义抛 ZeroDivisionError（float64 只会得到 inf/NaN）。
+    pre_num_sum = pd.to_numeric(grouped['PRE_NUM_SUM'], errors='coerce').fillna(0.0)
+    avg_inv_sum = pd.to_numeric(grouped['AVG_INV_SUM'], errors='coerce')
+    i_end_sum = pd.to_numeric(grouped['I_END_SUM'], errors='coerce').fillna(0.0)
+    running_sum = pd.to_numeric(grouped['RUNNING_SUM'], errors='coerce')
+
+    zero_avg_inv = int((avg_inv_sum.fillna(0) == 0).sum())
+    zero_running = int((running_sum.fillna(0) == 0).sum())
+    if zero_avg_inv or zero_running:
+        logger.info(f'[周转明细] 零分母分组: AVG_INV=0 共 {zero_avg_inv} 组, RUNNING_NUM=0 共 {zero_running} 组，对应指标置 0')
+
+    grouped['PRE_ITT'] = (
+        pre_num_sum / avg_inv_sum.where(avg_inv_sum != 0)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).round(4)
+    grouped['PRE_ITR'] = (
+        i_end_sum / running_sum.where(running_sum != 0) * 100
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
     grouped.drop(columns=['PRE_NUM_SUM', 'AVG_INV_SUM', 'I_END_SUM', 'RUNNING_SUM'], inplace=True)
 
     # 2. 合并历史数据（使用左连接）
@@ -478,8 +501,12 @@ def GetGlobalSchemeITT(detail: pd.DataFrame, scheme_id: str, yearMonth: str, cen
     grouped['PRE_ITR_LAST_YEAR'] = grouped['PRE_ITR_LAST_YEAR'].fillna(0)
     # 3. 计算同比环比（避免除零，结果转为百分比）
     def calc_rate(current, history):
-        value = ((current - history) / history ).where(history != 0, 0.0)
-        return round(value * 100, 2)
+        # 先把分母中的 0 置为 NaN，确保除法不会真的执行 0 分母（object dtype 下会抛错）
+        current = pd.to_numeric(current, errors='coerce')
+        history = pd.to_numeric(history, errors='coerce')
+        safe_history = history.where(history != 0)
+        value = ((current - safe_history) / safe_history).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return (value * 100).round(2)
 
     grouped['ITT_TR'] = calc_rate(grouped['PRE_ITT'], grouped['PRE_ITT_LAST_MONTH'])
     grouped['ITT_YOY'] = calc_rate(grouped['PRE_ITT'], grouped['PRE_ITT_LAST_YEAR'])
