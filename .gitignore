@@ -17,3 +17,22 @@ data_cleaning/simulation/output/
 
 # 日志
 *.log
+
+# 本地工作区资料/脚本（不入库）
+backend/data_cleaning/explore_db/
+backend/data_cleaning/simulation/
+backend/11-18配送修改/
+backend/算法PPT制作/
+backend/文档/
+backend/二阶段目标设计开发/
+backend/供电所补库需求调整/
+backend/CLAUDE.md
+backend/需求硬约束设计.md
+backend/EmergReplenish/紧急补库算法说明.md
+backend/EmergReplenish/紧急补库算法逻辑草稿.txt
+backend/config/scheme_epsilons_202608.json
+backend/inventory_optimization/quota_check.py
+.codex/
+/sql.txt
+/sql(1).txt
+/项目模块说明.md

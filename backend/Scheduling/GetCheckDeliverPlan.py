@@ -110,7 +110,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         UnitPerBoxI = pd.to_numeric(unit_arr[0], errors='coerce') if len(unit_arr) > 0 else 5
         UnitPerBoxI = UnitPerBoxI if (pd.notna(UnitPerBoxI) and UnitPerBoxI > 0) else 5
         cls_val = str(SubTypeList.loc[i, 'DEV_CLS']).replace('.0', '').strip().zfill(2) if 'DEV_CLS' in SubTypeList.columns else '01'
-        vol_mult = 2.5 if cls_val == '02' else 1.0
+        vol_mult = 2.0 if cls_val == '02' else 1.0
         demand_boxes_by_loc += np.ceil(np.ceil(Demands[:, i] / UnitPerBoxI) * vol_mult)
     total_demand_boxes = demand_boxes_by_loc.sum()
     active_loc_count = np.sum(demand_boxes_by_loc > 0)
@@ -189,11 +189,37 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     # 构造 node_org_map → 供 GetDelivPlan 合肥约束使用
     node_org_map = {i + 1: str(locations.loc[i + 1, 'ORG_NO']).strip() for i in range(LocationNum)}
 
+    # ====================================================================
+    # 从 ADAM_SYS_PARAM 表读取配送算法配置（最大可配站点数 / 最短距离阈值）
+    # ====================================================================
+    max_site_num = 3        # 默认最大站点数（读不到时兜底）
+    dist_mist = 10.0        # 默认最短距离阈值 km（读不到时兜底）
+    try:
+        df_param = fetch_data("gk-adam-query_adam_sys_param")
+        if not df_param.empty:
+            for _, pr in df_param.iterrows():
+                code = str(pr.get('PARAM_CODE', '')).strip()
+                if code == 'GK_MAX_SITE_NUM':
+                    try:
+                        # 上限 4（老板要求"表里大于 4 最多配置为 4"），下限 1
+                        max_site_num = max(1, min(int(float(pr.get('PARAM_VALUE'))), 4))
+                    except (TypeError, ValueError):
+                        pass
+                elif code == 'GK_DIST_MIST':
+                    try:
+                        dist_mist = max(0.0, float(pr.get('PARAM_VALUE')))
+                    except (TypeError, ValueError):
+                        pass
+        logging.info(f"[配送配置] 最大站点数={max_site_num}(已钳≤4), 最短距离阈值={dist_mist}km")
+    except Exception as e:
+        logging.warning(f"[配送配置] 读取 ADAM_SYS_PARAM 失败({e})，使用默认值 站点数=3, 阈值=10km")
+
     ScheduledRoutes = GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList,
                                    actual_deliv_days, VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT,
                                    node_priority, daily_vehicle_limits, vehicle_types=all_vehicle_types,
                                    near_center_nodes=near_center_nodes if near_center_nodes else None,
-                                   work_days=work_days_list, node_org_map=node_org_map)
+                                   work_days=work_days_list, node_org_map=node_org_map,
+                                   max_site_num=max_site_num, dist_mist=dist_mist)
 
     # 【诊断】排程后装箱前：汇总 ALNS 配送结果
     sched_total_boxes = 0.0
@@ -306,6 +332,12 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
         is_realtime = (str(row.get('SOURCE_TYPE', '')).upper() == 'REALTIME')
         days_to_end = (month_end_dt - arr_dt).days
         earliest_bgn = max(arr_dt + timedelta(days=2), sim_start_dt)
+        # 重排的 pending 批次（带旧主键 DAY_DETECT_PLAN_PRE_ID，即 01/02/03 状态）：检定要放到
+        # "重排日"及以后，不排在已过去的日期（重排日之前的计划往后排）
+        if pd.notnull(row.get('DAY_DETECT_PLAN_PRE_ID')):
+            _today = datetime.now()
+            _today_date = datetime(_today.year, _today.month, _today.day)
+            earliest_bgn = max(earliest_bgn, _today_date)
         # 全部待检批次都要检定完，不设需求上限
         if is_realtime:
             take = rem
@@ -610,7 +642,7 @@ def GetCheckDeliverPlan(Demands, InitQuaStock, LotList, DeviceCaps, SubTypeList,
     dev_unit_box = {}   # dev_code → 每箱只数
     for sub_idx in range(SubTypeNum):
         dc = str(SubTypeList.loc[sub_idx, 'DEV_CODE_NO']).strip()
-        dev_vol_mult[dc] = 2.5 if get_cls(dc) == '02' else 1.0
+        dev_vol_mult[dc] = 2.0 if get_cls(dc) == '02' else 1.0
         unit_arr = TypeList.loc[TypeList['DEV_CODE_NO'] == dc, 'UnitPerBox'].values
         _upb = pd.to_numeric(unit_arr[0], errors='coerce') if len(unit_arr) > 0 else 5
         dev_unit_box[dc] = _upb if (pd.notna(_upb) and _upb > 0) else 5

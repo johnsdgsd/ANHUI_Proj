@@ -13,8 +13,21 @@ DelivPlanV4 全局常量
 
 MAX_ROUTE_DIST = 750
 ANGLE_COS_THRESHOLD = 0.707   # cos(45°)
-MAX_STOPS = 3
+
+# ---- 运行时参数（默认值仅兜底；实际值由 params.py 读取 ADAM_SYS_PARAM）----
+DEFAULT_MAX_STOPS = 3
+MAX_STOPS = DEFAULT_MAX_STOPS    # 兼容旧 import；运行时以参数表为准
+MAX_STOPS_LIMIT = 4
+DEFAULT_GK_DIST_MIST = 10.0      # 短腿计费阈值默认值（km）
+PT_VOL_MULT = 2.0                # 互感器(DEV_CLS='02')体积系数（V4 专用）
+
 ILP_TIMEOUT_SEC = 60
+# 4 站档：候选池约为 3 站的数倍，且 V4 有三轮车型放宽，单轮 300s、总预算 900s
+ILP_TIMEOUT_SEC_4STOP = 300
+ILP_TOTAL_BUDGET_SEC_4STOP = 900
+MAX_CANDIDATES_4STOP = 100000
+STAGE1_TIME_LIMIT_4STOP = 900
+
 NEAR_DEPOT_DIST_THRESHOLD = 80  # 角度豁免兜底阈值（hefei_nodes 未知时使用）
 
 # ==== V4 新增约束参数 ====

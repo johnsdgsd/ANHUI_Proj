@@ -23,6 +23,8 @@ except ImportError:
 SOLVER_TIME_LIMIT_SMALL = 60
 SOLVER_TIME_LIMIT_MEDIUM = 200
 SOLVER_TIME_LIMIT_LARGE = 400
+SOLVER_TIME_LIMIT_4STOP = 800  # 4 站档专用下限(用户 2026-11-13):候选池约为 3 站的 3.5 倍,
+                               # 同样 400s 等于预算不变而模型变大,故 4 站档 Pass 2 放宽到 800s
 ROUTE_CAP_SMALL = 800          # MIP 路线数 ≤ 此值 → 小算例
 ROUTE_CAP_MEDIUM = 3000        # MIP 路线数 ≤ 此值 → 中算例; 其余 → 大算例
 CONSTRUCT_PASS2_TIME = 400     # 构造热启动生效时的 Pass 2 时间(与 LARGE 同步,用户 2026-08-10: 600→400)
@@ -34,12 +36,44 @@ MAX_ROUTES_AUTO_CAP = 2500     # 自适应 reduce：RPS=3 后路线数 ≤ 此�
 NUM_SEARCH_WORKERS = min(8, os.cpu_count() or 1)   # CP-SAT并行搜索线程数(用户 2026-08-09: 4→8,核数不足自动降)
 RATE_EPSILON = 0.001           # 装载率/占比浮点比较容差（validate 用）
 DIST_EPSILON = 0.1             # 距离浮点比较容差（validate 用）
-MAX_STOPS_PER_ROUTE = 3        # 枚举路径最多停靠点(1/2/3站);车队子任务数下界依赖此值,与 enumerate_routes 保持一致
+MAX_STOPS_PER_ROUTE = 3        # 【默认值,仅兜底】实际值由 params['MAX_STOPS_PER_ROUTE'](data_loader.py) 决定,
+                               # 可设 1/2/3/4。枚举(最多几站)与车队子任务数下界(_team_lower_bound)
+                               # 都读同一个 params 键,不会再出现"常量与枚举不同步"的问题(用户 2026-11-13)。
 A_B_MAX_B_STOPS = 1            # A_B 路线最多含 1 个 Set B 网点(用户 2026-09-11: "每车只带 1 个 B")。
                                # 仅约束【含 Set A】的路线;ANY 路线(无 Set A)不受限,B 网点数任意。
                                # 注意:按"B 网点个数"判定而非站数——2A+1B(3站)合法,1A+2B(3站)非法。
 
-def _grade_pass2_time(n_mip_routes, construction=False):
+# 计费里程规则默认值(兜底;实际取 params['GK_DIST_MIST'],唯一来源 data_loader.py)
+GK_DIST_MIST = 10.0
+
+
+def billing_leg_distances(legs, gk_dist_mist):
+    """把"真实分段里程"换算成"用于计费的分段里程"（用户 2026-11-13 新规则）。
+
+    规则: 某段真实里程 < GK_DIST_MIST 时，该段计费里程沿用【前一段的计费里程】。
+    连续多段都低于阈值时**链式传递**（用户确认）:
+        A-B=20, B-C=4, C-D=3, 阈值 5  →  计费 20 / 20 / 20
+    首段（中心→首站）没有前一段，保持真实里程。
+
+    只影响费用（cost_coeffs → MIP 目标 → 报告成本）;
+    total_dist_km / 750km 上限 / 里程展示一律仍用真实距离，不受本规则影响。
+
+    Args:
+        legs: [中心→首站, 首站→次站, ...] 的真实里程列表
+        gk_dist_mist: 阈值 km
+    Returns:
+        与 legs 等长的计费里程列表
+    """
+    billed = []
+    for i, d in enumerate(legs):
+        if i > 0 and d < gk_dist_mist:
+            billed.append(billed[-1])      # 链式:沿用前一段的"计费"里程
+        else:
+            billed.append(d)
+    return billed
+
+
+def _grade_pass2_time(n_mip_routes, construction=False, max_stops=None):
     """Pass 2 时限分级（用户 2026-08-05）：按 MIP 路线数自动分档，替换固定超参。
 
     路线数是 MIP 规模的主要决定因素（变量/约束数随路线数线性增长）：
@@ -48,6 +82,8 @@ def _grade_pass2_time(n_mip_routes, construction=False):
     - 大算例（其余，如正式 87 网点 RPS=1 后 ~4500 条）：400s（用户 2026-08-10: 600→400 提速）
     construction=True（构造热启动把优先路线硬固定后，Pass 2 仍需完成全网络解，
     1 车队紧凑拼装是大算例难点）：大算例在分档基础上直接给满 CONSTRUCT_PASS2_TIME（400s）。
+    max_stops>=4（用户 2026-11-13）：4 站档候选池约为 3 站的 3.5 倍，
+    在分档结果上再取 max(..., SOLVER_TIME_LIMIT_4STOP=800s)，避免"预算不变、模型变大"。
     """
     if n_mip_routes <= ROUTE_CAP_SMALL:
         base = SOLVER_TIME_LIMIT_SMALL
@@ -57,6 +93,8 @@ def _grade_pass2_time(n_mip_routes, construction=False):
         base = SOLVER_TIME_LIMIT_LARGE
     if construction and n_mip_routes > ROUTE_CAP_MEDIUM:
         base = max(base, CONSTRUCT_PASS2_TIME)
+    if max_stops is not None and max_stops >= 4:
+        base = max(base, SOLVER_TIME_LIMIT_4STOP)
     return base
 
 def validate(solution, data, params):
@@ -384,7 +422,9 @@ def _team_lower_bound(params, subtasks, team_mix, vehicles, max_teams=18,
                 n_pack += 1
             else:
                 n_nonpack += 1
-        routes_needed = n_full + n_nonpack + math.ceil(n_pack / MAX_STOPS_PER_ROUTE)
+        # 每车最多装 _max_stops 个可共载碎片 —— 与枚举取同一个 params 键,保证下界与枚举一致
+        _max_stops = params.get('MAX_STOPS_PER_ROUTE', MAX_STOPS_PER_ROUTE)
+        routes_needed = n_full + n_nonpack + math.ceil(n_pack / max(1, _max_stops))
         count_lb = math.ceil(routes_needed / max(1, sum(team_mix)))
         cap_lb = max(cap_lb, count_lb)
     for N in range(cap_lb, max_teams + 1):
@@ -515,7 +555,8 @@ def _build_unified_model(params, data, routes, priority_tasks, n_teams_max, team
                          enforce_load_rate, load_rate_hard_target,
                          objective,  # 'feasibility' | 'min_teams' | 'min_cost'
                          fix_n_teams=None, max_n_teams=None,
-                         effective_max_trips=None, transport_teams=None, qbar=None):
+                         effective_max_trips=None, transport_teams=None, qbar=None,
+                         min_n_teams=None):
     """构建统一 MIP 模型。返回 (model, ctx)。
 
     ctx = {'x','route_active','y','z','p','w','n_teams',
@@ -591,6 +632,10 @@ def _build_unified_model(params, data, routes, priority_tasks, n_teams_max, team
             model.Add(n_teams == fix_n_teams)
         if max_n_teams is not None:
             model.Add(n_teams <= max_n_teams)
+        # v6(用户 2026-11-14):标注超 3000/队后升级重试时,强制不少于该队数,
+        # 否则求解器可能再次选出同样装不下的队数,导致反复重试。
+        if min_n_teams is not None:
+            model.Add(n_teams >= min_n_teams)
 
     objective_terms = []
 
@@ -1050,7 +1095,9 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     # ---- Pass 2: 最低成本(含软装载率惩罚;无车辆数量目标) ----
     # 车队数递增回退:若探测假设的 N* 实际不可行(探测超时误判,或热启动未命中),
     # 逐步放大 max_n_teams 重试,得到合法解后再退出;避免整条流水线坠入贪心回退。
+    # v6: min_teams_retry 用于"标注超 3000/队"后的重试,强制比失败解更多的车队数。
     solution = None
+    min_teams_retry = None    # 标注超 3000/队后置为 n_teams_actual+1,禁止重试再选更少车队
     for trial_N in range(n_teams_opt, n_teams_max + 1):
         t0 = time.time()
         model2, ctx2 = _build_unified_model(params,
@@ -1058,6 +1105,7 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
             enforce_load_rate, load_rate_hard_target,
             objective='min_cost',
             max_n_teams=(trial_N if has_teams else None),
+            min_n_teams=min_teams_retry,
             effective_max_trips=effective_max_trips,
             transport_teams=transport_teams,
             qbar=qbar)
@@ -1158,7 +1206,8 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
         time_limit = _grade_pass2_time(
             len(routes),
             construction=(trial_N == n_teams_opt and warm_start is not None
-                          and warm_start[0] == 'construct'))
+                          and warm_start[0] == 'construct'),
+            max_stops=params.get('MAX_STOPS_PER_ROUTE', MAX_STOPS_PER_ROUTE))
         if pass2_time_limit is not None:
             time_limit = pass2_time_limit
 
@@ -1232,6 +1281,25 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
                 p=ctx2['p'], n_teams=n_teams_actual,
                 n_teams_max=n_teams_max, team_mix=team_mix,
                 z=ctx2['z'], eligible_by_route=ctx2['eligible_by_route'])
+
+            # ---- 每队 3000 箱硬约束的事后校验（v6，用户 2026-11-14）----
+            # g3 只建模了"全车队总量 ≤ 3000·N"，**每队上限不在 MIP 里**：标注回溯可能找不到
+            # 满足 3000/队的分配（实测 colleague 案例 N=3：14 条优先路线总量正好 9000，
+            # 但 3 队装箱数学上无解，贪心兜底后车队1/2 分别 3466/3284 箱）。
+            # 此时**不采纳该解**，按 N+1 再跑一次 Pass 2（与"升级车队数"既有路径一致）；
+            # 只有已经到车队数上限时，才保留该解并大声告警（不静默产出违规方案）。
+            over = _team_volume_over(params, solution)
+            if over and trial_N < n_teams_max:
+                if verbose:
+                    print(f"  ↻ 标注超出 {params['TEAM_CAP_BOXES']}/队 {over} "
+                          f"→ 放弃 ≤{trial_N} 队的解，升到 {max(n_teams_actual, trial_N)+1} 队重试")
+                min_teams_retry = max(n_teams_actual, trial_N) + 1   # 下次至少这么多队
+                solution = None
+                continue
+            if over:
+                if verbose:
+                    print(f"  ⚠ 已达车队数上限 {n_teams_max}，保留超 {params['TEAM_CAP_BOXES']}/队 "
+                          f"的标注 {over}（请人工确认）")
             break
         else:
             if verbose:
@@ -1274,7 +1342,9 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
                     model_fb.AddHint(ctx_fb['y'][key], s_hint.Value(var))
             tf = time.time()
             solver_fb = cp_model.CpSolver()
-            solver_fb.parameters.max_time_in_seconds = _grade_pass2_time(len(routes), construction=False)
+            solver_fb.parameters.max_time_in_seconds = _grade_pass2_time(
+                len(routes), construction=False,
+                max_stops=params.get('MAX_STOPS_PER_ROUTE', MAX_STOPS_PER_ROUTE))
             solver_fb.parameters.num_search_workers = NUM_SEARCH_WORKERS
             solver_fb.parameters.linearization_level = 2
             solver_fb.parameters.symmetry_level = 2
@@ -1315,6 +1385,23 @@ def solve(params, data, routes, ftl_routes, verbose=True, enforce_load_rate=True
     merged['priority_tasks'] = priority_tasks or {}
     merged['teams_saturated'] = solution.get('teams_saturated')
     return merged
+
+def _team_volume_over(params, solution):
+    """返回 {车队: 运量} —— 标注后运量超过 TEAM_CAP_BOXES 的车队(空 dict 表示合规)。
+
+    统计口径与 `validate` 的"每车队运量 ≤ 3000"完全一致(统计所有已标注车队的路线,
+    含优先路线上的拼车普通量)。v6 新增,用于 Pass 2 出解后的**事后可行性校验**:
+    g3 只建模"全车队总量 ≤ 3000·N",每队上限不在 MIP 里,标注阶段可能装不下
+    (实测 colleague 案例: 14 条优先路线总量正好 9000,但 3 队装箱数学上无解)。
+    """
+    vol = defaultdict(int)
+    for sr in solution.get('routes', []):
+        t = sr.get('team') or 0
+        if t > 0:
+            vol[t] += sr.get('total_load', 0)
+    cap = params['TEAM_CAP_BOXES']
+    return {t: v for t, v in vol.items() if v > cap + 1}
+
 
 def _extract_solution(params, solver, routes, vehicles, branches, set_a, x, y, solve_time,
                       status_name, solver_obj, p=None, n_teams=0, n_teams_max=0,
@@ -1643,6 +1730,17 @@ def enumerate_routes(params, data, verbose=True):
     """
     t0 = time.time()
 
+    # 路径最大停靠站数（用户 2026-11-13：可切换 1/2/3/4，唯一来源 data_loader.MAX_STOPS_PER_ROUTE）
+    # 1/2/3 站各有专门枚举块；只有 max_stops==4 才进入 4 站块（计算量最大，见该块注释）。
+    max_stops = params.get('MAX_STOPS_PER_ROUTE', MAX_STOPS_PER_ROUTE)
+    if max_stops not in (1, 2, 3, 4):
+        raise ValueError(
+            f"MAX_STOPS_PER_ROUTE 只能取 1/2/3/4，当前为 {max_stops!r}"
+            "（data_loader.py 头部设置）")
+
+    # 计费里程阈值（用户 2026-11-13）：短于该值的分段沿用前一段计费里程
+    gk_dist_mist = params.get('GK_DIST_MIST', GK_DIST_MIST)
+
     branches = data['branches']
     compatible = data['compatible']
     d_center = data['d_center']
@@ -1656,6 +1754,8 @@ def enumerate_routes(params, data, verbose=True):
     n_active = len(active_codes)
     if verbose:
         print(f"Active branches (with demand): {n_active}")
+        print(f"Max stops per route: {max_stops}"
+              + ("   [4 站档:枚举与 MIP 规模会显著膨胀]" if max_stops >= 4 else ""))
         print(f"Set A: {len(set_a)}, Set B: {len(set_b)}")
         print(f"Other (not A or B): {n_active - len(set_a & set(active_codes)) - len(set_b & set(active_codes))}")
 
@@ -1692,7 +1792,7 @@ def enumerate_routes(params, data, verbose=True):
 
     routes = []
     route_id = 0
-    stats = {'1stop': 0, '2stop': 0, '3stop': 0, 'invalid': 0,
+    stats = {'1stop': 0, '2stop': 0, '3stop': 0, '4stop': 0, 'invalid': 0,
              'invalid_multi_b': 0, 'dist_fail': 0, 'angle_fail': 0}
 
     # 路径分类函数
@@ -1743,9 +1843,11 @@ def enumerate_routes(params, data, verbose=True):
         print(f"  1-stop routes: {stats['1stop']}")
 
     # ---- 2站路径 ----
-    if verbose:
+    if verbose and max_stops >= 2:
         print("Enumerating 2-stop routes...")
     for i in active_codes:
+        if max_stops < 2:          # 该档关闭:直接跳过整块
+            break
         d_out_i = get_dist_center_to(i)
         for j in active_codes:
             if i == j:
@@ -1767,28 +1869,31 @@ def enumerate_routes(params, data, verbose=True):
                 stats['invalid'] += 1
                 continue
 
+            billed = billing_leg_distances([d_out_i, d_ij_val], gk_dist_mist)
             routes.append({
                 'route_id': route_id,
                 'stops': [i, j],
                 'category': cat,
                 'total_dist_km': round(total_d, 3),
                 'n_stops': 2,
-                'cost_coeffs': {i: params['C0'] * d_out_i, j: params['C0'] * d_ij_val},
+                'cost_coeffs': {i: params['C0'] * billed[0], j: params['C0'] * billed[1]},
                 'leg_distances': [d_out_i, d_ij_val],
             })
             route_id += 1
             stats['2stop'] += 1
 
-    if verbose:
+    if verbose and max_stops >= 2:
         print(f"  2-stop routes: {stats['2stop']}")
 
     # ---- 3站路径 (角度桶加速) ----
-    if verbose:
+    if verbose and max_stops >= 3:
         print("Enumerating 3-stop routes (angle bucket accelerated)...")
     three_count = 0
     processed_triples = set()
 
     for i in active_codes:
+        if max_stops < 3:          # 该档关闭:直接跳过整块
+            break
         d_out_i = get_dist_center_to(i)
         # 只考虑i的邻居范围内的3站组合
         nbrs = neighbors[i]
@@ -1825,21 +1930,97 @@ def enumerate_routes(params, data, verbose=True):
                     stats['invalid'] += 1
                     continue
 
+                billed = billing_leg_distances([d_out_i, d_ij_val, d_jl_val], gk_dist_mist)
                 routes.append({
                     'route_id': route_id,
                     'stops': [i, j, l],
                     'category': cat,
                     'total_dist_km': round(total_d, 3),
                     'n_stops': 3,
-                    'cost_coeffs': {i: params['C0'] * d_out_i, j: params['C0'] * d_ij_val, l: params['C0'] * d_jl_val},
+                    'cost_coeffs': {i: params['C0'] * billed[0], j: params['C0'] * billed[1],
+                                    l: params['C0'] * billed[2]},
                     'leg_distances': [d_out_i, d_ij_val, d_jl_val],
                 })
                 route_id += 1
                 three_count += 1
 
     stats['3stop'] = three_count
-    if verbose:
+    if verbose and max_stops >= 3:
         print(f"  3-stop routes: {three_count}")
+
+    # ---- 4站路径 (角度桶加速;仅当 MAX_STOPS_PER_ROUTE >= 4 时枚举) ----
+    # 计算量:O(n·d³)(d = 平均邻居数),约为 3 站块的 d 倍 —— 是本项目最大的枚举负担来源。
+    # 沿用 3 站块的口径:只从 i 的邻居集合里取点,并要求四点两两同向兼容(整体是兼容图的一个 4-团),
+    # 因此不会枚举出"j 与 i 不同向"的组合。距离用增量剪枝(前几腿已超 L_MAX 就不再展开)。
+    # 不做 processed_quads 去重:三重循环对每个有序四元组恰好访问一次(3 站块的 set 是冗余防御,
+    # 4 站若照搬会多占数百 MB 内存)。
+    four_count = 0
+    if max_stops >= 4:
+        if verbose:
+            print("Enumerating 4-stop routes (angle bucket accelerated)...")
+        l_max = params['L_MAX']
+
+        for i in active_codes:
+            d_out_i = get_dist_center_to(i)
+            nbrs = neighbors[i]
+
+            for j in nbrs:
+                d_ij_val = get_dist_ij(i, j)
+                if d_out_i + d_ij_val > l_max:
+                    stats['dist_fail'] += 1
+                    continue
+
+                for l in nbrs:
+                    if l == j:
+                        continue
+                    if not compatible.get((j, l), False):
+                        continue
+                    d_jl_val = get_dist_ij(j, l)
+                    if d_out_i + d_ij_val + d_jl_val > l_max:
+                        stats['dist_fail'] += 1
+                        continue
+
+                    for m in nbrs:
+                        if m == j or m == l:
+                            continue
+                        # 与前一点 l 兼容(其余三点对已在上一层校验过: i↔j, i↔l, j↔l, i↔m 由 nbrs 保证)
+                        if not compatible.get((l, m), False):
+                            continue
+                        if not compatible.get((j, m), False):
+                            continue
+
+                        d_lm_val = get_dist_ij(l, m)
+                        d_back_m = get_dist_to_center(m)
+                        total_d = d_out_i + d_ij_val + d_jl_val + d_lm_val + d_back_m
+                        if total_d > l_max:
+                            stats['dist_fail'] += 1
+                            continue
+
+                        cat = classify([i, j, l, m])
+                        if cat == "INVALID":
+                            stats['invalid'] += 1
+                            continue
+
+                        billed = billing_leg_distances(
+                            [d_out_i, d_ij_val, d_jl_val, d_lm_val], gk_dist_mist)
+                        routes.append({
+                            'route_id': route_id,
+                            'stops': [i, j, l, m],
+                            'category': cat,
+                            'total_dist_km': round(total_d, 3),
+                            'n_stops': 4,
+                            'cost_coeffs': {i: params['C0'] * billed[0],
+                                            j: params['C0'] * billed[1],
+                                            l: params['C0'] * billed[2],
+                                            m: params['C0'] * billed[3]},
+                            'leg_distances': [d_out_i, d_ij_val, d_jl_val, d_lm_val],
+                        })
+                        route_id += 1
+                        four_count += 1
+
+        stats['4stop'] = four_count
+        if verbose:
+            print(f"  4-stop routes: {four_count}")
 
     # ---- 组排序重排(用户 2026-08-10): 同组网点按需求降序,保证 MIP 组排序约束 (f) 恒可满足 ----
     # 旧枚举按腿距排顺序,可能把同组小需求网点排在大需求前面(如 全椒13 → 滁州城郊939),
@@ -1875,10 +2056,11 @@ def enumerate_routes(params, data, verbose=True):
         total_d = sum(legs) + get_dist_to_center(new_stops[-1])
         if total_d > params['L_MAX']:
             return r
+        billed = billing_leg_distances(legs, gk_dist_mist)   # 重排后按新顺序重算计费里程
         r2 = dict(r)
         r2['stops'] = new_stops
         r2['total_dist_km'] = round(total_d, 3)
-        r2['cost_coeffs'] = {s: params['C0'] * legs[a] for a, s in enumerate(new_stops)}
+        r2['cost_coeffs'] = {s: params['C0'] * billed[a] for a, s in enumerate(new_stops)}
         r2['leg_distances'] = legs
         return r2
 

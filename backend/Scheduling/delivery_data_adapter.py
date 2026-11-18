@@ -57,8 +57,12 @@ LOAD_RATE_MIN_ANY = 0.80
 LOAD_RATE_MIN_A_ONLY = 0.70
 DIST_MAX_KM = 750
 
+# ---- 配送算法可配置参数（默认值仅兜底；实际由 get_params 注入 ADAM_SYS_PARAM 读到的值）----
+MAX_STOPS_PER_ROUTE = 3        # 最大可配站点数（1~4；>4 由读取层钳到 4）
+GK_DIST_MIST = 10.0            # 配送最短距离阈值 km（短于此值的分段沿用前段计费里程）
 
-def get_params(VeCap=None, VeUnitPrice=None):
+
+def get_params(VeCap=None, VeUnitPrice=None, max_site_num=None, dist_mist=None):
     """返回 v5_5 全部业务参数字典。
 
     业务数据（车型容量 / 运输单价 / 整车直配容量）优先从数据库查询结果注入：
@@ -121,6 +125,8 @@ def get_params(VeCap=None, VeUnitPrice=None):
         'LOAD_RATE_MIN_ANY': LOAD_RATE_MIN_ANY,
         'LOAD_RATE_MIN_A_ONLY': LOAD_RATE_MIN_A_ONLY,
         'DIST_MAX_KM': DIST_MAX_KM,
+        'MAX_STOPS_PER_ROUTE': max_site_num if max_site_num is not None else MAX_STOPS_PER_ROUTE,
+        'GK_DIST_MIST': dist_mist if dist_mist is not None else GK_DIST_MIST,
     }
 
 
@@ -189,7 +195,7 @@ def _compute_demand_boxes(Demands, LocationNum, TypeList, SubTypeList):
         unit_arr = TypeList.loc[TypeList['DEV_CODE_NO'] == dc, 'UnitPerBox'].values
         UnitPerBox = unit_arr[0] if len(unit_arr) > 0 else 5
         cls_val = str(SubTypeList.iloc[j].get('DEV_CLS', '01')).replace('.0', '').strip().zfill(2)
-        vol_mult = 2.5 if cls_val == '02' else 1.0
+        vol_mult = 2.0 if cls_val == '02' else 1.0
         for i in range(LocationNum):
             val = dm.iloc[i, j] if hasattr(dm, 'iloc') else dm[i, j]
             if val > 0:

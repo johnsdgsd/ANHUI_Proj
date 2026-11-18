@@ -432,7 +432,8 @@ def _v3_generate_main_scheme(best_sol, VeCap, CarTypeStrList, date):
 # ==================== V3 拆箱 → 明细表 ====================
 
 def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
-                         DMAT_arr, org_labels, demand_units=None, uid_to_dev=None):
+                         DMAT_arr, org_labels, demand_units=None, uid_to_dev=None,
+                         pt_vol_mult=2.5, billed_legs=None):
     """
     从 best_sol 拆箱生成 DetailScheme。
 
@@ -441,6 +442,14 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
           (网点, 设备码)，按 unit 1:1 分配件数——同一设备码不会被按比例打散到多条
           路线，仅单码超容内部切分时才按比例分摊（现场规则）。
         - 不传（V3 旧链路兼容）: 按网点体积箱占比(ratio)分摊各设备码（旧行为）。
+
+    参数:
+        pt_vol_mult: 互感器体积系数。V4 传 config.PT_VOL_MULT(2.0)；
+                     V3 不传时保持 2.5，行为不变。
+        billed_legs: 可选，按 best_sol 顺序的计费分段里程列表。
+                     传入时 EST_TOT_DIST_MIST 仍存真实段距，DIST_EXP 用计费段距；
+                     不传时 DIST_EXP 也用真实段距（V3 旧行为）。
+                     注意：短腿计费规则下，DIST_EXP 不能用 EST_TOT_DIST_MIST 反算。
 
     核心逻辑:
         - 追踪剩余需求，硬封顶不超过剩余需求，确保 Σ配送件数 ≤ 原始需求
@@ -455,7 +464,7 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
     for dev_idx in range(SubTypeNum):
         box_cap = float(SubTypeList.iloc[dev_idx]['PACK_BOX_NUM'])
         cls_val = str(SubTypeList.iloc[dev_idx].get('DEV_CLS', '')).replace('.0', '').strip().zfill(2)
-        vol_mult = 2.5 if cls_val == '02' else 1.0
+        vol_mult = float(pt_vol_mult) if cls_val == '02' else 1.0
         dev_attrs.append((
             box_cap, vol_mult,
             SubTypeList.iloc[dev_idx]['DEV_CODE'],
@@ -486,6 +495,16 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
         for node_id, _ in deliveries:
             seg_dists.append(DMAT_arr[prev_node, node_id])
             prev_node = node_id
+
+        # 计费分段里程（V4 短腿规则）；EST 仍用真实 seg_dists
+        route_billed = None
+        if billed_legs is not None:
+            if (r_idx < len(billed_legs) and billed_legs[r_idx] is not None
+                    and len(billed_legs[r_idx]) == len(deliveries)):
+                route_billed = billed_legs[r_idx]
+            else:
+                logging.warning(f"[计费里程] 路线{r_idx} billed_legs 长度不匹配"
+                                f"(deliveries={len(deliveries)})，回退真实段距")
 
         # 诊断：检查零距离段
         for s_idx, (nid, vol) in enumerate(deliveries):
@@ -527,6 +546,7 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
                     remaining.iloc[loc_idx, dev_idx] -= alloc_pieces
                     plan_box_num = int(np.ceil(alloc_pieces / box_cap))
                     seg_dist = seg_dists[stop_idx]
+                    billed_dist = route_billed[stop_idx] if route_billed is not None else seg_dist
                     det_seq += 1
 
                     rows.append({
@@ -541,7 +561,7 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
                         'PLAN_DIST_NUM': alloc_pieces,
                         'PLAN_BOX_NUM': plan_box_num,
                         'EST_TOT_DIST_MIST': round(seg_dist, 4),
-                        'DIST_EXP': round(unit_price * plan_box_num * seg_dist, 4),
+                        'DIST_EXP': round(unit_price * plan_box_num * billed_dist, 4),
                         'GLOBAL_SCHEME_ID': GlobalSchemeId
                     })
                 continue
@@ -574,6 +594,7 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
                 plan_box_num = int(np.ceil(alloc_pieces / box_cap))
                 _, _, dev_code, dev_cls, dev_categ = dev_attrs[dev_idx]
                 seg_dist = seg_dists[stop_idx]
+                billed_dist = route_billed[stop_idx] if route_billed is not None else seg_dist
                 det_seq += 1
 
                 rows.append({
@@ -588,7 +609,7 @@ def _v3_unbox_to_detail(best_sol, MainScheme, Demands, SubTypeList, VeUnitPrice,
                     'PLAN_DIST_NUM': alloc_pieces,
                     'PLAN_BOX_NUM': plan_box_num,
                     'EST_TOT_DIST_MIST': round(seg_dist, 4),
-                    'DIST_EXP': round(unit_price * plan_box_num * seg_dist, 4),
+                    'DIST_EXP': round(unit_price * plan_box_num * billed_dist, 4),
                     'GLOBAL_SCHEME_ID': GlobalSchemeId
                 })
 

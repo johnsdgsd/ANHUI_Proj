@@ -4,7 +4,7 @@ Stage 1: 候选路径枚举
 以 demand_unit 为原子单元，枚举所有满足约束的候选配送路径。
 
 约束条件（V4）:
-    - 每路径 ≤ MAX_STOPS 个物理站点
+    - 每路径 ≤ max_stops 个物理站点（默认3，可配1-4）
     - 路径内任意两网点夹角 ≤ 45°（合肥四库房豁免）
     - 总装载量 ≤ max_cap
     - 闭环距离 ≤ max_route_dist
@@ -27,26 +27,34 @@ import logging
 import time
 from collections import defaultdict
 
-from backend.DelivPlanV4.config import MAX_STOPS, HEFEI_EXCLUDE_DIST
+from backend.DelivPlanV4.billing import billing_leg_distances
+from backend.DelivPlanV4.config import (
+    DEFAULT_MAX_STOPS,
+    HEFEI_EXCLUDE_DIST,
+    MAX_STOPS_LIMIT,
+)
 from backend.DelivPlanV4.geometry import (
     compute_polar_angles,
     check_angle_constraint,
     compute_path_cost,
+    path_leg_distances,
 )
 
 
 def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                                hefei_node_ids=None, node_to_group=None,
                                depot_coord=None, node_coords=None,
-                               node_real_boxes=None):
+                               node_real_boxes=None,
+                               max_stops=None, gk_dist_mist=0.0,
+                               max_candidates=None, max_seconds=None):
     """
     枚举所有满足约束的候选配送路径。
 
     约束条件（V4 新增约束见 Stage 1 内联注释）:
-        - 每路径 ≤ MAX_STOPS 个物理站点
+        - 每路径 ≤ max_stops 个物理站点（1~4，默认 config.DEFAULT_MAX_STOPS）
         - 路径内任意两网点夹角 ≤ 45°（合肥四库房豁免）
         - 总装载量 ≤ max_cap
-        - 闭环距离 ≤ max_route_dist
+        - 闭环距离 ≤ max_route_dist（真实距离）
         - [约束1] 同城节点首站必须最大箱数
         - [约束2] 合肥四库房不能与各自 150km 内非合肥节点同路
         - [约束4] 由近及远：跨城相邻站点距省库单调不降（同城豁免）
@@ -67,6 +75,10 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
         node_real_boxes: dict[int, float] | None, node_id → 实际箱合计（业务口径）。
                         None 时约束1按体积箱判定（向后兼容）；传入后约束1
                         「量大先行」改按实际箱判定，容量/成本仍按体积箱。
+        max_stops: 单路径最大物理站点数，只允许 1/2/3/4；None 用默认 3。
+        gk_dist_mist: 短腿计费阈值 km；<=0 关闭计费规则。
+        max_candidates: 候选数上限（4站档保护）；None 不限制。
+        max_seconds: Stage1 软截止秒数（4站档保护）；None 不限制。
 
     Returns:
         list[dict]: 候选路径列表，每项格式:
@@ -75,12 +87,19 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                 'unit_ids': frozenset[int],   # 覆盖的 demand_unit ID 集合
                 'sequence': tuple[int],        # 访问的物理节点序列（最优排列）
                 'load': float,                 # 总装载量
-                'distance': float,             # 闭环距离
-                'base_cost': float,            # 运输成本基数（未乘单价）
+                'distance': float,             # 真实闭环距离
+                'base_cost': float,            # 运输成本基数（未乘单价，按计费里程）
+                'legs': list[float],           # 出车分段真实里程
+                'billed_legs': list[float],    # 出车分段计费里程
                 'has_hefei': bool,             # [V4新增] 是否含合肥四库房
                 'has_far_node': bool,          # [V4新增] 是否含非合肥节点
             }
     """
+    max_stops = DEFAULT_MAX_STOPS if max_stops is None else int(max_stops)
+    if max_stops not in (1, 2, 3, 4) or max_stops > MAX_STOPS_LIMIT:
+        raise ValueError(
+            f"max_stops 只能是 1/2/3/4，当前为 {max_stops!r}")
+    gk_dist_mist = float(gk_dist_mist or 0.0)
     t_start = time.time()
 
     # ---- 1. 构建查找表 ----
@@ -161,6 +180,10 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
     total_accepted = 0         # 实际保留
     total_replaced = 0         # 替换已有（更好的排列）
     window_sizes = []          # 各窗口大小统计
+    limit_hit = None           # 4站档候选数/时间上限触发标记
+
+    logging.info(f"[Stage1] max_stops={max_stops}, gk_dist_mist={gk_dist_mist}, "
+                 f"max_candidates={max_candidates}, max_seconds={max_seconds}")
 
     for start in range(n_polar):
         # 构建极角兼容的最大窗口
@@ -183,8 +206,8 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
 
         window_sizes.append(len(window_nodes))
 
-        # 窗口内枚举节点组合 (1 ~ min(|window|, MAX_STOPS))
-        max_k = min(len(window_nodes), MAX_STOPS)
+        # 窗口内枚举节点组合 (1 ~ min(|window|, max_stops))
+        max_k = min(len(window_nodes), max_stops)
         for k in range(1, max_k + 1):
             for node_subset in itertools.combinations(window_nodes, k):
                 if not _all_pairs_angle_ok(node_subset, dmat_arr,
@@ -203,6 +226,13 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                 for r in range(1, max_r + 1):
                     for unit_combo in itertools.combinations(subset_uids, r):
                         total_enumerated += 1
+                        if max_candidates is not None and len(best_paths) >= max_candidates:
+                            limit_hit = f"候选数上限 {max_candidates}"
+                            break
+                        if (max_seconds is not None and total_enumerated % 1000 == 0
+                                and time.time() - t_start > max_seconds):
+                            limit_hit = f"Stage1 时间上限 {max_seconds}s"
+                            break
                         total_load = sum(uid_to_info[uid][1] for uid in unit_combo)
                         if total_load > max_cap + 0.01:
                             total_cap_rejected += 1
@@ -239,19 +269,46 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
                         best_seq, best_dist, best_cost = _find_best_sequence(
                             combo_nodes, node_load, total_load, dmat_arr, max_route_dist,
                             node_to_group=node_to_group if node_to_group else None,
-                            node_load_real=node_load_real
+                            node_load_real=node_load_real,
+                            gk_dist_mist=gk_dist_mist
                         )
 
                         if best_seq is not None:
                             key = frozenset(unit_combo)
+                            legs = path_leg_distances(best_seq, dmat_arr)
+                            billed_legs = billing_leg_distances(legs, gk_dist_mist)
+                            item = {
+                                'seq': best_seq,
+                                'load': total_load,
+                                'dist': best_dist,
+                                'cost': best_cost,
+                                'legs': legs,
+                                'billed_legs': billed_legs,
+                            }
                             if key not in best_paths:
-                                best_paths[key] = (best_seq, total_load, best_dist, best_cost)
+                                best_paths[key] = item
                                 total_accepted += 1
-                            elif best_cost < best_paths[key][2]:
-                                best_paths[key] = (best_seq, total_load, best_dist, best_cost)
+                            elif best_cost < best_paths[key]['cost']:
+                                best_paths[key] = item
                                 total_replaced += 1
                         else:
                             total_dist_rejected += 1
+
+                    if limit_hit:
+                        break
+
+                if limit_hit:
+                    break
+
+            if limit_hit:
+                break
+
+        if limit_hit:
+            break
+
+    if limit_hit:
+        logging.warning(f"[Stage1] 触发{limit_hit}，停止多站组合枚举；"
+                        f"已保留候选={len(best_paths)}，继续执行单点兜底")
 
     # ---- 4. 单点单 unit 直达兜底 ----
     fallback_count = 0
@@ -260,31 +317,43 @@ def enumerate_candidate_paths(demand_units, dmat_arr, max_cap, max_route_dist,
             continue
         dist = dmat_arr[0, nid] + dmat_arr[nid, 0]
         if dist <= max_route_dist:
-            cost = dmat_arr[0, nid] * boxes
+            load_fb, dist_fb, cost_fb = compute_path_cost(
+                (nid,), {nid: boxes}, dmat_arr, gk_dist_mist)
+            legs = path_leg_distances((nid,), dmat_arr)
+            billed_legs = billing_leg_distances(legs, gk_dist_mist)
             key = frozenset([uid])
             if key not in best_paths:
-                # 兜底路径也需带标签，元组格式与标准路径一致
-                best_paths[key] = ((nid,), boxes, dist, cost)
+                best_paths[key] = {
+                    'seq': (nid,),
+                    'load': load_fb,
+                    'dist': dist_fb,
+                    'cost': cost_fb,
+                    'legs': legs,
+                    'billed_legs': billed_legs,
+                }
                 fallback_count += 1
 
     # ---- 5. 转换为候选列表 ----
     candidates = []
     load_dist = defaultdict(int)  # 装载量分布统计
     stop_dist = defaultdict(int)  # 站点数分布
-    for i, (key, (seq, load, dist, cost)) in enumerate(best_paths.items()):
+    for i, (key, item) in enumerate(best_paths.items()):
+        seq = item['seq']
         candidates.append({
             'id': i,
             'unit_ids': frozenset(key),
             'sequence': tuple(seq),
-            'load': load,
-            'distance': dist,
-            'base_cost': cost,
+            'load': item['load'],
+            'distance': item['dist'],
+            'base_cost': item['cost'],
+            'legs': item['legs'],
+            'billed_legs': item['billed_legs'],
             # V4 新增标签: 供 Stage 2 约束3 使用
             'has_hefei': bool(set(seq) & hefei_nodes),
             'has_far_node': bool(set(seq) - hefei_nodes),
         })
         # 统计
-        load_bucket = int(load // 100) * 100
+        load_bucket = int(item['load'] // 100) * 100
         load_dist[load_bucket] += 1
         stop_dist[len(seq)] += 1
 
@@ -338,7 +407,7 @@ def _all_pairs_angle_ok(node_subset, dmat_arr, hefei_nodes=None,
 
 
 def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_dist,
-                        node_to_group=None, node_load_real=None):
+                        node_to_group=None, node_load_real=None, gk_dist_mist=0.0):
     """
     对给定节点集合，枚举所有排列，先按业务硬约束过滤，再在幸存排列里取成本最低的。
 
@@ -375,7 +444,7 @@ def _find_best_sequence(combo_nodes, node_load, total_load, dmat_arr, max_route_
         if not _check_near_to_far(perm, dmat_arr, node_to_group):
             continue
 
-        load, dist, cost = compute_path_cost(perm, node_load, dmat_arr)
+        load, dist, cost = compute_path_cost(perm, node_load, dmat_arr, gk_dist_mist)
         if dist > max_route_dist + 0.01:
             continue
         if cost < best_cost - 0.01:

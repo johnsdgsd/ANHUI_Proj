@@ -11,23 +11,27 @@ import logging
 import numpy as np
 import pandas as pd
 
+from backend.DelivPlanV4.config import PT_VOL_MULT
 
-def compute_volume_boxes(demands, sub_type_list):
+
+def compute_volume_boxes(demands, sub_type_list, pt_vol_mult=None):
     """
     将需求件数矩阵转换为各网点的体积箱合计。
 
-    转换公式（与 GetDelivPlan 保持一致）:
+    转换公式:
         boxes(loc, dev) = ceil(ceil(pieces / PACK_BOX_NUM) × vol_mult)
-        vol_mult = 2.5 if DEV_CLS == '02' else 1.0
+        vol_mult = PT_VOL_MULT(2.0) if DEV_CLS == '02' else 1.0
         unit_sum(loc) = Σ_i boxes(loc, i)
 
     Args:
         demands: (LocationNum × SubTypeNum) DataFrame 或 numpy array，需求件数
         sub_type_list: 设备规格 DataFrame，需含 PACK_BOX_NUM 和 DEV_CLS 列
+        pt_vol_mult: 互感器体积系数；None 时使用 config.PT_VOL_MULT
 
     Returns:
         dict[int, float]: {node_id (1-indexed): total_volume_boxes}
     """
+    vol_mult_pt = PT_VOL_MULT if pt_vol_mult is None else float(pt_vol_mult)
     location_num = demands.shape[0]
     sub_type_num = len(sub_type_list)
     demands_arr = demands.values if isinstance(demands, pd.DataFrame) else demands
@@ -39,13 +43,14 @@ def compute_volume_boxes(demands, sub_type_list):
         cls_val = str(sub_type_list.iloc[i].get('DEV_CLS', '')).replace('.0', '').strip().zfill(2)
         if cls_val == '02':
             pt_devices += 1
-    logging.info(f"[需求转换] {location_num}站点 × {sub_type_num}设备 (含{pt_devices}种互感器×2.5体积系数)")
+    logging.info(f"[需求转换] {location_num}站点 × {sub_type_num}设备 "
+                 f"(含{pt_devices}种互感器×{vol_mult_pt}体积系数)")
 
     total_pieces = 0
     for i in range(sub_type_num):
         unit_per_box = float(sub_type_list.iloc[i]['PACK_BOX_NUM'])
         cls_val = str(sub_type_list.iloc[i].get('DEV_CLS', '')).replace('.0', '').strip().zfill(2)
-        vol_mult = 2.5 if cls_val == '02' else 1.0
+        vol_mult = vol_mult_pt if cls_val == '02' else 1.0
         pieces_i = demands_arr[:, i].sum()
         total_pieces += pieces_i
         demands_boxes[:, i] = np.ceil(np.ceil(demands_arr[:, i] / unit_per_box) * vol_mult)
@@ -67,7 +72,7 @@ def compute_volume_boxes(demands, sub_type_list):
 
 
 def compute_real_boxes(demands, sub_type_list):
-    """将需求件数矩阵转换为各网点的实际箱合计（不含 2.5 体积系数）。
+    """将需求件数矩阵转换为各网点的实际箱合计（不含互感器体积系数）。
 
     公式: boxes(loc, dev) = ceil(pieces / PACK_BOX_NUM)
     用途: 「同城量大先行」约束按实际箱判定（业务口径），
@@ -165,7 +170,7 @@ def split_large_demand(unit_sum, max_cap):
     return units
 
 
-def split_demand_by_dev(demands, sub_type_list, max_cap):
+def split_demand_by_dev(demands, sub_type_list, max_cap, pt_vol_mult=None):
     """按(网点×设备码)生成不可分装载单元（现场规则版）
 
     现场要求：同一设备码的货物必须整码装同一辆车，仅当单一设备码自身的
@@ -175,6 +180,7 @@ def split_demand_by_dev(demands, sub_type_list, max_cap):
         demands: (LocationNum × SubTypeNum) DataFrame 或 numpy array，需求件数
         sub_type_list: 设备规格 DataFrame，需含 PACK_BOX_NUM 和 DEV_CLS 列
         max_cap: 最大单车容量
+        pt_vol_mult: 互感器体积系数；None 时使用 config.PT_VOL_MULT
 
     Returns:
         (units, uid_to_dev):
@@ -183,6 +189,7 @@ def split_demand_by_dev(demands, sub_type_list, max_cap):
             uid_to_dev: {unit_id: dev_idx}，unit 对应的设备码列索引，
                         供拆箱时按码 1:1 分配件数（货物不再打散）
     """
+    vol_mult_pt = PT_VOL_MULT if pt_vol_mult is None else float(pt_vol_mult)
     demands_arr = demands.values if isinstance(demands, pd.DataFrame) else demands
     units = []
     uid_to_dev = {}
@@ -197,7 +204,7 @@ def split_demand_by_dev(demands, sub_type_list, max_cap):
             if box_cap <= 0:
                 box_cap = 1.0
             cls_val = str(sub_type_list.iloc[dev_idx].get('DEV_CLS', '')).replace('.0', '').strip().zfill(2)
-            vol_mult = 2.5 if cls_val == '02' else 1.0
+            vol_mult = vol_mult_pt if cls_val == '02' else 1.0
             vol = float(np.ceil(np.ceil(pieces / box_cap) * vol_mult))
             nid = loc_idx + 1
             if vol > max_cap:

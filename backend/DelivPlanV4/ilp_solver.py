@@ -15,11 +15,23 @@ from collections import defaultdict
 
 import pulp
 
-from backend.DelivPlanV4.config import ILP_TIMEOUT_SEC
+from backend.DelivPlanV4.config import (
+    ILP_TIMEOUT_SEC,
+    ILP_TIMEOUT_SEC_4STOP,
+    ILP_TOTAL_BUDGET_SEC_4STOP,
+)
+
+
+def resolve_ilp_budget(max_stops):
+    """按最大站点数返回 (每轮超时, 总预算或 None)。"""
+    if max_stops is not None and int(max_stops) >= 4:
+        return ILP_TIMEOUT_SEC_4STOP, ILP_TOTAL_BUDGET_SEC_4STOP
+    return ILP_TIMEOUT_SEC, None
 
 
 def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_price,
-                            no_small_first=False, load_rate_penalty=0.0):
+                            no_small_first=False, load_rate_penalty=0.0,
+                            time_limit=None, total_time_limit=None):
     """
     求解集合划分 ILP，返回 best_sol 格式的路线列表。
 
@@ -32,11 +44,13 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
                         False 时保持三轮逐步放宽（默认）。
         load_rate_penalty: float, 低装载率惩罚系数。0=不惩罚（默认）。
                            >0 时 cost *= (1 + penalty×(1-load_rate)²)，推动合并低载路线。
+        time_limit: 每轮 CBC 超时秒数；None 用 ILP_TIMEOUT_SEC(60s)。
+        total_time_limit: 多轮总预算秒数；None 不限制（3 站档默认）。
 
     Returns:
         list[dict]: best_sol 格式:
             [{'vehicle_type': int, 'deliveries': [(node_id, boxes), ...],
-              'unit_ids': frozenset[int]}, ...]
+              'unit_ids': frozenset[int], 'legs': [...], 'billed_legs': [...]}, ...]
 
     Raises:
         ValueError: ILP 无可行解时
@@ -94,6 +108,8 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
     last_error = None
     last_error_detail = ""
     x, prob, status_str, obj_val = None, None, None, None
+    per_pass_limit = float(ILP_TIMEOUT_SEC if time_limit is None else time_limit)
+    total_budget = None if total_time_limit is None else float(total_time_limit)
 
     extra_type_passes = [0, 1, num_types - 1]  # 默认：三轮逐步放宽
     if no_small_first:
@@ -241,10 +257,19 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
         )
 
         # ---- 4c. 求解 ----
-        logging.info(f"[Stage2] 开始CBC求解 (超时{ILP_TIMEOUT_SEC}s, gap=1%)...")
+        sec = per_pass_limit
+        if total_budget is not None:
+            remaining_budget = total_budget - (time.time() - t_start)
+            if remaining_budget <= 1:
+                status_str = 'TimeLimit'
+                last_error_detail = f"4站求解总预算 {total_budget:.0f}s 耗尽"
+                logging.warning(f"[Stage2] {last_error_detail}，停止后续车型放宽轮次")
+                break
+            sec = min(sec, remaining_budget)
+        logging.info(f"[Stage2] 开始CBC求解 (超时{sec:.0f}s, gap=1%)...")
         solver = pulp.PULP_CBC_CMD(
             msg=False,
-            options=[f'sec={ILP_TIMEOUT_SEC}', 'ratioGap=0.01']
+            options=[f'sec={sec:.0f}', 'ratioGap=0.01']
         )
         status = prob.solve(solver)
         status_str = pulp.LpStatus[status]
@@ -313,6 +338,8 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
                 'vehicle_type': vehicle_type,
                 'deliveries': deliveries,
                 'unit_ids': cand['unit_ids'],
+                'legs': cand.get('legs'),
+                'billed_legs': cand.get('billed_legs'),
             })
             type_usage[vehicle_type] += 1
             selected_routes.append((r, t, vehicle_type, cand['load'], cand['distance'], cand['base_cost']))

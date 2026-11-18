@@ -3156,6 +3156,41 @@ def query_adam_sys_param() -> dict:
         raise
 
 
+def query_adam_sys_param_gk() -> dict:
+    """查询配送算法系统参数（GK_ 前缀）。
+
+    与仓网布局的 query_adam_sys_param() 分开，避免 WL_ 过滤逻辑互相影响。
+    DS_SQL endpoint: gk-adam-query_adam_sys_param（下划线版）。
+
+    Returns:
+        dict: {PARAM_CODE: PARAM_VALUE}，仅包含 GK_ 前缀参数
+    """
+    try:
+        host = API_CONFIG["database"]["host"]
+        port = API_CONFIG["database"]["port"]
+        endpoint = '/exec/gk-adam-query_adam_sys_param'
+        url = f"http://{host}:{port}{endpoint}"
+        response = session.post(url, json={})
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            params = {}
+            for row in data:
+                code = str(row.get('PARAM_CODE', '')).strip()
+                value = row.get('PARAM_VALUE', '')
+                if code.startswith('GK_'):
+                    params[code] = value
+            logger.info(f"配送算法-系统参数: 读取 {len(params)} 项")
+            return params
+        return {}
+    except requests.exceptions.RequestException:
+        logger.exception("配送算法-系统参数查询网络异常")
+        raise
+    except Exception:
+        logger.exception("配送算法-系统参数查询失败")
+        raise
+
+
 def delete_adam_layout_result_by_date(today: str):
     """按日期删除旧的仓网布局方案主表
 

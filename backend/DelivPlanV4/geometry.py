@@ -14,6 +14,7 @@ V4.1 新增: 支持基于 geodesic 直线距离的余弦定理角度约束（向
 import logging
 import math
 
+from backend.DelivPlanV4.billing import billing_leg_distances
 from backend.DelivPlanV4.config import ANGLE_COS_THRESHOLD, NEAR_DEPOT_DIST_THRESHOLD
 
 # 地球半径 (km)
@@ -225,29 +226,39 @@ def check_angle_constraint(n1, n2, dmat_arr, hefei_nodes=None,
     return cos_theta >= ANGLE_COS_THRESHOLD
 
 
-def compute_path_cost(node_sequence, node_load_map, dmat_arr):
+def path_leg_distances(node_sequence, dmat_arr):
+    """返回出车分段真实里程：[中心→首站, 首站→次站, ...]（不含返程）。"""
+    if not node_sequence:
+        return []
+    legs = [dmat_arr[0, node_sequence[0]]]
+    for a, b in zip(node_sequence, node_sequence[1:]):
+        legs.append(dmat_arr[a, b])
+    return legs
+
+
+def compute_path_cost(node_sequence, node_load_map, dmat_arr, gk_dist_mist=0.0):
     """
     计算给定节点排列的路径指标。
 
     运输成本基数公式（与 V3 calc_route_cost 一致，不含单价）:
-        base_cost = Σ_i amt_i × dist(prev_node_i, node_i)
+        base_cost = Σ_i amt_i × billed_dist(prev_node_i, node_i)
         即：每段的成本只算该段终点卸货量，不是 cum_load
 
-    对比 V3 源码（GetDelivPlan.calc_route_cost）:
-        for cid, amt in route['deliveries']:
-            total_cost += amt * get_dist(prev_node, cid) * unit_price
-            prev_node = cid
+    计费口径（用户 2026-11-13）:
+        - 真实分段里程 < gk_dist_mist 时，该段计费里程沿用前一段计费里程；
+        - 只影响 base_cost，distance 仍是真实闭环距离（750km 过滤不变）。
 
     Args:
         node_sequence: 节点访问顺序，如 (3, 7, 12)
         node_load_map: dict[int, float], 各节点在该路径中的装载量（只含该路径覆盖的 demand_units）
         dmat_arr: 距离矩阵
+        gk_dist_mist: 短腿计费阈值 km；<=0 表示关闭计费规则
 
     Returns:
         tuple: (total_load, distance, base_cost)
             - total_load: float, 总装载量
-            - distance: float, 闭环距离（省库→节点1→...→节点k→省库）
-            - base_cost: float, 运输成本基数（未乘单价）
+            - distance: float, 真实闭环距离（省库→节点1→...→节点k→省库）
+            - base_cost: float, 运输成本基数（未乘单价，已按计费里程）
     """
     k = len(node_sequence)
     if k == 0:
@@ -255,19 +266,17 @@ def compute_path_cost(node_sequence, node_load_map, dmat_arr):
 
     total_load = sum(node_load_map.get(nid, 0.0) for nid in node_sequence)
 
-    # 闭环距离
+    # 闭环距离（真实距离）
     distance = dmat_arr[0, node_sequence[0]]
     for i in range(k - 1):
         distance += dmat_arr[node_sequence[i], node_sequence[i + 1]]
     distance += dmat_arr[node_sequence[-1], 0]
 
-    # 运输成本基数（与 V3 一致）: Σ amt_i × dist(prev, i)，不含单价
+    # 运输成本基数：Σ amt_i × 计费段距(prev, i)，不含单价；返程空载不计费
+    legs = path_leg_distances(node_sequence, dmat_arr)
+    billed_legs = billing_leg_distances(legs, gk_dist_mist)
     base_cost = 0.0
-    prev_node = 0
-    for nid in node_sequence:
-        amt = node_load_map.get(nid, 0.0)
-        base_cost += amt * dmat_arr[prev_node, nid]
-        prev_node = nid
-    # 回程空载不计成本
+    for i, nid in enumerate(node_sequence):
+        base_cost += node_load_map.get(nid, 0.0) * billed_legs[i]
 
     return total_load, distance, base_cost

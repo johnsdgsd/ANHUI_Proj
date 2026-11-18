@@ -26,8 +26,14 @@ from backend.DelivPlanV4.demand import (
     split_demand_by_dev,
 )
 from backend.DelivPlanV4.path_enumerator import enumerate_candidate_paths
-from backend.DelivPlanV4.ilp_solver import solve_set_partition_ilp
-from backend.DelivPlanV4.config import MAX_ROUTE_DIST
+from backend.DelivPlanV4.ilp_solver import solve_set_partition_ilp, resolve_ilp_budget
+from backend.DelivPlanV4.params import resolve_runtime_params
+from backend.DelivPlanV4.config import (
+    MAX_CANDIDATES_4STOP,
+    MAX_ROUTE_DIST,
+    PT_VOL_MULT,
+    STAGE1_TIME_LIMIT_4STOP,
+)
 
 # 省库（营销服务中心）在 ADAM_DEL_SITE_CONF 中的 ORG_NO。
 # 注意：'34101' 是距离矩阵(ADAM_DIST_MIST)与组织表的省库编码，该表中不存在；
@@ -35,7 +41,7 @@ from backend.DelivPlanV4.config import MAX_ROUTE_DIST
 DEPOT_SITE_ORG = '3410117'
 
 
-def run_deliv_plan_v4(date_str):
+def run_deliv_plan_v4(date_str, max_stops=None, gk_dist_mist=None):
     """
     DelivPlanV4 日配送算法主入口。
 
@@ -52,6 +58,8 @@ def run_deliv_plan_v4(date_str):
 
     Args:
         date_str: 配送日期，格式 'YYYY-MM-DD'
+        max_stops: 可选，覆盖 ADAM_SYS_PARAM.GK_MAX_SITE_NUM（1~4）
+        gk_dist_mist: 可选，覆盖 ADAM_SYS_PARAM.GK_DIST_MIST（km）
 
     Returns:
         tuple: (MainScheme DataFrame, DetailScheme DataFrame)
@@ -62,8 +70,14 @@ def run_deliv_plan_v4(date_str):
         delete_adam_dist_scheme_by_id,
         query_pk_next)
 
+    runtime = resolve_runtime_params(max_stops, gk_dist_mist)
+    max_stops = runtime['max_stops']
+    gk_dist_mist = runtime['gk_dist_mist']
+
     t_total = time.time()
     timing = {}
+    logging.info(f"[V4] 配送参数: max_stops={max_stops}, "
+                 f"gk_dist_mist={gk_dist_mist}km, source={runtime['source']}")
 
     # ---- 0. 删除当天未确认的旧方案（保留已确认 DIST_FLAG='02'） ----
     t0 = time.time()
@@ -140,7 +154,7 @@ def run_deliv_plan_v4(date_str):
     # ---- 2. 需求 → 体积箱 ----
     t0 = time.time()
     logging.info(f"[V4] Step 2/6: 需求件数→体积箱转换...")
-    unit_sum = compute_volume_boxes(demands, sub_type_list)
+    unit_sum = compute_volume_boxes(demands, sub_type_list, pt_vol_mult=PT_VOL_MULT)
     # 实际箱（业务口径）：仅用于「同城量大先行」约束1判定；容量/装载率仍按体积箱
     real_sum = compute_real_boxes(demands, sub_type_list)
     total_demand_boxes = sum(unit_sum.values())
@@ -179,7 +193,8 @@ def run_deliv_plan_v4(date_str):
     # ---- 4. 大需求拆分（按设备码粒度，现场规则：仅单一设备码超容才内部切分） ----
     t0 = time.time()
     logging.info(f"[V4] Step 4/6: 大需求拆分-按码 (阈值={max_cap:.0f}箱)...")
-    demand_units, uid_to_dev = split_demand_by_dev(demands, sub_type_list, max_cap)
+    demand_units, uid_to_dev = split_demand_by_dev(
+        demands, sub_type_list, max_cap, pt_vol_mult=PT_VOL_MULT)
     timing['split'] = time.time() - t0
 
     # ---- 5. Stage 1: 候选路径枚举 ----
@@ -219,12 +234,17 @@ def run_deliv_plan_v4(date_str):
     # ---- V4.1: 加载经纬度坐标 → geodesic 角度约束 ----
     depot_coord, node_coords = _load_coordinates(org_labels, hefei_node_ids)
 
+    stage1_guard = max_stops >= 4
     candidates = enumerate_candidate_paths(
         demand_units, dmat_arr, max_cap, MAX_ROUTE_DIST,
         hefei_node_ids=hefei_node_ids if hefei_node_ids else None,
         node_to_group=node_to_group if node_to_group else None,
         depot_coord=depot_coord, node_coords=node_coords,
-        node_real_boxes=real_sum if real_sum else None
+        node_real_boxes=real_sum if real_sum else None,
+        max_stops=max_stops,
+        gk_dist_mist=gk_dist_mist,
+        max_candidates=MAX_CANDIDATES_4STOP if stage1_guard else None,
+        max_seconds=STAGE1_TIME_LIMIT_4STOP if stage1_guard else None,
     )
     timing['stage1'] = time.time() - t0
 
@@ -234,9 +254,12 @@ def run_deliv_plan_v4(date_str):
     # ---- 6. Stage 2: ILP 求解 ----
     t0 = time.time()
     logging.info(f"[V4] Step 6/6: Stage2 ILP求解...")
+    ilp_time_limit, ilp_total_budget = resolve_ilp_budget(max_stops)
     best_sol = solve_set_partition_ilp(
         candidates, demand_units, vehicle_config, ve_unit_price,
-        load_rate_penalty=1.0
+        load_rate_penalty=1.0,
+        time_limit=ilp_time_limit,
+        total_time_limit=ilp_total_budget,
     )
     timing['stage2'] = time.time() - t0
 
@@ -253,9 +276,12 @@ def run_deliv_plan_v4(date_str):
     t0 = time.time()
     logging.info("[V4] 生成配送方案表...")
     main_scheme = _v3_generate_main_scheme(best_sol, ve_cap, car_type_str_list, date_str)
+    billed_legs_by_route = [r.get('billed_legs') for r in best_sol]
     detail_scheme = _v3_unbox_to_detail(
         best_sol, main_scheme, demands, sub_type_list, ve_unit_price, dmat_arr, org_labels,
-        demand_units=demand_units, uid_to_dev=uid_to_dev
+        demand_units=demand_units, uid_to_dev=uid_to_dev,
+        pt_vol_mult=PT_VOL_MULT,
+        billed_legs=billed_legs_by_route,
     )
     timing['output'] = time.time() - t0
     # 拆箱后统计

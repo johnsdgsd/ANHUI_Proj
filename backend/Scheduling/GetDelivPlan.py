@@ -21,7 +21,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay,
                  VeUnitPrice, VeTypeNum, VNums, VeCap, DMAT,
                  node_priority=None, daily_vehicle_limits=None,
                  vehicle_types=None, near_center_nodes=None,
-                 work_days=None, node_org_map=None):
+                 work_days=None, node_org_map=None,
+                 max_site_num=None, dist_mist=None):
     """
     配送排程主函数（签名与旧版完全兼容）。
 
@@ -35,7 +36,8 @@ def GetDelivPlan(Demands, LocationNum, TypeList, SubTypeList, DelivDay,
     # =========================================================================
     # 1. 准备 v5_5 参数和数据
     # =========================================================================
-    params = get_params(VeCap=VeCap, VeUnitPrice=VeUnitPrice)
+    params = get_params(VeCap=VeCap, VeUnitPrice=VeUnitPrice,
+                        max_site_num=max_site_num, dist_mist=dist_mist)
     data, branch_codes, code_to_idx = build_data(
         Demands, LocationNum, TypeList, SubTypeList, DMAT,
         VeCap=VeCap, VNums=VNums,
