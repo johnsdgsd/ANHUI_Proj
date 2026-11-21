@@ -41,6 +41,19 @@ from backend.DelivPlanV4.config import (
 DEPOT_SITE_ORG = '3410117'
 
 
+def _max_available_cap(vehicle_config):
+    """最大可用单车容量：只统计当日仍有剩余配额的车型。
+
+    不能直接取 vehicle_config[-1]['cap']：最大的车型可能已被已确认方案占用，
+    daily_max=0；若仍按它的容量拆分需求，会拆出任何可用车型都装不下的单元，
+    导致 ILP 无解。
+    """
+    available = [cfg for cfg in vehicle_config if int(cfg.get('daily_max', 0)) > 0]
+    if not available:
+        raise ValueError("【运力不足】当前没有可用车辆（各车型日配额均为 0），请先补充车辆")
+    return max(float(cfg['cap']) for cfg in available)
+
+
 def run_deliv_plan_v4(date_str, max_stops=None, gk_dist_mist=None):
     """
     DelivPlanV4 日配送算法主入口。
@@ -173,7 +186,14 @@ def run_deliv_plan_v4(date_str, max_stops=None, gk_dist_mist=None):
     t0 = time.time()
     logging.info(f"[V4] Step 3/6: 车辆配置与运力校验...")
     vehicle_config = build_vehicle_config(ve_cap, v_nums, ve_type_num)
-    max_cap = vehicle_config[-1]['cap']
+    max_cap = _max_available_cap(vehicle_config)
+    unavailable = [cfg for cfg in vehicle_config if int(cfg.get('daily_max', 0)) <= 0]
+    if unavailable:
+        logging.warning(
+            f"[V4] 以下车型当日无剩余配额，不参与最大单车容量拆分: "
+            + ", ".join(f"车型{cfg['type']}(容{cfg['cap']:.0f}, 配额0)" for cfg in unavailable)
+        )
+    logging.info(f"[V4] 最大可用单车容量={max_cap:.0f}箱（仅统计 daily_max>0 的车型）")
     total_capacity = sum(cfg['cap'] * cfg['daily_max'] for cfg in vehicle_config)
     timing['vehicle'] = time.time() - t0
 
@@ -195,6 +215,13 @@ def run_deliv_plan_v4(date_str, max_stops=None, gk_dist_mist=None):
     logging.info(f"[V4] Step 4/6: 大需求拆分-按码 (阈值={max_cap:.0f}箱)...")
     demand_units, uid_to_dev = split_demand_by_dev(
         demands, sub_type_list, max_cap, pt_vol_mult=PT_VOL_MULT)
+    oversized = [u for u in demand_units if u[2] > max_cap + 0.01]
+    if oversized:
+        _, nid, boxes = max(oversized, key=lambda x: x[2])
+        raise ValueError(
+            f"【无可用车型可装】站点{nid} 的需求单元 {boxes:.0f}箱 "
+            f"> 最大可用单车容量 {max_cap:.0f}箱，请增加大车或调整拆分"
+        )
     timing['split'] = time.time() - t0
 
     # ---- 5. Stage 1: 候选路径枚举 ----

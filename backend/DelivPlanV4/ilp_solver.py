@@ -291,6 +291,19 @@ def solve_set_partition_ilp(candidates, demand_units, vehicle_config, ve_unit_pr
 
     # ---- 5. 所有轮次均失败 → 报错 ----
     if status_str not in ('Optimal', 'Feasible'):
+        # 先区分“单个需求单元装不下”和“总运力不足”：前者总运力可能仍然充足
+        available_caps = [
+            float(c['cap']) for c in vehicle_config
+            if int(c.get('daily_max', 0)) > 0
+        ]
+        max_unit = max((float(boxes) for _, _, boxes in demand_units), default=0.0)
+        if available_caps and max_unit > max(available_caps) + 0.01:
+            raise ValueError(
+                f"【无可用车型可装】最大需求单元 {max_unit:.0f} 箱 > "
+                f"最大可用单车容量 {max(available_caps):.0f} 箱，"
+                f"请检查车辆配额或需求拆分"
+            )
+
         total_dmd = sum(boxes for _, _, boxes in demand_units)
         total_veh_cap = sum(c['cap'] * c['daily_max'] for c in vehicle_config)
         if total_dmd > total_veh_cap:
